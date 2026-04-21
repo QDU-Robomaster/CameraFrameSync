@@ -41,12 +41,15 @@ jobs:
       - name: Create minimal CMakeLists.txt
         run: |
           cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
           project(xrobot_mod_test CXX)
           set(CMAKE_CXX_STANDARD 20)
           set(CMAKE_CXX_STANDARD_REQUIRED ON)
           add_executable(xr_test main.cpp)
           set(XROBOT_MODULES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Modules/)
           add_subdirectory(libxr)
+          set_property(TARGET xr PROPERTY CXX_STANDARD 20)
+          set_property(TARGET xr PROPERTY CXX_STANDARD_REQUIRED ON)
           target_include_directories(xr_test PUBLIC $<TARGET_PROPERTY:xr,INTERFACE_INCLUDE_DIRECTORIES> ${CMAKE_SOURCE_DIR}/User)
           target_link_libraries(xr_test PUBLIC xr)
           EOF
@@ -60,6 +63,55 @@ jobs:
             --branch feat/camerainfo-staticinfo-cxx20-20260420 \
             https://github.com/QDU-Robomaster/CameraBase \
             ./Modules/CameraBase
+
+      - name: Create FakeCamera module
+        run: |
+          mkdir -p Modules/FakeCamera
+          cat > Modules/FakeCamera/FakeCamera.hpp <<'EOF'
+          #pragma once
+
+          /* === MODULE MANIFEST V2 ===
+          module_description: Fake camera for CameraFrameSync CI
+          constructor_args: []
+          template_args:
+            - Info:
+                width: 1280
+                height: 720
+                step: 3840
+                encoding: CameraTypes::Encoding::BGR8
+                camera_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                distortion_model: CameraTypes::DistortionModel::PLUMB_BOB
+                distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+                rectification_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+                projection_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+          required_hardware: []
+          depends:
+            - qdu-future/CameraBase
+          === END MANIFEST === */
+
+          #include "CameraBase.hpp"
+          #include "app_framework.hpp"
+          #include "libxr.hpp"
+
+          template <CameraTypes::CameraInfo CameraInfoV>
+          class FakeCamera : public CameraBase<CameraInfoV>, public LibXR::Application
+          {
+           public:
+            explicit FakeCamera(LibXR::HardwareContainer &hw, LibXR::ApplicationManager &app)
+                : CameraBase<CameraInfoV>(hw, "fake_camera")
+            {
+              app.Register(*this);
+            }
+
+            void OnMonitor() override {}
+            void SetExposure(double) override {}
+            void SetGain(double) override {}
+          };
+          EOF
+
+          cat > Modules/FakeCamera/CMakeLists.txt <<'EOF'
+          target_include_directories(xr PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+          EOF
 
       - name: Setup Python & Install deps
         run: |
@@ -82,13 +134,39 @@ jobs:
         run: |
           xrobot_init_mod
 
-      - name: Add BlinkLED module
+      - name: Create test module config
         run: |
-          xrobot_add_mod BlinkLED --instance-id BlinkLED_0
+          cat > User/xrobot.yaml <<'EOF'
+          constexpr_namespace: ProjectConstexpr
 
-      - name: Add this repo module
-        run: |
-          xrobot_add_mod ${{ env.XR_MODULE_NAME }} && cat User/xrobot.yaml
+          constexprs:
+            TestCameraInfo:
+              type: CameraTypes::CameraInfo
+              value:
+                width: 1280
+                height: 720
+                step: 3840
+                encoding: CameraTypes::Encoding::BGR8
+                camera_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+                distortion_model: CameraTypes::DistortionModel::PLUMB_BOB
+                distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+                rectification_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+                projection_matrix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+          modules:
+            - id: Camera_0
+              name: FakeCamera
+              template_args:
+                Info: {constexpr: TestCameraInfo}
+            - id: CameraFrameSync_0
+              name: CameraFrameSync
+              template_args:
+                Info: {constexpr: TestCameraInfo}
+              constructor_args:
+                camera: '@Camera_0'
+                output_topic_name: camera_frame_sync
+          EOF
+          cat User/xrobot.yaml
 
       - name: Generate main again
         run: |

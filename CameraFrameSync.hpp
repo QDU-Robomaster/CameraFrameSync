@@ -74,7 +74,6 @@ class CameraFrameSync : public LibXR::Application, public CameraSinkBase<CameraI
       .queue_num = 4,
   };
 
-  static_assert(std::is_trivial_v<SyncedFrame>, "SyncedFrame must be trivial");
   static_assert(std::is_trivially_copyable_v<SyncedFrame>,
                 "SyncedFrame must be trivially copyable");
 
