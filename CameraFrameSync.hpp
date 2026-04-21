@@ -2,10 +2,8 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: Camera sink that publishes one shared synced frame
-constructor_args:
-  - camera: '@Camera_0'
-  - output_topic_name: camera_frame_sync
+module_description: Shared synced-frame payload definition for camera_frame_sync
+constructor_args: []
 template_args:
   - Info:
       width: 1280
@@ -23,42 +21,56 @@ depends:
 === END MANIFEST === */
 // clang-format on
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 #include <type_traits>
 
 #include "CameraBase.hpp"
-#include "app_framework.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
-#include "logger.hpp"
-
-template <CameraTypes::CameraInfo CameraInfoV>
-using CameraSinkBase = typename CameraBase<CameraInfoV>::Sink;
 
 /**
- * @brief 相机帧直写 sink。
+ * @brief `camera_frame_sync(shared)` 的最终共享载荷定义。
  *
- * 该模块不再订阅图像 topic，而是直接注册到 `CameraBase`：
- * 1. 相机线程先调用 `AcquireFrame(...)` 预借最终 shared payload；
- * 2. 相机把像素直接写进借出的图像缓冲区；
- * 3. 写完后调用 `CommitFrame(...)` 发布整帧。
+ * 这里不再承担运行时中转职责，只保留：
+ * 1. 单帧 shared payload 的 ABI；
+ * 2. 话题类型别名；
+ * 3. 默认的单槽、非阻塞配置。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
-class CameraFrameSync : public LibXR::Application, public CameraSinkBase<CameraInfoV>
+struct CameraFrameSync
 {
- public:
   using Base = CameraBase<CameraInfoV>;
   using CameraInfo = typename Base::CameraInfo;
-  using Pose = typename Base::Pose;
-  using Motion = typename Base::Motion;
-  using FrameContext = typename Base::FrameContext;
-  using FrameLease = typename Base::FrameLease;
-  using SharedImageFrame = typename Base::SharedImageFrame;
+
+  static inline constexpr CameraInfo camera_info = CameraInfoV;
+  static constexpr std::size_t frame_data_alignment = 64;
+  static constexpr std::size_t frame_bytes =
+      static_cast<std::size_t>(camera_info.step) * static_cast<std::size_t>(camera_info.height);
+
+  struct Pose
+  {
+    std::array<float, 4> rotation_wxyz;
+    std::array<float, 3> translation_xyz;
+  };
+
+  struct Motion
+  {
+    std::array<float, 3> angular_velocity_xyz;
+    std::array<float, 3> linear_acceleration_xyz;
+  };
+
+  struct alignas(frame_data_alignment) ImageFrame
+  {
+    uint64_t timestamp_us;
+    uint64_t sequence;
+    alignas(frame_data_alignment) std::array<uint8_t, frame_bytes> data;
+  };
 
   struct SyncedFrame
   {
-    SharedImageFrame image;
+    ImageFrame image;
     Pose pose;
     Motion motion;
   };
@@ -66,128 +78,25 @@ class CameraFrameSync : public LibXR::Application, public CameraSinkBase<CameraI
   using OutputTopic = LibXR::LinuxSharedTopic<SyncedFrame>;
   using OutputData = typename OutputTopic::Data;
 
-  static inline constexpr CameraInfo camera_info = CameraInfoV;
-  // 这一份 shared topic 只承担“前半段最终帧”输出，槽位数量可以保持紧凑。
+  // 默认预留 8 个 in-flight 槽位，给后续多线程流水线留余量；
+  // 生产者路径仍不等待空槽，拿不到可用槽位时直接丢帧。
   static constexpr LibXR::LinuxSharedTopicConfig output_topic_config{
-      .slot_num = 4,
+      .slot_num = 8,
       .subscriber_num = 8,
-      .queue_num = 4,
+      .queue_num = 2,
   };
 
+  static_assert(frame_bytes > 0, "CameraFrameSync requires non-zero frame bytes");
+  static_assert(std::is_trivially_copyable_v<Pose>, "Pose must be trivially copyable");
+  static_assert(std::is_trivially_copyable_v<Motion>, "Motion must be trivially copyable");
+  static_assert(std::is_trivially_copyable_v<ImageFrame>,
+                "ImageFrame must be trivially copyable");
+  static_assert(std::is_standard_layout_v<ImageFrame>,
+                "ImageFrame must be standard layout");
   static_assert(std::is_trivially_copyable_v<SyncedFrame>,
                 "SyncedFrame must be trivially copyable");
-
-  explicit CameraFrameSync([[maybe_unused]] LibXR::HardwareContainer& hw,
-                           LibXR::ApplicationManager& app, Base& camera,
-                           const char* output_topic_name = "camera_frame_sync")
-      : camera_(camera), output_topic_(output_topic_name, output_topic_config)
-  {
-    if (!output_topic_.Valid())
-    {
-      XR_LOG_ERROR("CameraFrameSync failed to create output topic: %s", output_topic_name);
-      throw std::runtime_error("CameraFrameSync: output topic creation failed");
-    }
-    if (!camera_.RegisterSink(*this))
-    {
-      throw std::runtime_error("CameraFrameSync: camera sink registration failed");
-    }
-
-    app.Register(*this);
-    XR_LOG_PASS("CameraFrameSync enabled: output=%s", output_topic_name);
-  }
-
-  ~CameraFrameSync() override
-  {
-    camera_.UnregisterSink(*this);
-    ResetPendingFrame();
-  }
-
-  void OnMonitor() override {}
-
-  bool AcquireFrame(const FrameContext& context, FrameLease& lease) override
-  {
-    ClearLease(lease);
-
-    if (pending_frame_active_)
-    {
-      XR_LOG_ERROR(
-          "CameraFrameSync: previous frame was not released before acquiring a new one");
-      ResetPendingFrame();
-    }
-
-    const auto create_ans = output_topic_.CreateData(pending_frame_data_);
-    if (create_ans != LibXR::ErrorCode::OK)
-    {
-      XR_LOG_ERROR("CameraFrameSync output slot unavailable: err=%d",
-                   static_cast<int>(create_ans));
-      return false;
-    }
-
-    SyncedFrame* frame = pending_frame_data_.GetData();
-    if (frame == nullptr)
-    {
-      XR_LOG_ERROR("CameraFrameSync output payload is null");
-      ResetPendingFrame();
-      return false;
-    }
-
-    frame->image.timestamp_us = context.timestamp_us;
-    frame->image.sequence = context.sequence;
-    frame->pose = context.pose;
-    frame->motion = context.motion;
-
-    // 相机线程会直接把像素写进这块最终 shared payload。
-    lease.image_data = frame->image.data.data();
-    lease.image_step = camera_info.step;
-    lease.private_data = frame;
-    pending_frame_active_ = true;
-    return true;
-  }
-
-  void CommitFrame(FrameLease& lease) override
-  {
-    if (!pending_frame_active_)
-    {
-      XR_LOG_ERROR("CameraFrameSync: CommitFrame called without an active frame");
-      ClearLease(lease);
-      return;
-    }
-
-    const auto publish_ans = output_topic_.Publish(pending_frame_data_);
-    if (publish_ans != LibXR::ErrorCode::OK)
-    {
-      XR_LOG_ERROR("CameraFrameSync output publish failed: err=%d",
-                   static_cast<int>(publish_ans));
-      ResetPendingFrame();
-      ClearLease(lease);
-      return;
-    }
-
-    pending_frame_active_ = false;
-    ClearLease(lease);
-  }
-
-  void AbortFrame(FrameLease& lease) override
-  {
-    ResetPendingFrame();
-    ClearLease(lease);
-  }
-
- private:
-  static void ClearLease(FrameLease& lease) { lease = {}; }
-
-  void ResetPendingFrame()
-  {
-    if (pending_frame_active_)
-    {
-      pending_frame_data_.Reset();
-      pending_frame_active_ = false;
-    }
-  }
-
-  Base& camera_;
-  OutputTopic output_topic_;
-  // 当前这一个 Data 对象表示“已借出但尚未发布”的共享槽位。
-  OutputData pending_frame_data_{};
-  bool pending_frame_active_ = false;
+  static_assert(alignof(ImageFrame) >= frame_data_alignment,
+                "ImageFrame alignment is too small");
+  static_assert(offsetof(ImageFrame, data) % frame_data_alignment == 0,
+                "ImageFrame data must be aligned");
 };

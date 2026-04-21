@@ -1,44 +1,35 @@
 # CameraFrameSync
 
-Host-side camera-frame synchronizer.
+Shared synced-frame payload definition for `camera_frame_sync(shared)`.
 
-`CameraFrameSync<Info>` consumes one shared image topic and two ordinary topics:
+`CameraFrameSync<Info>` no longer owns a runtime forwarding module.
 
-- `image_frame(shared)`
-- `camera_pose`
-- `camera_motion`
+The runtime publisher is now `WebotsCamera<Info>` itself:
 
-Then it republishes a single shared-memory payload:
+1. sample pose and motion
+2. create one shared payload slot directly
+3. write image bytes into that final payload
+4. publish without blocking
+
+Output topic remains:
 
 - `camera_frame_sync(shared)`
 
 Current shared payload layout:
 
-- full copied `SharedImageFrame`
+- `image.timestamp_us`
+- `image.sequence`
+- `image.data`
 - `pose.rotation_wxyz`
 - `pose.translation_xyz`
 - `motion.angular_velocity_xyz`
 - `motion.linear_acceleration_xyz`
 
-## Current Mode
+Default shared topic policy:
 
-Only `mode1` is implemented now:
-
-- image frame is the anchor
-- producer must publish `pose / motion` first, then publish `image`
-- consumer arms async pose/motion subscribers before waiting for the next image
-- only exact timestamp match is accepted
-- any missing or mismatched side data causes an error log and that image is dropped
-
-There is no fallback, nearest-neighbor, or partial output path.
-
-## Constructor Arguments
-
-- `image_topic_name`: input shared image topic name, default `image_frame`
-- `pose_topic_name`: input pose topic name, default `camera_pose`
-- `motion_topic_name`: input motion topic name, default `camera_motion`
-- `output_topic_name`: output shared synced-frame topic name, default `camera_frame_sync`
-- `image_wait_timeout_ms`: image wait timeout, default `100`
+- `slot_num = 8`
+- `queue_num = 2`
+- producer path is non-blocking; if no writable slot is available, the new frame is dropped
 
 ## Template Arguments
 
