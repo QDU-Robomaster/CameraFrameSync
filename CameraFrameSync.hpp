@@ -2,10 +2,9 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: camera_frame_sync shared-topic bridge for CameraBase
+module_description: 相机共享图像传输与 image+imu 同步订阅器 / Shared image transport plus image+imu sync subscriber
 constructor_args:
   camera: @camera
-  output_topic_name: "camera_frame_sync"
 template_args:
   - Info:
       width: 1280
@@ -33,16 +32,6 @@ depends:
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
 
-/**
- * @brief `camera_frame_sync(shared)` 的运行时桥接模块。
- *
- * `CameraBase` 只负责维护唯一的帧类型和当前可写帧指针；
- * 这个模块负责：
- * 1. 创建共享 topic；
- * 2. 申请第一块可写槽位并注册给 `CameraBase`；
- * 3. 每次相机提交一帧时，先预取下一块槽位，再发布当前槽位；
- * 4. 如果已经只剩最后一个可写槽位，就直接丢掉当前帧并继续复用这块槽位。
- */
 template <CameraTypes::CameraInfo CameraInfoV>
 class CameraFrameSync
 {
@@ -50,115 +39,229 @@ class CameraFrameSync
   using Self = CameraFrameSync<CameraInfoV>;
   using Base = CameraBase<CameraInfoV>;
   using CameraInfo = typename Base::CameraInfo;
-  using Frame = typename Base::Frame;
-  using OutputTopic = LibXR::LinuxSharedTopic<Frame>;
-  using OutputData = typename OutputTopic::Data;
+  using ImageFrame = typename Base::ImageFrame;
+  using ImuStamped = typename Base::ImuStamped;
+  using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;
+  using ImageData = typename ImageTopic::Data;
 
   static inline constexpr CameraInfo camera_info = CameraInfoV;
-  static constexpr LibXR::LinuxSharedTopicConfig output_topic_config{
+  static constexpr LibXR::LinuxSharedTopicConfig image_topic_config{
       .slot_num = 8,
       .subscriber_num = 8,
       .queue_num = 2,
   };
 
-  CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera,
-                  const char* output_topic_name = "camera_frame_sync")
-      : camera_(camera),
-        output_topic_name_(SafeCStr(output_topic_name)),
-        output_topic_(output_topic_name_, output_topic_config)
+  struct SyncedFrame
   {
-    if (!output_topic_.Valid())
+    ImageData image{};
+    ImuStamped imu{};
+
+    const ImageFrame* GetImageFrame() const { return image.GetData(); }
+  };
+
+  class Subscriber
+  {
+   public:
+    explicit Subscriber(const Self& sync)
+        : image_sub_(sync.ImageTopicName()), imu_sub_(sync.ImuTopicName())
     {
-      XR_LOG_ERROR("CameraFrameSync: failed to create topic: %s", output_topic_name_);
-      throw std::runtime_error("CameraFrameSync: topic creation failed");
-    }
-    if (!AcquireInitialWritableSlot())
-    {
-      throw std::runtime_error("CameraFrameSync: initial slot acquisition failed");
-    }
-    if (!camera_.RegisterSync(this, current_data_.GetData(), CommitFrameAdapter))
-    {
-      current_data_.Reset();
-      throw std::runtime_error("CameraFrameSync: camera registration failed");
+      imu_sub_.StartWaiting();
     }
 
-    XR_LOG_PASS("CameraFrameSync enabled: output=%s slot_num=%u queue_num=%u",
-                output_topic_name_,
-                static_cast<unsigned>(output_topic_config.slot_num),
-                static_cast<unsigned>(output_topic_config.queue_num));
+    Subscriber(const char* image_topic_name, const char* imu_topic_name)
+        : image_sub_(image_topic_name), imu_sub_(imu_topic_name)
+    {
+      imu_sub_.StartWaiting();
+    }
+
+    bool Valid() const { return image_sub_.Valid(); }
+
+    LibXR::ErrorCode Wait(SyncedFrame& out, uint32_t timeout_ms)
+    {
+      while (true)
+      {
+        ImageData image_data;
+        const auto wait_ans = image_sub_.Wait(image_data, timeout_ms);
+        if (wait_ans != LibXR::ErrorCode::OK)
+        {
+          return wait_ans;
+        }
+
+        const ImageFrame* image = image_data.GetData();
+        if (image == nullptr)
+        {
+          LogNullImage();
+          image_data.Reset();
+          continue;
+        }
+
+        if (!imu_sub_.Available())
+        {
+          LogImuNotReady();
+          image_data.Reset();
+          continue;
+        }
+
+        const ImuStamped imu = imu_sub_.GetData();
+        imu_sub_.StartWaiting();
+        if (imu.timestamp_us != image->timestamp_us)
+        {
+          LogImuTimestampMismatch(image->timestamp_us, imu.timestamp_us);
+          image_data.Reset();
+          continue;
+        }
+
+        out.image = std::move(image_data);
+        out.imu = imu;
+        return LibXR::ErrorCode::OK;
+      }
+    }
+
+   private:
+    void LogNullImage()
+    {
+      null_image_count_++;
+      if (null_image_count_ == 1 || null_image_count_ % 200 == 0)
+      {
+        XR_LOG_ERROR("CameraFrameSync::Subscriber: received null image lease (count=%llu)",
+                     static_cast<unsigned long long>(null_image_count_));
+      }
+    }
+
+    void LogImuNotReady()
+    {
+      imu_not_ready_count_++;
+      if (imu_not_ready_count_ == 1 || imu_not_ready_count_ % 200 == 0)
+      {
+        XR_LOG_ERROR(
+            "CameraFrameSync::Subscriber: image arrived before imu was ready (count=%llu)",
+            static_cast<unsigned long long>(imu_not_ready_count_));
+      }
+    }
+
+    void LogImuTimestampMismatch(uint64_t image_timestamp_us, uint64_t imu_timestamp_us)
+    {
+      imu_timestamp_mismatch_count_++;
+      if (imu_timestamp_mismatch_count_ == 1 ||
+          imu_timestamp_mismatch_count_ % 200 == 0)
+      {
+        XR_LOG_ERROR(
+            "CameraFrameSync::Subscriber: image/imu timestamp mismatch image=%llu imu=%llu (count=%llu)",
+            static_cast<unsigned long long>(image_timestamp_us),
+            static_cast<unsigned long long>(imu_timestamp_us),
+            static_cast<unsigned long long>(imu_timestamp_mismatch_count_));
+      }
+    }
+
+   private:
+    typename ImageTopic::Subscriber image_sub_;
+    LibXR::Topic::ASyncSubscriber<ImuStamped> imu_sub_;
+    uint64_t null_image_count_{0};
+    uint64_t imu_not_ready_count_{0};
+    uint64_t imu_timestamp_mismatch_count_{0};
+  };
+
+  CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
+      : camera_(camera),
+        image_topic_name_(camera.ImageTopicName()),
+        imu_topic_name_(camera.ImuTopicName()),
+        image_topic_(image_topic_name_, image_topic_config)
+  {
+    if (!image_topic_.Valid())
+    {
+      XR_LOG_ERROR("CameraFrameSync: failed to create image topic: %s", image_topic_name_);
+      throw std::runtime_error("CameraFrameSync: image topic creation failed");
+    }
+    if (!AcquireInitialWritableImage())
+    {
+      throw std::runtime_error("CameraFrameSync: initial image slot acquisition failed");
+    }
+    if (!camera_.RegisterImageSink(this, current_image_.GetData(), CommitImageAdapter))
+    {
+      current_image_.Reset();
+      throw std::runtime_error("CameraFrameSync: image sink registration failed");
+    }
+
+    XR_LOG_PASS("CameraFrameSync enabled: image=%s imu=%s slot_num=%u queue_num=%u",
+                image_topic_name_, imu_topic_name_,
+                static_cast<unsigned>(image_topic_config.slot_num),
+                static_cast<unsigned>(image_topic_config.queue_num));
   }
 
- private:
-  static const char* SafeCStr(const char* text) { return text != nullptr ? text : ""; }
+  const char* ImageTopicName() const { return image_topic_name_; }
 
-  bool AcquireInitialWritableSlot()
+  const char* ImuTopicName() const { return imu_topic_name_; }
+
+ private:
+  bool AcquireInitialWritableImage()
   {
-    const auto create_ans = output_topic_.CreateData(current_data_);
+    const auto create_ans = image_topic_.CreateData(current_image_);
     if (create_ans != LibXR::ErrorCode::OK)
     {
       XR_LOG_ERROR("CameraFrameSync: initial CreateData failed err=%d",
                    static_cast<int>(create_ans));
       return false;
     }
-    if (current_data_.GetData() == nullptr)
+    if (current_image_.GetData() == nullptr)
     {
-      XR_LOG_ERROR("CameraFrameSync: initial writable frame is null");
-      current_data_.Reset();
+      XR_LOG_ERROR("CameraFrameSync: initial writable image is null");
+      current_image_.Reset();
       return false;
     }
     return true;
   }
 
-  static Frame* CommitFrameAdapter(void* sync_context)
+  static ImageFrame* CommitImageAdapter(void* image_sink_context)
   {
-    return static_cast<Self*>(sync_context)->CommitAndLeaseNext();
+    return static_cast<Self*>(image_sink_context)->CommitImageAndLeaseNext();
   }
 
-  Frame* CommitAndLeaseNext()
+  ImageFrame* CommitImageAndLeaseNext()
   {
-    Frame* current_frame = current_data_.GetData();
-    if (current_frame == nullptr)
+    ImageFrame* current_image = current_image_.GetData();
+    if (current_image == nullptr)
     {
-      XR_LOG_ERROR("CameraFrameSync: current writable frame is null");
+      XR_LOG_ERROR("CameraFrameSync: current writable image is null");
       return nullptr;
     }
 
-    OutputData next_data;
-    const auto create_ans = output_topic_.CreateData(next_data);
+    ImageData next_image;
+    const auto create_ans = image_topic_.CreateData(next_image);
     if (create_ans != LibXR::ErrorCode::OK)
     {
-      dropped_frame_count_++;
-      if (dropped_frame_count_ == 1 || dropped_frame_count_ % 200 == 0)
+      dropped_image_count_++;
+      if (dropped_image_count_ == 1 || dropped_image_count_ % 200 == 0)
       {
         XR_LOG_WARN(
-            "CameraFrameSync: no spare slot, drop current frame and reuse last slot (dropped=%llu, err=%d)",
-            static_cast<unsigned long long>(dropped_frame_count_),
+            "CameraFrameSync: no spare image slot, drop current image and reuse last slot (dropped=%llu, err=%d)",
+            static_cast<unsigned long long>(dropped_image_count_),
             static_cast<int>(create_ans));
       }
-      return current_frame;
+      return current_image;
     }
 
-    const auto publish_ans = output_topic_.Publish(current_data_);
+    const auto publish_ans = image_topic_.Publish(current_image_);
     if (publish_ans != LibXR::ErrorCode::OK)
     {
       publish_fail_count_++;
       if (publish_fail_count_ == 1 || publish_fail_count_ % 200 == 0)
       {
-        XR_LOG_WARN("CameraFrameSync: publish failed (count=%llu, err=%d)",
+        XR_LOG_WARN("CameraFrameSync: image publish failed (count=%llu, err=%d)",
                     static_cast<unsigned long long>(publish_fail_count_),
                     static_cast<int>(publish_ans));
       }
     }
 
-    current_data_ = std::move(next_data);
-    return current_data_.GetData();
+    current_image_ = std::move(next_image);
+    return current_image_.GetData();
   }
 
  private:
   Base& camera_;
-  const char* output_topic_name_;
-  OutputTopic output_topic_;
-  OutputData current_data_{};
-  uint64_t dropped_frame_count_{0};
+  const char* image_topic_name_;
+  const char* imu_topic_name_;
+  ImageTopic image_topic_;
+  ImageData current_image_{};
+  uint64_t dropped_image_count_{0};
   uint64_t publish_fail_count_{0};
 };
