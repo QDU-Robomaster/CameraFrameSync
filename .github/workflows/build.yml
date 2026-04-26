@@ -59,10 +59,7 @@ jobs:
 
       - name: Pull CameraBase dependency
         run: |
-          git clone --depth=1 \
-            --branch feat/camerainfo-staticinfo-cxx20-20260420 \
-            https://github.com/QDU-Robomaster/CameraBase \
-            ./Modules/CameraBase
+          git clone --depth=1 https://github.com/QDU-Robomaster/CameraBase ./Modules/CameraBase
 
       - name: Create FakeCamera module
         run: |
@@ -71,7 +68,7 @@ jobs:
           #pragma once
 
           /* === MODULE MANIFEST V2 ===
-          module_description: Fake camera for CameraFrameSync CI
+          module_description: 用于 CameraFrameSync CI 的假相机
           constructor_args: []
           template_args:
             - Info:
@@ -165,7 +162,6 @@ jobs:
                 Info: {constexpr: TestCameraInfo}
               constructor_args:
                 camera: '@Camera_0'
-                output_topic_name: camera_frame_sync
           EOF
           cat User/xrobot.yaml
 
