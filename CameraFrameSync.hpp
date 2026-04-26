@@ -53,6 +53,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
 
   struct SyncedFrame
   {
+    // image 保持共享 lease 语义，imu 这里直接保留一个按值拷贝。
     ImageData image{};
     ImuStamped imu{};
 
@@ -65,6 +66,8 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
     explicit Subscriber(const Self& sync)
         : image_sub_(sync.ImageTopicName()), imu_sub_(sync.ImuTopicName())
     {
+      // imu 订阅端始终先挂起等待，让 Wait() 可以用“图像到达后读取同时间戳 imu”
+      // 的固定策略工作。
       imu_sub_.StartWaiting();
     }
 
@@ -78,6 +81,8 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
 
     LibXR::ErrorCode Wait(SyncedFrame& out, uint32_t timeout_ms)
     {
+      // 这里以图像到达为主时钟：先等一帧 image，再取当前 imu。
+      // 只有时间戳完全对齐时才把同步帧交给下游。
       while (true)
       {
         ImageData image_data;
@@ -97,6 +102,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
 
         if (!imu_sub_.Available())
         {
+          // image 已经到了，但 imu 还没准备好；直接丢这帧 image，等下一轮。
           LogImuNotReady();
           image_data.Reset();
           continue;
@@ -106,6 +112,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
         imu_sub_.StartWaiting();
         if (imu.timestamp_us != image->timestamp_us)
         {
+          // 当前桥接策略不做“最近邻”或回补，只接受严格同时间戳同步。
           LogImuTimestampMismatch(image->timestamp_us, imu.timestamp_us);
           image_data.Reset();
           continue;
@@ -178,6 +185,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
       throw std::runtime_error("CameraFrameSync: image sink registration failed");
     }
 
+    // 这里不自己起线程；CameraBase 生产者会在自己的发布时间线上调用 sink。
     XR_LOG_PASS("CameraFrameSync enabled: image=%s imu=%s slot_num=%u queue_num=%u",
                 image_topic_name_, imu_topic_name_,
                 static_cast<unsigned>(image_topic_config.slot_num),
@@ -191,6 +199,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
  private:
   ImageFrame* EnsureWritableImageLease()
   {
+    // 正常热路径下会一直持有一块当前可写 lease，只有第一次或异常后才重新申请。
     if (writable_image_lease_.GetData() != nullptr)
     {
       return writable_image_lease_.GetData();
@@ -234,6 +243,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
     if (create_ans != LibXR::ErrorCode::OK)
     {
       dropped_image_count_++;
+      // 申请不到备用槽位时，不阻塞生产者；直接复用当前可写槽位并丢掉新帧。
       if (dropped_image_count_ == 1 || dropped_image_count_ % 200 == 0)
       {
         XR_LOG_WARN(
@@ -248,6 +258,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
     if (publish_ans != LibXR::ErrorCode::OK)
     {
       publish_fail_count_++;
+      // 发布失败同样不回滚到阻塞路径，只做统计并继续向前租下一帧。
       if (publish_fail_count_ == 1 || publish_fail_count_ % 200 == 0)
       {
         XR_LOG_WARN("CameraFrameSync: image publish failed (count=%llu, err=%d)",
@@ -265,6 +276,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
   const char* image_topic_name_;
   const char* imu_topic_name_;
   ImageTopic image_topic_;
+  // 当前始终保留的一块可写共享图像 lease，供 CameraBase 直接写入。
   ImageData writable_image_lease_{};
   uint64_t dropped_image_count_{0};
   uint64_t publish_fail_count_{0};
