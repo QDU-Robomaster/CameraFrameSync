@@ -2,13 +2,13 @@
 
 Shared image-transport bridge plus image+imu sync subscriber.
 
-`CameraFrameSync<Info>` is the current typed image sink implementation for
+`CameraFrameSync<Info>` is the current typed image lease sink implementation for
 `CameraBase<Info>`.
 
 ## Runtime Role
 
 1. lease one writable `ImageFrame` slot from `LinuxSharedTopic`
-2. register itself to `CameraBase<Info>` as the producer-side image sink
+2. register itself to `CameraBase<Info>` as the producer-side image lease sink
 3. when the camera calls `CommitImage()`, publish the current shared slot
 4. lease the next writable slot for the producer
 5. let downstream subscribers wait until image and imu timestamps match

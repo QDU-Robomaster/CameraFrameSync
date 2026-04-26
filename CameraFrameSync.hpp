@@ -33,7 +33,7 @@ depends:
 #include "logger.hpp"
 
 template <CameraTypes::CameraInfo CameraInfoV>
-class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
+class CameraFrameSync : public CameraBase<CameraInfoV>::ImageLeaseSink
 {
  public:
   using Self = CameraFrameSync<CameraInfoV>;
@@ -174,7 +174,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
     }
     if (!camera_.RegisterImageSink(*this))
     {
-      current_image_.Reset();
+      writable_image_lease_.Reset();
       throw std::runtime_error("CameraFrameSync: image sink registration failed");
     }
 
@@ -189,59 +189,62 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
   const char* ImuTopicName() const { return imu_topic_name_; }
 
  private:
-  ImageFrame* AcquireInitialWritableImage() override
+  ImageFrame* EnsureWritableImageLease()
   {
-    if (current_image_.GetData() != nullptr)
+    if (writable_image_lease_.GetData() != nullptr)
     {
-      return current_image_.GetData();
+      return writable_image_lease_.GetData();
     }
 
-    const auto create_ans = image_topic_.CreateData(current_image_);
+    const auto create_ans = image_topic_.CreateData(writable_image_lease_);
     if (create_ans != LibXR::ErrorCode::OK)
     {
-      XR_LOG_ERROR("CameraFrameSync: initial CreateData failed err=%d",
+      XR_LOG_ERROR("CameraFrameSync: AcquireWritableImage CreateData failed err=%d",
                    static_cast<int>(create_ans));
       return nullptr;
     }
-    if (current_image_.GetData() == nullptr)
+    if (writable_image_lease_.GetData() == nullptr)
     {
-      XR_LOG_ERROR("CameraFrameSync: initial writable image is null");
-      current_image_.Reset();
+      XR_LOG_ERROR("CameraFrameSync: acquired writable image is null");
+      writable_image_lease_.Reset();
       return nullptr;
     }
-    return current_image_.GetData();
+    return writable_image_lease_.GetData();
   }
 
-  ImageFrame* CommitImageAndGetNextWritable(ImageFrame& committed_image) override
+  ImageFrame* AcquireWritableImage() override { return EnsureWritableImageLease(); }
+
+  ImageFrame* CommitAndAcquireNextWritableImage(
+      ImageFrame& committed_image) override
   {
-    ImageFrame* current_image = current_image_.GetData();
-    if (current_image == nullptr)
+    ImageFrame* current_writable_image = writable_image_lease_.GetData();
+    if (current_writable_image == nullptr)
     {
       XR_LOG_ERROR("CameraFrameSync: current writable image is null");
       return nullptr;
     }
-    if (&committed_image != current_image)
+    if (&committed_image != current_writable_image)
     {
       XR_LOG_ERROR("CameraFrameSync: committed image does not match current writable slot");
       return nullptr;
     }
 
-    ImageData next_image;
-    const auto create_ans = image_topic_.CreateData(next_image);
+    ImageData next_writable_image_lease;
+    const auto create_ans = image_topic_.CreateData(next_writable_image_lease);
     if (create_ans != LibXR::ErrorCode::OK)
     {
       dropped_image_count_++;
       if (dropped_image_count_ == 1 || dropped_image_count_ % 200 == 0)
       {
         XR_LOG_WARN(
-            "CameraFrameSync: no spare image slot, drop current image and reuse last slot (dropped=%llu, err=%d)",
+            "CameraFrameSync: no spare image slot, drop current image and reuse current writable slot (dropped=%llu, err=%d)",
             static_cast<unsigned long long>(dropped_image_count_),
             static_cast<int>(create_ans));
       }
-      return current_image;
+      return current_writable_image;
     }
 
-    const auto publish_ans = image_topic_.Publish(current_image_);
+    const auto publish_ans = image_topic_.Publish(writable_image_lease_);
     if (publish_ans != LibXR::ErrorCode::OK)
     {
       publish_fail_count_++;
@@ -253,8 +256,8 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
       }
     }
 
-    current_image_ = std::move(next_image);
-    return current_image_.GetData();
+    writable_image_lease_ = std::move(next_writable_image_lease);
+    return writable_image_lease_.GetData();
   }
 
  private:
@@ -262,7 +265,7 @@ class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
   const char* image_topic_name_;
   const char* imu_topic_name_;
   ImageTopic image_topic_;
-  ImageData current_image_{};
+  ImageData writable_image_lease_{};
   uint64_t dropped_image_count_{0};
   uint64_t publish_fail_count_{0};
 };
