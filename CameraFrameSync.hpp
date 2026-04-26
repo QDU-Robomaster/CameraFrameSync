@@ -33,7 +33,7 @@ depends:
 #include "logger.hpp"
 
 template <CameraTypes::CameraInfo CameraInfoV>
-class CameraFrameSync
+class CameraFrameSync : public CameraBase<CameraInfoV>::ImageSink
 {
  public:
   using Self = CameraFrameSync<CameraInfoV>;
@@ -172,11 +172,7 @@ class CameraFrameSync
       XR_LOG_ERROR("CameraFrameSync: failed to create image topic: %s", image_topic_name_);
       throw std::runtime_error("CameraFrameSync: image topic creation failed");
     }
-    if (!AcquireInitialWritableImage())
-    {
-      throw std::runtime_error("CameraFrameSync: initial image slot acquisition failed");
-    }
-    if (!camera_.RegisterImageSink(this, current_image_.GetData(), CommitImageAdapter))
+    if (!camera_.RegisterImageSink(*this))
     {
       current_image_.Reset();
       throw std::runtime_error("CameraFrameSync: image sink registration failed");
@@ -193,35 +189,40 @@ class CameraFrameSync
   const char* ImuTopicName() const { return imu_topic_name_; }
 
  private:
-  bool AcquireInitialWritableImage()
+  ImageFrame* AcquireInitialWritableImage() override
   {
+    if (current_image_.GetData() != nullptr)
+    {
+      return current_image_.GetData();
+    }
+
     const auto create_ans = image_topic_.CreateData(current_image_);
     if (create_ans != LibXR::ErrorCode::OK)
     {
       XR_LOG_ERROR("CameraFrameSync: initial CreateData failed err=%d",
                    static_cast<int>(create_ans));
-      return false;
+      return nullptr;
     }
     if (current_image_.GetData() == nullptr)
     {
       XR_LOG_ERROR("CameraFrameSync: initial writable image is null");
       current_image_.Reset();
-      return false;
+      return nullptr;
     }
-    return true;
+    return current_image_.GetData();
   }
 
-  static ImageFrame* CommitImageAdapter(void* image_sink_context)
-  {
-    return static_cast<Self*>(image_sink_context)->CommitImageAndLeaseNext();
-  }
-
-  ImageFrame* CommitImageAndLeaseNext()
+  ImageFrame* CommitImageAndGetNextWritable(ImageFrame& committed_image) override
   {
     ImageFrame* current_image = current_image_.GetData();
     if (current_image == nullptr)
     {
       XR_LOG_ERROR("CameraFrameSync: current writable image is null");
+      return nullptr;
+    }
+    if (&committed_image != current_image)
+    {
+      XR_LOG_ERROR("CameraFrameSync: committed image does not match current writable slot");
       return nullptr;
     }
 

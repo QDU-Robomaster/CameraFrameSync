@@ -1,35 +1,39 @@
 # CameraFrameSync
 
-Shared synced-frame payload definition for `camera_frame_sync(shared)`.
+Shared image-transport bridge plus image+imu sync subscriber.
 
-`CameraFrameSync<Info>` no longer owns a runtime forwarding module.
+`CameraFrameSync<Info>` is the current typed image sink implementation for
+`CameraBase<Info>`.
 
-The runtime publisher is now `WebotsCamera<Info>` itself:
+## Runtime Role
 
-1. sample pose and motion
-2. create one shared payload slot directly
-3. write image bytes into that final payload
-4. publish without blocking
+1. lease one writable `ImageFrame` slot from `LinuxSharedTopic`
+2. register itself to `CameraBase<Info>` as the producer-side image sink
+3. when the camera calls `CommitImage()`, publish the current shared slot
+4. lease the next writable slot for the producer
+5. let downstream subscribers wait until image and imu timestamps match
 
-Output topic remains:
+## Output Topics
 
-- `camera_frame_sync(shared)`
+- image shared topic:
+  - same name as `camera.ImageTopicName()`
+- imu async topic:
+  - same name as `camera.ImuTopicName()`
 
-Current shared payload layout:
+## Synced Payload
 
-- `image.timestamp_us`
-- `image.sequence`
-- `image.data`
-- `pose.rotation_wxyz`
-- `pose.translation_xyz`
-- `motion.angular_velocity_xyz`
-- `motion.linear_acceleration_xyz`
+- `SyncedFrame.image`
+  - shared lease of `CameraBase<Info>::ImageFrame`
+- `SyncedFrame.imu`
+  - copied `CameraBase<Info>::ImuStamped`
 
-Default shared topic policy:
+## Default Policy
 
 - `slot_num = 8`
 - `queue_num = 2`
-- producer path is non-blocking; if no writable slot is available, the new frame is dropped
+- producer path is non-blocking
+- if no spare writable slot is available, the current writable slot is reused
+  and the new frame is dropped
 
 ## Template Arguments
 
