@@ -530,10 +530,20 @@ class CameraFrameSync
     while (!pending_image_events_.empty())
     {
       const ImageEvent image_event = pending_image_events_.front();
+      if (NeedMoreImuFor(image_event))
+      {
+        break;
+      }
+
       pending_image_events_.pop_front();
 
       const AssembledImu* imu = FindMatchedImu(image_event);
-      if (imu == nullptr || !CadenceAcceptable(image_event, *imu))
+      if (imu == nullptr)
+      {
+        EnterRecovering();
+        continue;
+      }
+      if (!CadenceAcceptable(image_event, *imu))
       {
         EnterRecovering();
         continue;
@@ -544,6 +554,22 @@ class CameraFrameSync
     }
   }
 
+  bool NeedMoreImuFor(const ImageEvent& image_event) const
+  {
+    if (imu_history_.empty())
+    {
+      return true;
+    }
+
+    return imu_history_.back().timestamp_us < TargetTimestampUs(image_event);
+  }
+
+  uint64_t TargetTimestampUs(const ImageEvent& image_event) const
+  {
+    const SyncConfig config = const_cast<Self*>(this)->SnapshotSyncConfig();
+    return ApplyOffset(image_event.sensor_timestamp_us, config.offset_us);
+  }
+
   const AssembledImu* FindMatchedImu(const ImageEvent& image_event) const
   {
     if (imu_history_.empty())
@@ -551,9 +577,7 @@ class CameraFrameSync
       return nullptr;
     }
 
-    const SyncConfig config = const_cast<Self*>(this)->SnapshotSyncConfig();
-    const uint64_t target_us =
-        ApplyOffset(image_event.sensor_timestamp_us, config.offset_us);
+    const uint64_t target_us = TargetTimestampUs(image_event);
     const uint64_t tolerance_us =
         std::max<uint64_t>(1000ULL, last_imu_period_us_ != 0 ? last_imu_period_us_ * 2 : 10000ULL);
 
@@ -603,7 +627,7 @@ class CameraFrameSync
     {
       return false;
     }
-    if (last_imu_period_us_ != 0 && imu_dt > last_imu_period_us_ * 4)
+    if (AbsDiff(imu_dt, image_dt) > image_tol)
     {
       return false;
     }
