@@ -45,13 +45,14 @@
 2. `image_event` 回调作为唯一同步触发点，串行排空所有 ingress
 3. 以 `gyro` 为主时间轴，向后找第一条时间不早于它的 `accl / quat`，组装原始 IMU 历史
 4. 对正常图像流记录 `rx_time` 周期，估算 `image_rate / imu_rate` 的整数步长
-5. 当收到探针帧（`image_event.sync_cmd_id != 0`）时：
-   - 利用“前一张普通图像 -> 当前探针图像”的**双周期变化**
+5. 发出一次性 `sensor_sync_cmd` 后，等待 `image_event` 出现 `T -> 2T -> T` 的节拍变化
+6. 对 probe 帧：
+   - 利用“前一张普通图像 -> 当前 probe 图像”的**双周期变化**
    - 在主机侧 `rx_time` 上搜索最合理的同步 gyro 帧
-   - 由此锁定 `image -> sync gyro frame` 的对应关系
-6. 锁定后，后续图像按固定步长直接预测目标 gyro 序号
-7. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
-8. 若出现超时、队列溢出、host skew 突变、探针超时等情况，则进入 `RECOVERING` 并重新发探针
+   - 锁住 `image -> sync gyro frame` 的对应关系
+7. 锁定后，后续图像按 `host skew` 稳定性与 IMU 域周期一致性继续跟踪，不依赖 `seq/id`
+8. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
+9. 若出现超时、队列溢出、host skew 突变、图像周期异常、探针超时等情况，则进入 `RECOVERING` 并重新发探针
 
 ## `Subscriber` 语义
 

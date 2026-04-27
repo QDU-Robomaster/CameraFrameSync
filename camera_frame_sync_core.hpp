@@ -133,10 +133,19 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
   return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
 }
 
-inline uint64_t SequenceSearchToleranceUs(uint64_t imu_rx_period_us)
+inline uint64_t HostSkewToleranceUs(uint64_t imu_rx_period_us)
 {
   return std::max<uint64_t>(3000ULL,
                             imu_rx_period_us != 0 ? imu_rx_period_us * 4 : 12000ULL);
+}
+
+inline uint64_t ImageGapToleranceUs(uint64_t image_period_us, uint64_t imu_rx_period_us)
+{
+  const uint64_t upper =
+      image_period_us != 0 ? std::min<uint64_t>(image_period_us / 3U,
+                                                HostSkewToleranceUs(imu_rx_period_us))
+                           : 3000ULL;
+  return std::max<uint64_t>(1500ULL, upper);
 }
 
 inline uint64_t OffsetSearchToleranceUs(uint64_t imu_sensor_period_us, uint32_t stride_samples)
@@ -148,41 +157,38 @@ inline uint64_t OffsetSearchToleranceUs(uint64_t imu_sensor_period_us, uint32_t 
   return std::max<uint64_t>(4000ULL, base);
 }
 
+inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
+                                         uint64_t imu_sensor_period_us)
+{
+  const uint64_t base = std::max<uint64_t>(sync_sensor_gap_us / 4U,
+                                           imu_sensor_period_us != 0 ? imu_sensor_period_us * 4U
+                                                                     : 4000ULL);
+  return std::max<uint64_t>(4000ULL, base);
+}
+
 template <typename ImuHistoryContainer>
-const typename ImuHistoryContainer::ValueType* FindBySequence(
-    const ImuHistoryContainer& imu_history, uint32_t expected_sequence,
-    uint32_t max_error_samples, uint32_t* matched_error_samples = nullptr)
+const typename ImuHistoryContainer::ValueType* FindByRxTime(
+    const ImuHistoryContainer& imu_history, uint64_t expected_rx_time_us, uint64_t tolerance_us)
 {
   const typename ImuHistoryContainer::ValueType* best = nullptr;
-  uint32_t best_error = std::numeric_limits<uint32_t>::max();
+  uint64_t best_error = std::numeric_limits<uint64_t>::max();
 
   for (size_t i = imu_history.Size(); i > 0; --i)
   {
     const auto& imu = imu_history[i - 1];
-    const uint32_t error = imu.sensor_sequence >= expected_sequence
-                               ? (imu.sensor_sequence - expected_sequence)
-                               : (expected_sequence - imu.sensor_sequence);
+    const uint64_t error = AbsDiffUs(imu.rx_time_us, expected_rx_time_us);
     if (error < best_error)
     {
       best = &imu;
       best_error = error;
     }
-    if (imu.sensor_sequence + max_error_samples < expected_sequence)
+    if (imu.rx_time_us + tolerance_us < expected_rx_time_us)
     {
       break;
     }
   }
 
-  if (best == nullptr || best_error > max_error_samples)
-  {
-    return nullptr;
-  }
-
-  if (matched_error_samples != nullptr)
-  {
-    *matched_error_samples = best_error;
-  }
-  return best;
+  return (best != nullptr && best_error <= tolerance_us) ? best : nullptr;
 }
 
 template <typename ImuHistoryContainer>
