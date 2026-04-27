@@ -1,15 +1,91 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <limits>
 
 namespace CameraFrameSyncCore
 {
 // 这里只保留“按时间序列对齐图像和 IMU”相关的纯逻辑。
 // 生产代码和独立序列测试共用这一份，避免两边各写一套。
+
+template <typename T, size_t Capacity>
+class FixedRingBuffer
+{
+ public:
+  using ValueType = T;
+
+  static_assert(Capacity > 0, "FixedRingBuffer requires non-zero capacity");
+
+  bool Empty() const { return size_ == 0; }
+
+  size_t Size() const { return size_; }
+
+  const T& Front() const { return storage_[head_]; }
+
+  const T& Back() const { return storage_[PhysicalIndex(size_ - 1)]; }
+
+  T& operator[](size_t index) { return storage_[PhysicalIndex(index)]; }
+
+  const T& operator[](size_t index) const { return storage_[PhysicalIndex(index)]; }
+
+  // 队列满时覆盖最旧样本，调用方可据返回值决定是否进入恢复态。
+  bool PushBackDropOldest(const T& value)
+  {
+    if (size_ < Capacity)
+    {
+      storage_[PhysicalIndex(size_)] = value;
+      ++size_;
+      return false;
+    }
+
+    storage_[head_] = value;
+    head_ = Increment(head_);
+    return true;
+  }
+
+  void PopFront()
+  {
+    if (size_ == 0)
+    {
+      return;
+    }
+
+    head_ = Increment(head_);
+    --size_;
+  }
+
+  void PopFrontN(size_t count)
+  {
+    if (count >= size_)
+    {
+      head_ = 0;
+      size_ = 0;
+      return;
+    }
+
+    head_ = PhysicalIndex(count);
+    size_ -= count;
+  }
+
+ private:
+  size_t PhysicalIndex(size_t logical_index) const
+  {
+    return (head_ + logical_index) % Capacity;
+  }
+
+  size_t Increment(size_t index) const
+  {
+    return (index + 1) % Capacity;
+  }
+
+ private:
+  std::array<T, Capacity> storage_{};
+  size_t head_{0};
+  size_t size_{0};
+};
 
 enum class SyncState : uint8_t
 {
@@ -81,11 +157,11 @@ inline uint64_t CadenceToleranceUs(uint64_t last_imu_period_us)
 }
 
 template <typename ImageEventLike, typename ImuHistoryContainer>
-const typename ImuHistoryContainer::value_type* FindMatchedImu(
+const typename ImuHistoryContainer::ValueType* FindMatchedImu(
     const ImageEventLike& image_event, const ImuHistoryContainer& imu_history,
     int32_t offset_us, uint64_t last_imu_period_us)
 {
-  if (imu_history.empty())
+  if (imu_history.Empty())
   {
     return nullptr;
   }
@@ -93,17 +169,18 @@ const typename ImuHistoryContainer::value_type* FindMatchedImu(
   const uint64_t target_us = ImageEventTargetTimestampUs(image_event, offset_us);
   const uint64_t tolerance_us = MatchToleranceUs(last_imu_period_us);
 
-  const typename ImuHistoryContainer::value_type* best = nullptr;
+  const typename ImuHistoryContainer::ValueType* best = nullptr;
   uint64_t best_error = std::numeric_limits<uint64_t>::max();
-  for (auto it = imu_history.rbegin(); it != imu_history.rend(); ++it)
+  for (size_t i = imu_history.Size(); i > 0; --i)
   {
-    const uint64_t error = AbsDiffUs(it->timestamp_us, target_us);
+    const auto& imu = imu_history[i - 1];
+    const uint64_t error = AbsDiffUs(imu.timestamp_us, target_us);
     if (error < best_error)
     {
-      best = &(*it);
+      best = &imu;
       best_error = error;
     }
-    if (it->timestamp_us + tolerance_us < target_us)
+    if (imu.timestamp_us + tolerance_us < target_us)
     {
       break;
     }
@@ -217,39 +294,52 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
                       uint64_t& last_imu_period_us, size_t history_limit,
                       MakeImuFn&& make_imu)
 {
-  if (pending_gyros.empty())
+  if (pending_gyros.Empty())
   {
     return false;
   }
 
-  const auto& gyro = pending_gyros.front();
-  auto accl_it = std::find_if(
-      pending_accls.begin(), pending_accls.end(),
-      [&](const auto& sample)
-      { return sample.sensor_timestamp_us >= gyro.sensor_timestamp_us; });
-  auto quat_it = std::find_if(
-      pending_quats.begin(), pending_quats.end(),
-      [&](const auto& sample)
-      { return sample.sensor_timestamp_us >= gyro.sensor_timestamp_us; });
-  if (accl_it == pending_accls.end() || quat_it == pending_quats.end())
+  const auto& gyro = pending_gyros.Front();
+  size_t accl_index = pending_accls.Size();
+  for (size_t i = 0; i < pending_accls.Size(); ++i)
+  {
+    if (pending_accls[i].sensor_timestamp_us >= gyro.sensor_timestamp_us)
+    {
+      accl_index = i;
+      break;
+    }
+  }
+
+  size_t quat_index = pending_quats.Size();
+  for (size_t i = 0; i < pending_quats.Size(); ++i)
+  {
+    if (pending_quats[i].sensor_timestamp_us >= gyro.sensor_timestamp_us)
+    {
+      quat_index = i;
+      break;
+    }
+  }
+
+  if (accl_index == pending_accls.Size() || quat_index == pending_quats.Size())
   {
     return false;
   }
 
-  if (!imu_history.empty() && gyro.sensor_timestamp_us > imu_history.back().timestamp_us)
+  if (!imu_history.Empty() && gyro.sensor_timestamp_us > imu_history.Back().timestamp_us)
   {
-    last_imu_period_us = gyro.sensor_timestamp_us - imu_history.back().timestamp_us;
+    last_imu_period_us = gyro.sensor_timestamp_us - imu_history.Back().timestamp_us;
   }
 
-  imu_history.push_back(make_imu(gyro, *accl_it, *quat_it));
-  while (imu_history.size() > history_limit)
+  if (imu_history.Size() >= history_limit)
   {
-    imu_history.pop_front();
+    imu_history.PopFront();
   }
+  imu_history.PushBackDropOldest(make_imu(gyro, pending_accls[accl_index],
+                                          pending_quats[quat_index]));
 
-  pending_gyros.pop_front();
-  pending_accls.erase(pending_accls.begin(), std::next(accl_it));
-  pending_quats.erase(pending_quats.begin(), std::next(quat_it));
+  pending_gyros.PopFront();
+  pending_accls.PopFrontN(accl_index + 1);
+  pending_quats.PopFrontN(quat_index + 1);
   return true;
 }
 

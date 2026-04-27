@@ -26,7 +26,6 @@ depends:
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -117,23 +116,23 @@ class CameraFrameSync
         while (true)
         {
           DrainImuQueue();
-          while (!pending_imus_.empty() &&
-                 pending_imus_.front().timestamp_us < image_timestamp_us)
+          while (!pending_imus_.Empty() &&
+                 pending_imus_.Front().timestamp_us < image_timestamp_us)
           {
-            pending_imus_.pop_front();
+            pending_imus_.PopFront();
           }
 
-          if (!pending_imus_.empty() &&
-              pending_imus_.front().timestamp_us == image_timestamp_us)
+          if (!pending_imus_.Empty() &&
+              pending_imus_.Front().timestamp_us == image_timestamp_us)
           {
             out.image = std::move(image_data);
-            out.imu = pending_imus_.front();
-            pending_imus_.pop_front();
+            out.imu = pending_imus_.Front();
+            pending_imus_.PopFront();
             return LibXR::ErrorCode::OK;
           }
 
-          if (!pending_imus_.empty() &&
-              pending_imus_.front().timestamp_us > image_timestamp_us)
+          if (!pending_imus_.Empty() &&
+              pending_imus_.Front().timestamp_us > image_timestamp_us)
           {
             image_data.Reset();
             break;
@@ -181,11 +180,7 @@ class CameraFrameSync
       ImuStamped imu{};
       while (imu_queue_.Pop(imu) == LibXR::ErrorCode::OK)
       {
-        pending_imus_.push_back(imu);
-        while (pending_imus_.size() > kQueueLength)
-        {
-          pending_imus_.pop_front();
-        }
+        pending_imus_.PushBackDropOldest(imu);
       }
     }
 
@@ -193,7 +188,7 @@ class CameraFrameSync
     typename ImageTopic::Subscriber image_sub_;
     LibXR::LockFreeQueue<ImuStamped> imu_queue_;
     LibXR::Topic::QueuedSubscriber imu_sub_;
-    std::deque<ImuStamped> pending_imus_{};
+    CameraFrameSyncCore::FixedRingBuffer<ImuStamped, kQueueLength> pending_imus_{};
   };
 
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
@@ -269,6 +264,8 @@ class CameraFrameSync
  private:
   using SyncLockState = CameraFrameSyncCore::SyncLockState;
   using SyncCadenceState = CameraFrameSyncCore::SyncCadenceState;
+  template <typename T, size_t Capacity>
+  using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
 
   struct AssembledImu
   {
@@ -412,40 +409,26 @@ class CameraFrameSync
     GyroStamped gyro{};
     while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
     {
-      pending_gyros_.push_back(gyro);
-      while (pending_gyros_.size() > kPendingLimit)
-      {
-        pending_gyros_.pop_front();
-      }
+      pending_gyros_.PushBackDropOldest(gyro);
     }
 
     AcclStamped accl{};
     while (accl_ingress_.Pop(accl) == LibXR::ErrorCode::OK)
     {
-      pending_accls_.push_back(accl);
-      while (pending_accls_.size() > kPendingLimit)
-      {
-        pending_accls_.pop_front();
-      }
+      pending_accls_.PushBackDropOldest(accl);
     }
 
     QuatStamped quat{};
     while (quat_ingress_.Pop(quat) == LibXR::ErrorCode::OK)
     {
-      pending_quats_.push_back(quat);
-      while (pending_quats_.size() > kPendingLimit)
-      {
-        pending_quats_.pop_front();
-      }
+      pending_quats_.PushBackDropOldest(quat);
     }
 
     ImageEvent image_event{};
     while (image_event_ingress_.Pop(image_event) == LibXR::ErrorCode::OK)
     {
-      pending_image_events_.push_back(image_event);
-      while (pending_image_events_.size() > kPendingLimit)
+      if (pending_image_events_.PushBackDropOldest(image_event))
       {
-        pending_image_events_.pop_front();
         overflowed_.store(true, std::memory_order_relaxed);
       }
     }
@@ -474,19 +457,19 @@ class CameraFrameSync
 
   void DrainPendingImageEvents(const SyncConfig& config)
   {
-    while (!pending_image_events_.empty())
+    while (!pending_image_events_.Empty())
     {
-      const ImageEvent image_event = pending_image_events_.front();
-      const bool has_imu_history = !imu_history_.empty();
+      const ImageEvent image_event = pending_image_events_.Front();
+      const bool has_imu_history = !imu_history_.Empty();
       const uint64_t newest_imu_timestamp_us =
-          has_imu_history ? imu_history_.back().timestamp_us : 0ULL;
+          has_imu_history ? imu_history_.Back().timestamp_us : 0ULL;
       if (CameraFrameSyncCore::NeedMoreImuForImage(
               image_event, has_imu_history, newest_imu_timestamp_us, config.offset_us))
       {
         break;
       }
 
-      pending_image_events_.pop_front();
+      pending_image_events_.PopFront();
 
       const AssembledImu* imu = CameraFrameSyncCore::FindMatchedImu(
           image_event, imu_history_, config.offset_us, cadence_state_.last_imu_period_us);
@@ -575,11 +558,11 @@ class CameraFrameSync
   std::atomic<bool> overflowed_{false};
 
   // 下面这些状态只在 image_event 触发的串行路径里访问。
-  std::deque<GyroStamped> pending_gyros_{};
-  std::deque<AcclStamped> pending_accls_{};
-  std::deque<QuatStamped> pending_quats_{};
-  std::deque<ImageEvent> pending_image_events_{};
-  std::deque<AssembledImu> imu_history_{};
+  FixedRingBuffer<GyroStamped, kPendingLimit> pending_gyros_{};
+  FixedRingBuffer<AcclStamped, kPendingLimit> pending_accls_{};
+  FixedRingBuffer<QuatStamped, kPendingLimit> pending_quats_{};
+  FixedRingBuffer<ImageEvent, kPendingLimit> pending_image_events_{};
+  FixedRingBuffer<AssembledImu, kHistoryLimit> imu_history_{};
   LibXR::Mutex sync_state_mutex_{};
 
   LibXR::Mutex sync_config_mutex_{};

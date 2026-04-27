@@ -1,5 +1,4 @@
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <iostream>
 #include <sstream>
@@ -43,19 +42,22 @@ struct TestImu
 class SequenceHarness
 {
  public:
+  template <typename T, size_t Capacity>
+  using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
+
   void SetOffsetUs(int32_t offset_us) { offset_us_ = offset_us; }
 
   void SetRelockConfirmFrames(uint32_t frames) { relock_confirm_frames_ = frames; }
 
-  void PushGyro(uint64_t timestamp_us) { pending_gyros_.push_back({timestamp_us}); }
+  void PushGyro(uint64_t timestamp_us) { pending_gyros_.PushBackDropOldest({timestamp_us}); }
 
-  void PushAccl(uint64_t timestamp_us) { pending_accls_.push_back({timestamp_us}); }
+  void PushAccl(uint64_t timestamp_us) { pending_accls_.PushBackDropOldest({timestamp_us}); }
 
-  void PushQuat(uint64_t timestamp_us) { pending_quats_.push_back({timestamp_us}); }
+  void PushQuat(uint64_t timestamp_us) { pending_quats_.PushBackDropOldest({timestamp_us}); }
 
   void PushImage(uint64_t timestamp_us, uint32_t sequence)
   {
-    pending_image_events_.push_back({timestamp_us, sequence});
+    pending_image_events_.PushBackDropOldest({timestamp_us, sequence});
   }
 
   void Drain()
@@ -74,18 +76,18 @@ class SequenceHarness
     {
     }
 
-    while (!pending_image_events_.empty())
+    while (!pending_image_events_.Empty())
     {
-      const TestImageEvent image_event = pending_image_events_.front();
-      const bool has_imu_history = !imu_history_.empty();
+      const TestImageEvent image_event = pending_image_events_.Front();
+      const bool has_imu_history = !imu_history_.Empty();
       const uint64_t newest_imu_ts =
-          has_imu_history ? imu_history_.back().timestamp_us : 0ULL;
+          has_imu_history ? imu_history_.Back().timestamp_us : 0ULL;
       if (NeedMoreImuForImage(image_event, has_imu_history, newest_imu_ts, offset_us_))
       {
         break;
       }
 
-      pending_image_events_.pop_front();
+      pending_image_events_.PopFront();
       const TestImu* imu =
           FindMatchedImu(image_event, imu_history_, offset_us_,
                          cadence_state_.last_imu_period_us);
@@ -109,13 +111,13 @@ class SequenceHarness
     }
   }
 
-  size_t PendingImageCount() const { return pending_image_events_.size(); }
+  size_t PendingImageCount() const { return pending_image_events_.Size(); }
 
-  size_t PendingGyroCount() const { return pending_gyros_.size(); }
+  size_t PendingGyroCount() const { return pending_gyros_.Size(); }
 
-  size_t PendingAcclCount() const { return pending_accls_.size(); }
+  size_t PendingAcclCount() const { return pending_accls_.Size(); }
 
-  size_t PendingQuatCount() const { return pending_quats_.size(); }
+  size_t PendingQuatCount() const { return pending_quats_.Size(); }
 
   const std::vector<uint64_t>& PublishedImages() const { return published_images_; }
 
@@ -139,11 +141,11 @@ class SequenceHarness
   uint32_t relock_confirm_frames_{3};
   SyncLockState lock_state_{};
   SyncCadenceState cadence_state_{};
-  std::deque<TestGyro> pending_gyros_{};
-  std::deque<TestAccl> pending_accls_{};
-  std::deque<TestQuat> pending_quats_{};
-  std::deque<TestImageEvent> pending_image_events_{};
-  std::deque<TestImu> imu_history_{};
+  FixedRingBuffer<TestGyro, kHistoryLimit> pending_gyros_{};
+  FixedRingBuffer<TestAccl, kHistoryLimit> pending_accls_{};
+  FixedRingBuffer<TestQuat, kHistoryLimit> pending_quats_{};
+  FixedRingBuffer<TestImageEvent, kHistoryLimit> pending_image_events_{};
+  FixedRingBuffer<TestImu, kHistoryLimit> imu_history_{};
   std::vector<uint64_t> published_images_{};
   std::vector<TestImu> published_imus_{};
   std::vector<uint64_t> cadence_reject_timestamps_{};
