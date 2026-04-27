@@ -74,6 +74,8 @@ struct TestImu
 
 struct ImageInput
 {
+  // 测试侧显式构造的图像输入。这里把 step/rx/tag 拆开，方便混合正常节拍、
+  // 抖动节拍和带 host skew 的场景，不必每次手写完整 PushImage 参数列表。
   uint64_t sensor_timestamp_us{};
   uint32_t sensor_step_index{};
   uint64_t rx_time_us{};
@@ -88,6 +90,7 @@ struct ImageReference
 
 struct CadenceObservation
 {
+  // 这四路观察状态与正式模块保持一致，用来驱动“先稳定观察，再发 probe”。
   RxCadenceState gyro{};
   RxCadenceState accl{};
   RxCadenceState quat{};
@@ -96,6 +99,8 @@ struct CadenceObservation
 
 struct SyncRelation
 {
+  // 这组关系描述“上一张接受图像”和“上一条同步 IMU”之间的已锁定节拍。
+  // 进入锁定/稳态后，测试也沿着这组量递推，而不是每帧重新全局匹配。
   uint64_t base_image_rx_period_us{0};
   uint64_t last_imu_sensor_period_us{0};
   uint64_t last_imu_rx_period_us{0};
@@ -979,6 +984,7 @@ void PushImageAndDrain(SequenceHarness& harness, const ImageInput& image)
 void PushImageSequenceAndDrain(SequenceHarness& harness,
                                std::initializer_list<ImageInput> images)
 {
+  // 图像在测试里总是同步触发点；这里保持“一张图像推进一次状态机”的阅读方式。
   for (const ImageInput& image : images)
   {
     PushImageAndDrain(harness, image);
@@ -989,6 +995,8 @@ void PushImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t en
                      uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us,
                      bool drain_after_each_sample)
 {
+  // `drain_after_each_sample=true` 模拟 IMU 边到边消费；
+  // `false` 模拟 IMU 先堆积，之后再由图像触发点统一处理。
   for (uint32_t index = begin_index; index <= end_index; ++index)
   {
     const uint64_t sensor_timestamp_us = static_cast<uint64_t>(index) * sensor_step_us;
@@ -1032,6 +1040,7 @@ void QueueDefaultImuTriplets(SequenceHarness& harness, uint32_t begin_index, uin
 void PrimeProbeReadyState(SequenceHarness& harness, uint32_t imu_end_index,
                           uint64_t image_rx_bias_us)
 {
+  // 预热到“图像/IMU cadence 已稳定，并且下一张正常图像到来时允许发 probe”。
   FeedDefaultImuTriplets(harness, 1, imu_end_index);
   PushImageSequenceAndDrain(harness, {
                                         StepImage(4, image_rx_bias_us, 0),
@@ -1043,6 +1052,8 @@ void PrimeProbeReadyState(SequenceHarness& harness, uint32_t imu_end_index,
 void BuildInitialSyncedState(SequenceHarness& harness, uint32_t imu_end_index,
                              uint64_t image_rx_bias_us)
 {
+  // 在 `PrimeProbeReadyState()` 基础上再走完 probe 锁定和两张稳态图像，
+  // 把状态直接推进到 `SYNCED`，供后续“失稳再恢复”类测试复用。
   FeedDefaultImuTriplets(harness, 1, imu_end_index);
   PushImageSequenceAndDrain(harness, {
                                         StepImage(4, image_rx_bias_us, 0),
@@ -1193,6 +1204,7 @@ void TestTrackedFrameWaitsForLateImu()
   {
     SequenceHarness harness;
 
+    // 先把系统推进到“probe 已发出，但 probe 命中的 IMU 还没全部到齐”。
     PrimeProbeReadyState(harness, 20, test_case.image_rx_bias_us);
     PushImageAndDrain(harness, StepImage(20, test_case.image_rx_bias_us, 3));
     if (test_case.lock_publish_end_index > 20)
@@ -1245,6 +1257,7 @@ void TestPositiveOffsetWaitsForFutureImu()
     SequenceHarness harness;
     harness.SetOffsetUs(test_case.offset_us);
 
+    // 这里同步 IMU 本身可以先锁到，但 offset 对应的最终 IMU 还在未来。
     PrimeProbeReadyState(harness, 20, test_case.image_rx_bias_us);
     PushImageAndDrain(harness, StepImage(20, test_case.image_rx_bias_us, 3));
 
@@ -1320,6 +1333,7 @@ void TestImageCadenceBreakResetsAndRelocks()
   BuildInitialSyncedState(harness, 58, 120);
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "initial sync state");
 
+  // 第一阶段：图像 cadence 断裂，系统应立即退回观察态。
   PushImageAndDrain(harness, StepImage(34, 120, 6));
   ExpectEqual(harness.CurrentState(), SyncState::OBSERVING,
               "cadence break should reset to observing");
@@ -1333,6 +1347,7 @@ void TestImageCadenceBreakResetsAndRelocks()
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(2),
               "restabilized cadence should send second probe");
 
+  // 第二阶段：重新发 probe 后再次锁定，并恢复稳态发布。
   PushImageSequenceAndDrain(harness, {
                                         StepImage(50, 120, 9),
                                         StepImage(54, 120, 10),
@@ -1353,6 +1368,7 @@ void TestRawImuCadenceBreakResetsAndRelocks()
   BuildInitialSyncedState(harness, 56, 120);
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "raw imu break bootstrap state");
 
+  // 第一阶段：只打断 raw IMU 节拍，图像节拍保持正常，系统也必须退回观察态。
   harness.PushGyro(29000, 29600);
   harness.PushAccl(29000, 29620);
   harness.PushQuat(29000, 29640);
@@ -1364,6 +1380,7 @@ void TestRawImuCadenceBreakResetsAndRelocks()
 
   QueueDefaultImuTriplets(harness, 30, 56, 600);
   harness.Drain();
+  // 第二阶段：raw IMU 节拍恢复稳定后，再靠正常图像 cadence 重发 probe。
   PushImageSequenceAndDrain(harness, {
                                         StepImage(32, 120, 6),
                                         StepImage(36, 120, 7),
@@ -1388,6 +1405,7 @@ void TestCompositeMixedSequence()
 {
   SequenceHarness harness;
 
+  // 第一阶段：probe 图像先到，等待迟到 IMU 补齐后完成首次锁定。
   PrimeProbeReadyState(harness, 16, 0);
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
               "composite first probe should arm");
@@ -1404,6 +1422,7 @@ void TestCompositeMixedSequence()
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
               "composite late tracked frame should stay pending");
 
+  // 第二阶段：稳态跟踪图像也经历一次“图像先到、IMU 后到”的等待恢复。
   FeedDefaultImuTriplets(harness, 21, 24);
   QueueDefaultImuTriplets(harness, 25, 28);
   harness.Drain();
@@ -1413,6 +1432,7 @@ void TestCompositeMixedSequence()
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED,
               "composite should reach synced before raw imu break");
 
+  // 第三阶段：再叠加 raw IMU cadence break，确认系统能再次回观察并重锁。
   harness.PushGyro(29000, 29600);
   harness.PushAccl(29000, 29620);
   harness.PushQuat(29000, 29640);
