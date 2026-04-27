@@ -198,10 +198,10 @@ class SequenceHarness
     REJECT = 2,
   };
 
-  static constexpr size_t kQueueLimit = 256;
-  static constexpr uint32_t kCadenceStableGaps = 2;
-  static constexpr uint64_t kRawCadenceMinToleranceUs = 300ULL;
-  static constexpr uint64_t kImageCadenceMinToleranceUs = 1500ULL;
+  static constexpr size_t queue_limit = 256;
+  static constexpr uint32_t cadence_stable_gaps = 2;
+  static constexpr uint64_t raw_cadence_min_tolerance_us = 300ULL;
+  static constexpr uint64_t image_cadence_min_tolerance_us = 1500ULL;
 
   void ResetLockedRelation()
   {
@@ -280,7 +280,8 @@ class SequenceHarness
   void ObserveRawCadence(RxCadenceState& cadence, uint64_t rx_time_us)
   {
     HandleCadenceUpdate(
-        ObserveRxCadence(cadence, rx_time_us, kCadenceStableGaps, kRawCadenceMinToleranceUs));
+        ObserveRxCadence(cadence, rx_time_us, cadence_stable_gaps,
+                         raw_cadence_min_tolerance_us));
   }
 
   CadenceUpdate ObserveImageCadence(const TimedTestImage& image)
@@ -300,7 +301,8 @@ class SequenceHarness
     }
 
     const CadenceUpdate update = ObserveRxCadence(
-        cadence_.image, image.rx_time_us, kCadenceStableGaps, kImageCadenceMinToleranceUs);
+        cadence_.image, image.rx_time_us, cadence_stable_gaps,
+        image_cadence_min_tolerance_us);
     HandleCadenceUpdate(update);
     return update;
   }
@@ -415,7 +417,7 @@ class SequenceHarness
   {
     while (TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
-        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, kQueueLimit,
+        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, queue_limit,
         [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat, uint64_t rx_time_us)
         {
           return TestImu{
@@ -880,15 +882,15 @@ class SequenceHarness
   ImageReference last_observed_image_{};
   ImageReference last_normal_image_{};
 
-  Ring<TimedTestGyro, kQueueLimit> gyro_ingress_{};
-  Ring<TimedTestAccl, kQueueLimit> accl_ingress_{};
-  Ring<TimedTestQuat, kQueueLimit> quat_ingress_{};
-  Ring<TimedTestImage, kQueueLimit> image_ingress_{};
-  Ring<TimedTestGyro, kQueueLimit> pending_gyros_{};
-  Ring<TimedTestAccl, kQueueLimit> pending_accls_{};
-  Ring<TimedTestQuat, kQueueLimit> pending_quats_{};
-  Ring<TimedTestImage, kQueueLimit> pending_images_{};
-  Ring<TestImu, kQueueLimit> imu_history_{};
+  Ring<TimedTestGyro, queue_limit> gyro_ingress_{};
+  Ring<TimedTestAccl, queue_limit> accl_ingress_{};
+  Ring<TimedTestQuat, queue_limit> quat_ingress_{};
+  Ring<TimedTestImage, queue_limit> image_ingress_{};
+  Ring<TimedTestGyro, queue_limit> pending_gyros_{};
+  Ring<TimedTestAccl, queue_limit> pending_accls_{};
+  Ring<TimedTestQuat, queue_limit> pending_quats_{};
+  Ring<TimedTestImage, queue_limit> pending_images_{};
+  Ring<TestImu, queue_limit> imu_history_{};
 
   std::vector<uint32_t> published_image_tags_{};
   std::vector<uint64_t> published_sync_imu_timestamps_{};
@@ -953,14 +955,14 @@ void ExpectEqual(const T& actual, const T& expected, const std::string& label)
   }
 }
 
-static constexpr uint64_t kDefaultSensorStepUs = 1000ULL;
-static constexpr uint64_t kDefaultRxStepUs = 1000ULL;
-static constexpr uint64_t kDefaultAcclRxOffsetUs = 20ULL;
-static constexpr uint64_t kDefaultQuatRxOffsetUs = 40ULL;
+static constexpr uint64_t default_sensor_step_us = 1000ULL;
+static constexpr uint64_t default_rx_step_us = 1000ULL;
+static constexpr uint64_t default_accl_rx_offset_us = 20ULL;
+static constexpr uint64_t default_quat_rx_offset_us = 40ULL;
 
 uint64_t StepTimestampUs(uint32_t step_index)
 {
-  return static_cast<uint64_t>(step_index) * kDefaultSensorStepUs;
+  return static_cast<uint64_t>(step_index) * default_sensor_step_us;
 }
 
 ImageInput StepImage(uint32_t step_index, uint64_t image_rx_bias_us, uint32_t tag)
@@ -1002,8 +1004,8 @@ void PushImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t en
     const uint64_t sensor_timestamp_us = static_cast<uint64_t>(index) * sensor_step_us;
     const uint64_t rx_time_us = static_cast<uint64_t>(index) * rx_step_us + rx_bias_us;
     harness.PushGyro(sensor_timestamp_us, rx_time_us);
-    harness.PushAccl(sensor_timestamp_us, rx_time_us + kDefaultAcclRxOffsetUs);
-    harness.PushQuat(sensor_timestamp_us, rx_time_us + kDefaultQuatRxOffsetUs);
+    harness.PushAccl(sensor_timestamp_us, rx_time_us + default_accl_rx_offset_us);
+    harness.PushQuat(sensor_timestamp_us, rx_time_us + default_quat_rx_offset_us);
     if (drain_after_each_sample)
     {
       harness.Drain();
@@ -1026,14 +1028,14 @@ void QueueImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t e
 void FeedDefaultImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
                             uint64_t rx_bias_us = 0)
 {
-  FeedImuTriplets(harness, begin_index, end_index, kDefaultSensorStepUs, kDefaultRxStepUs,
+  FeedImuTriplets(harness, begin_index, end_index, default_sensor_step_us, default_rx_step_us,
                   rx_bias_us);
 }
 
 void QueueDefaultImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
                              uint64_t rx_bias_us = 0)
 {
-  QueueImuTriplets(harness, begin_index, end_index, kDefaultSensorStepUs, kDefaultRxStepUs,
+  QueueImuTriplets(harness, begin_index, end_index, default_sensor_step_us, default_rx_step_us,
                    rx_bias_us);
 }
 

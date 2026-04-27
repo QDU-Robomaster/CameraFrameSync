@@ -55,7 +55,7 @@ class CameraFrameSync
   using ImageData = typename ImageTopic::Data;
 
   static inline constexpr CameraInfo camera_info = CameraInfoV;
-  static constexpr const char* kSensorSyncCmdTopicName = "sensor_sync_cmd";
+  static constexpr const char* sensor_sync_cmd_topic_name = "sensor_sync_cmd";
   static constexpr LibXR::LinuxSharedTopicConfig image_topic_config{
       .slot_num = 8,
       .subscriber_num = 8,
@@ -80,7 +80,7 @@ class CameraFrameSync
 
     Subscriber(const char* image_topic_name, const char* imu_topic_name)
         : image_sub_(image_topic_name),
-          imu_queue_(kQueueLength),
+          imu_queue_(queue_length),
           imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name)), imu_queue_)
     {
     }
@@ -150,7 +150,7 @@ class CameraFrameSync
     }
 
    private:
-    static constexpr size_t kQueueLength = 32;
+    static constexpr size_t queue_length = 32;
 
     static uint64_t MakeDeadline(uint32_t timeout_ms)
     {
@@ -189,7 +189,7 @@ class CameraFrameSync
     typename ImageTopic::Subscriber image_sub_;
     LibXR::LockFreeQueue<ImuStamped> imu_queue_;
     LibXR::Topic::QueuedSubscriber imu_sub_;
-    CameraFrameSyncCore::FixedRingBuffer<ImuStamped, kQueueLength> pending_imus_{};
+    CameraFrameSyncCore::FixedRingBuffer<ImuStamped, queue_length> pending_imus_{};
   };
 
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
@@ -210,7 +210,8 @@ class CameraFrameSync
         image_event_topic_name_(sensor_name_ + "_image_event"),
         image_topic_(image_topic_name_, image_topic_config),
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_)),
-        sensor_sync_cmd_topic_(LibXR::Topic::FindOrCreate<SensorSyncCmd>(kSensorSyncCmdTopicName)),
+        sensor_sync_cmd_topic_(
+            LibXR::Topic::FindOrCreate<SensorSyncCmd>(sensor_sync_cmd_topic_name)),
         gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
         accl_topic_(LibXR::Topic::FindOrCreate<AcclStamped>(accl_topic_name_.c_str())),
         quat_topic_(LibXR::Topic::FindOrCreate<QuatStamped>(quat_topic_name_.c_str())),
@@ -339,17 +340,17 @@ class CameraFrameSync
   };
 
   // 这里按“100Hz 图像基线 + 1kHz IMU + 100ms 级搜索窗口”留余量，不再保留 1k/2k 级大队列。
-  static constexpr size_t kImuIngressLength = 128;
-  static constexpr size_t kImageEventIngressLength = 32;
-  static constexpr size_t kPendingLimit = 256;
-  static constexpr size_t kHistoryLimit = 256;
-  static constexpr uint32_t kProbeTimeoutMs = 500;
-  static constexpr uint32_t kImageTimeoutMs = 200;
-  static constexpr uint32_t kImuTimeoutMs = 100;
-  static constexpr uint32_t kRelockConfirmFrames = 3;
-  static constexpr uint32_t kCadenceStableGaps = 2;
-  static constexpr uint64_t kRawCadenceMinToleranceUs = 300ULL;
-  static constexpr uint64_t kImageCadenceMinToleranceUs = 1500ULL;
+  static constexpr size_t imu_ingress_length = 128;
+  static constexpr size_t image_event_ingress_length = 32;
+  static constexpr size_t pending_limit = 256;
+  static constexpr size_t history_limit = 256;
+  static constexpr uint32_t probe_timeout_ms = 500;
+  static constexpr uint32_t image_timeout_ms = 200;
+  static constexpr uint32_t imu_timeout_ms = 100;
+  static constexpr uint32_t relock_confirm_frames = 3;
+  static constexpr uint32_t cadence_stable_gaps = 2;
+  static constexpr uint64_t raw_cadence_min_tolerance_us = 300ULL;
+  static constexpr uint64_t image_cadence_min_tolerance_us = 1500ULL;
 
   static uint64_t NowUs()
   {
@@ -374,7 +375,7 @@ class CameraFrameSync
 
   static uint64_t ProbeTimeoutUs()
   {
-    return static_cast<uint64_t>(std::max<uint32_t>(kProbeTimeoutMs, kImageTimeoutMs * 2U)) *
+    return static_cast<uint64_t>(std::max<uint32_t>(probe_timeout_ms, image_timeout_ms * 2U)) *
            1000ULL;
   }
 
@@ -448,7 +449,7 @@ class CameraFrameSync
   void ObserveRawCadence(CameraFrameSyncCore::RxCadenceState& cadence, uint64_t rx_time_us)
   {
     ObserveCadenceUpdate(CameraFrameSyncCore::ObserveRxCadence(
-        cadence, rx_time_us, kCadenceStableGaps, kRawCadenceMinToleranceUs));
+        cadence, rx_time_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
   CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const TimedImageEvent& image)
@@ -469,7 +470,8 @@ class CameraFrameSync
     }
 
     const auto update = CameraFrameSyncCore::ObserveRxCadence(
-        cadence_.image, image.rx_time_us, kCadenceStableGaps, kImageCadenceMinToleranceUs);
+        cadence_.image, image.rx_time_us, cadence_stable_gaps,
+        image_cadence_min_tolerance_us);
     ObserveCadenceUpdate(update);
     return update;
   }
@@ -683,7 +685,7 @@ class CameraFrameSync
   {
     while (CameraFrameSyncCore::TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
-        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, kHistoryLimit,
+        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, history_limit,
         [](const GyroStamped& gyro, const AcclStamped& accl, const QuatStamped& quat,
            uint64_t rx_time_us)
         {
@@ -865,7 +867,7 @@ class CameraFrameSync
     relation_.last_image_rx_time_us = image.rx_time_us;
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
     relation_.last_host_skew_us = match.host_skew_us;
-    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, kRelockConfirmFrames);
+    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, relock_confirm_frames);
     return ImageDecision::ACCEPT;
   }
 
@@ -1190,11 +1192,11 @@ class CameraFrameSync
     const bool image_timeout =
         previous_image_event_rx_ms != 0 &&
         static_cast<uint32_t>(current_image_event_rx_ms - previous_image_event_rx_ms) >
-            kImageTimeoutMs;
+            image_timeout_ms;
     const bool imu_timeout =
         last_imu_rx_ms != 0 &&
         static_cast<uint32_t>(current_image_event_rx_ms - last_imu_rx_ms) >
-            kImuTimeoutMs;
+            imu_timeout_ms;
     const bool probe_timeout =
         probe_pending_ && pending_probe_sent_rx_us_ != 0 &&
         (NowUs() - pending_probe_sent_rx_us_) > ProbeTimeoutUs();
@@ -1232,18 +1234,18 @@ class CameraFrameSync
   LibXR::Topic::Callback image_event_cb_{};
 
   // 每个回调各自入自己的 SPMC ingress，避免把多个 producer 压到同一个队列里。
-  LibXR::LockFreeQueue<TimedGyro> gyro_ingress_{kImuIngressLength};
-  LibXR::LockFreeQueue<TimedAccl> accl_ingress_{kImuIngressLength};
-  LibXR::LockFreeQueue<TimedQuat> quat_ingress_{kImuIngressLength};
-  LibXR::LockFreeQueue<TimedImageEvent> image_event_ingress_{kImageEventIngressLength};
+  LibXR::LockFreeQueue<TimedGyro> gyro_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<TimedAccl> accl_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<TimedQuat> quat_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<TimedImageEvent> image_event_ingress_{image_event_ingress_length};
   std::atomic<bool> overflowed_{false};
 
   // 下面这些状态只在 image_event 触发的串行路径里访问。
-  FixedRingBuffer<TimedGyro, kPendingLimit> pending_gyros_{};
-  FixedRingBuffer<TimedAccl, kPendingLimit> pending_accls_{};
-  FixedRingBuffer<TimedQuat, kPendingLimit> pending_quats_{};
-  FixedRingBuffer<TimedImageEvent, kPendingLimit> pending_image_events_{};
-  FixedRingBuffer<AssembledImu, kHistoryLimit> imu_history_{};
+  FixedRingBuffer<TimedGyro, pending_limit> pending_gyros_{};
+  FixedRingBuffer<TimedAccl, pending_limit> pending_accls_{};
+  FixedRingBuffer<TimedQuat, pending_limit> pending_quats_{};
+  FixedRingBuffer<TimedImageEvent, pending_limit> pending_image_events_{};
+  FixedRingBuffer<AssembledImu, history_limit> imu_history_{};
   LibXR::Mutex sync_state_mutex_{};
 
   std::atomic<int32_t> offset_us_{0};
