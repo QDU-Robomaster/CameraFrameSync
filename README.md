@@ -3,7 +3,7 @@
 `CameraFrameSync` 负责两件事：
 
 1. 承接 `CameraBase<Info>` 的图像 lease，并把图像发布到 `LinuxSharedTopic`
-2. 订阅原始 `gyro / accl / quat / image_event`，在模块内部完成图像与 IMU 同步，再发布同步后的 `imu`
+2. 订阅原始 `gyro / accl / quat / image_event`，在模块内部完成图像与 IMU 对齐，再发布同步后的 `imu`
 
 ## 输入与输出
 
@@ -31,89 +31,142 @@
 - `sensor_sync_cmd` 是固定名字，不跟随相机名变化
 - 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
-- 对下游稳定暴露的只有共享图像与同步后 `imu`；原始小话题只服务于模块内部同步
 - 运行时只保留一个调节点：
   - `offset_us`
   - 它表示在 IMU 自己的 `sensor_timestamp_us` 时间域里，对最终取样位置做常量平移
 
 ## 当前同步策略
 
-这个模块现在明确分成两段：
+这版实现只使用**传感器侧时间戳**：
 
-1. 先锁“图像对应的是哪一个同步 gyro 帧”
-2. 再在 IMU 自己的时间域里应用 `offset_us`，找最终要发给下游的 IMU 样本
+- 原始 `gyro / accl / quat` 使用 `sensor_timestamp_us`
+- `image_event` 使用相机侧 `sensor_timestamp_us`
+- 同步主逻辑里已经**没有**主机到达时间戳
 
-也就是说：
+约束也很明确：
 
-- **不会**再把图像域时间戳和 IMU 域时间戳直接拿来做跨域最近邻匹配
-- `rx_time` 只用于主机侧锁定同步关系
-- `sensor_timestamp_us` 只在 IMU 域内用于 `offset` 推导
+- 不拿相机时间戳和 IMU 时间戳做跨域绝对值比较
+- 只在各自时间域里做差分
+- 跨域关系只靠：
+  - 图像基线周期 `T`
+  - IMU 基线周期 `t`
+  - 估算出的整数步长 `N = round(T / t)`
+  - 一次性 `2T` 探针引入的节拍变化
 
-另外，`CameraFrameSync` 本身不创建独立同步线程：
+## 数据流
 
-- `gyro / accl / quat` 回调只入队
-- `image_event` 回调是唯一串行同步触发点
-- 所有重同步、探针发送、图像匹配、IMU 发布都在这条 `image_event` 路径里推进
-- 节拍稳定观察是常驻的，不是只在启动时做一次
+1. `gyro / accl / quat` 回调只入各自无锁 ingress 队列
+2. `image_event` 回调是唯一同步触发点
+3. 每次处理 `image_event` 时：
+   - 先排空四路 ingress
+   - 再按 `gyro` 主时间轴组装原始 IMU 历史
+   - 最后串行处理待同步图像事件
 
-模块内部的粗状态可以理解成：
+## 原始 IMU 组装
+
+组装规则：
+
+- 以 `gyro.sensor_timestamp_us` 为主轴
+- `accl / quat` 在同一个 IMU 时间域里配对
+
+具体做法：
+
+- 启动初期还没观察到稳定 IMU 周期时
+  - 为 `accl / quat` 各取第一条时间不早于 `gyro` 的样本
+- 一旦已经得到稳定 IMU 周期
+  - 在 `gyro` 的正负半个周期窗口内
+  - 为 `accl / quat` 各选离它最近的样本
+  - 如果前后距离完全相同，优先更晚样本
+- 如果某一路已经越过半周期窗口还找不到可配对样本
+  - 当前 `gyro` 直接丢弃
+  - 避免整条组装链被卡死
+
+## 图像侧状态机
+
+状态只有三种：
 
 - `OBSERVING`
-  - 启动后默认就处在这里
-  - 一直观察 `gyro / accl / quat / image_event` 四路到达节拍
-  - 只有四路都稳定，才允许发一次 `sensor_sync_cmd`
+  - 持续观察 `gyro / accl / quat / image_event` 四路节拍
+  - 四路都稳定后，才允许发一次 `sensor_sync_cmd`
 - `LOCKING`
-  - 已经看到 probe 的 `2T` 图像 gap，正在确认锁定关系
+  - 已经看到 probe 的 `2T` 图像 gap
+  - 正在确认“这一张图像对应哪一条同步 IMU”
 - `SYNCED`
   - 已经进入稳态跟踪
 
-这里不再单独保留 `RECOVERING` 状态：
+任何一条稳定节拍断掉，都会直接 reset 回 `OBSERVING`。
 
-- 发现同步关系失效时，直接执行一次 reset
-- 清掉当前锁定关系、图像基线、待发 probe
-- 然后立刻回到 `OBSERVING`
+## 锁定流程
 
-## 详细流程
+1. 持续观察四路节拍
+   - 全部稳定后记录正常图像基线周期 `T`
+   - 同时记录原始 IMU 基线周期 `t`
+2. 根据 `T / t` 估算图像对应的 IMU 整数步长 `N`
+3. 自动发出一次 `sensor_sync_cmd`
+4. 下位机只把**下一次图像间隔**拉成 `2T`，随后自动恢复到 `T`
+5. 当主机看到 `T -> 2T` 这次图像节拍变化时：
+   - 在 IMU 历史里找一对间隔约为 `2 * N * t` 的 IMU
+   - 这对 IMU 的后一条就是 probe 图像对应的同步 IMU 候选
+6. 如果 probe 图像还缺少后续 IMU 历史，先继续等待
+7. 命中后记下：
+   - 上一条同步 IMU 时间戳
+   - 同步 IMU 周期
+8. 后续普通图像进入稳态跟踪
 
-1. `gyro / accl / quat` 回调只负责入各自 ingress 队列
-2. `image_event` 回调作为唯一同步触发点，串行排空所有 ingress
-3. 以 `gyro` 为主时间轴组装原始 IMU 历史
-   - 启动初期还没有稳定 raw IMU 周期时，先退回旧策略：
-     - 为 `accl / quat` 各取第一条时间不早于 `gyro` 的样本
-   - 一旦已经观察到稳定 raw IMU 周期：
-     - 在 `gyro` 的正负半个周期窗口内，为 `accl / quat` 各选离它最近的样本
-     - 如果前后样本距离完全相同，仍优先更晚样本
-   - 如果某一路已经越过半周期窗口仍找不到可配对样本：
-     - 当前 `gyro` 直接丢弃，避免整条组装链被卡死
-4. 持续观察 `gyro / accl / quat / image_event` 四路 `rx_time` 节拍
-   - 任一路还没稳定，就继续停在 `OBSERVING`
-   - 任一路在稳定后又失稳，就立刻清掉当前锁定关系
-5. 对正常图像流记录基线 `T`，并据此估算 `image_rate / imu_rate` 的整数步长
-6. 四路节拍都稳定后，自动发出一次性 `sensor_sync_cmd`
-7. 等待 `image_event` 出现一次 `T -> 2T -> T` 的 probe 节拍变化
-   - 这里的 `2T` 是主动探针，不算 image cadence 失稳
-8. 对 probe 帧：
-   - 利用“前一张普通图像 -> 当前 probe 图像”的**双周期变化**
-   - 在主机侧 `rx_time` 上搜索最合理的同步 gyro 帧
-   - 锁住 `image -> sync gyro frame` 的对应关系
-9. 锁定后，后续图像先按上一帧关系预测下一条同步 IMU，再用 `host skew` 与 IMU 域周期做校验
-10. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
-11. 恢复策略分两层：
-   - 一般节拍失稳或匹配失败：
-     - 直接 reset 回 `OBSERVING`
-     - 清掉锁定关系与图像基线
-     - 继续跑常驻节拍观察，等稳定后再发下一次 probe
-   - 超时、队列溢出这类硬故障：
-     - 额外清掉 cadence 观察状态
-     - 从头重新观察四路节拍
+## 稳态跟踪
+
+锁定后不再全局扫描，而是沿着上一帧关系递推：
+
+1. 预测下一条同步 IMU 的目标时间戳
+   - `expected_sync_imu_ts = last_sync_imu_ts + sync_imu_period`
+2. 只有当 IMU 历史已经覆盖这个目标时，才允许处理当前图像
+3. 在 IMU 历史里找离这个目标最近、且误差仍在容差内的样本
+4. 找到后，先把它当作“同步 IMU”
+5. 再在 IMU 自己时间域里应用 `offset_us`
+6. 由 `sync_imu_ts + offset_us` 找最终要发布的 IMU 样本
+
+如果这一步只差 `offset_us` 对应的目标 IMU 还没到：
+
+- 当前图像会先停在队列里等待
+- 但已经选中的 `sync_imu` 不会在下一次重试时被重新改写
+- 也就是“等最终样本”，而不是“边等边改同步基准”
+
+最终发布时：
+
+- 图像仍保留自己的相机侧时间戳
+- 同步后 `imu.timestamp_us` 也使用这张图像的传感器侧时间戳
+
+## 等待、拒绝与恢复
+
+这版实现不再用主机到达时间做 timeout，而是全都按**序列语义**处理：
+
+- `WAIT`
+  - IMU 历史还没覆盖 probe 候选
+  - 或者还没覆盖稳态预测目标
+  - 或者 `offset_us` 目标样本还没到
+- `REJECT`
+  - probe 挂起后，下一张图像 gap 不是 `2T`
+  - 稳态下普通图像 gap 不是 `T`
+  - 预测目标已经被 IMU 历史覆盖，但仍找不到合法候选
+- `RESET`
+  - 任一路 cadence 失稳
+  - ingress / history 溢出
+  - 图像事件回退或乱序
+
+reset 后会：
+
+- 清掉 probe 挂起状态
+- 清掉当前锁定关系
+- 清掉图像基线
+- 立刻回到 `OBSERVING`
 
 ## `Subscriber` 语义
 
-`Subscriber::Wait()` 仍然是严格时间戳匹配：
+`Subscriber::Wait()` 仍然保持严格匹配：
 
-- 等到一帧图像
-- 再等待一条 `timestamp_us` 与该图像完全相同的同步后 `imu`
-- 只有两者对上，才返回 `SyncedFrame`
+- 先等一帧图像
+- 再等一条 `timestamp_us` 与该图像完全相同的同步后 `imu`
+- 两者对上才返回 `SyncedFrame`
 
 下游 `Subscriber` 不参与原始 IMU 重同步；重同步都在 `CameraFrameSync` 内部完成。
 
@@ -134,14 +187,6 @@
   - `cadence_stable_gaps = 2`
   - `raw_cadence_min_tolerance_us = 300`
   - `image_cadence_min_tolerance_us = 1500`
-- 内部使用定长 ring / 无锁队列
-  - 满时覆盖最旧样本并置 `overflow` 标记
-  - 下一次 `image_event` 串行路径会把它当成硬故障处理：
-    - 清掉锁定关系
-    - 清掉 cadence 观察状态
-    - 回到 `OBSERVING`
-- 图像发布路径保持非阻塞
-  - 如果拿不到新可写槽位，就继续复用当前槽位，并丢掉这次新图像
 
 ## 模板参数与依赖
 

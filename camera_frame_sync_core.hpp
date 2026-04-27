@@ -107,11 +107,11 @@ enum class CadenceUpdate : uint8_t
   BROKEN = 3,
 };
 
-struct RxCadenceState
+struct CadenceState
 {
-  bool has_last_rx{false};
+  bool has_last_timestamp{false};
   bool stable{false};
-  uint64_t last_rx_us{0};
+  uint64_t last_timestamp_us{0};
   uint64_t period_us{0};
   uint32_t stable_count{0};
 };
@@ -149,18 +149,9 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
   return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
 }
 
-inline uint64_t HostSkewToleranceUs(uint64_t imu_rx_period_us)
+inline uint64_t ImageGapToleranceUs(uint64_t image_period_us)
 {
-  return std::max<uint64_t>(3000ULL,
-                            imu_rx_period_us != 0 ? imu_rx_period_us * 4 : 12000ULL);
-}
-
-inline uint64_t ImageGapToleranceUs(uint64_t image_period_us, uint64_t imu_rx_period_us)
-{
-  const uint64_t upper =
-      image_period_us != 0 ? std::min<uint64_t>(image_period_us / 3U,
-                                                HostSkewToleranceUs(imu_rx_period_us))
-                           : 3000ULL;
+  const uint64_t upper = image_period_us != 0 ? (image_period_us / 3U) : 3000ULL;
   return std::max<uint64_t>(1500ULL, upper);
 }
 
@@ -182,31 +173,31 @@ inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
   return std::max<uint64_t>(4000ULL, base);
 }
 
-inline CadenceUpdate ObserveRxCadence(RxCadenceState& cadence, uint64_t rx_time_us,
-                                      uint32_t required_stable_gaps,
-                                      uint64_t min_tolerance_us)
+inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us,
+                                    uint32_t required_stable_gaps,
+                                    uint64_t min_tolerance_us)
 {
-  if (!cadence.has_last_rx)
+  if (!cadence.has_last_timestamp)
   {
-    cadence.has_last_rx = true;
-    cadence.last_rx_us = rx_time_us;
+    cadence.has_last_timestamp = true;
+    cadence.last_timestamp_us = timestamp_us;
     return CadenceUpdate::NO_GAP;
   }
 
-  if (rx_time_us <= cadence.last_rx_us)
+  if (timestamp_us <= cadence.last_timestamp_us)
   {
     const bool broken = cadence.stable;
     // 坏点只作为新的观察起点，不把这次异常 gap 本身算进稳定计数。
-    cadence.has_last_rx = true;
-    cadence.last_rx_us = rx_time_us;
+    cadence.has_last_timestamp = true;
+    cadence.last_timestamp_us = timestamp_us;
     cadence.stable = false;
     cadence.period_us = 0;
     cadence.stable_count = 0;
     return broken ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
   }
 
-  const uint64_t gap_us = rx_time_us - cadence.last_rx_us;
-  cadence.last_rx_us = rx_time_us;
+  const uint64_t gap_us = timestamp_us - cadence.last_timestamp_us;
+  cadence.last_timestamp_us = timestamp_us;
 
   if (cadence.period_us == 0)
   {
@@ -377,8 +368,7 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
                       PendingAcclContainer& pending_accls,
                       PendingQuatContainer& pending_quats,
                       ImuHistoryContainer& imu_history,
-                      uint64_t& last_imu_sensor_period_us,
-                      uint64_t& last_imu_rx_period_us, size_t history_limit,
+                      uint64_t& last_imu_sensor_period_us, size_t history_limit,
                       MakeImuFn&& make_imu)
 {
   if (pending_gyros.Empty())
@@ -387,13 +377,15 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
   }
 
   const auto& gyro = pending_gyros.Front();
+  const uint64_t gyro_sensor_timestamp_us =
+      static_cast<uint64_t>(gyro.sample.sensor_timestamp_us);
   const uint64_t half_period_window_us = last_imu_sensor_period_us / 2U;
   size_t accl_index = 0;
   const ChannelSampleSearchResult accl_search = SelectNearestChannelSampleIndex(
-      pending_accls, gyro.sample.sensor_timestamp_us, half_period_window_us, accl_index);
+      pending_accls, gyro_sensor_timestamp_us, half_period_window_us, accl_index);
   size_t quat_index = 0;
   const ChannelSampleSearchResult quat_search = SelectNearestChannelSampleIndex(
-      pending_quats, gyro.sample.sensor_timestamp_us, half_period_window_us, quat_index);
+      pending_quats, gyro_sensor_timestamp_us, half_period_window_us, quat_index);
 
   if (accl_search == ChannelSampleSearchResult::WAIT ||
       quat_search == ChannelSampleSearchResult::WAIT)
@@ -412,12 +404,7 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
   {
     if (gyro.sample.sensor_timestamp_us > imu_history.Back().sensor_timestamp_us)
     {
-      last_imu_sensor_period_us =
-          gyro.sample.sensor_timestamp_us - imu_history.Back().sensor_timestamp_us;
-    }
-    if (gyro.rx_time_us > imu_history.Back().rx_time_us)
-    {
-      last_imu_rx_period_us = gyro.rx_time_us - imu_history.Back().rx_time_us;
+      last_imu_sensor_period_us = gyro_sensor_timestamp_us - imu_history.Back().sensor_timestamp_us;
     }
   }
 
@@ -426,8 +413,7 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
     imu_history.PopFront();
   }
   imu_history.PushBackDropOldest(
-      make_imu(gyro.sample, pending_accls[accl_index].sample, pending_quats[quat_index].sample,
-               gyro.rx_time_us));
+      make_imu(gyro.sample, pending_accls[accl_index].sample, pending_quats[quat_index].sample));
 
   pending_gyros.PopFront();
   pending_accls.PopFrontN(accl_index + 1);

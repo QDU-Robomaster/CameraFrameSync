@@ -29,6 +29,7 @@ depends:
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "CameraBase.hpp"
@@ -53,6 +54,7 @@ class CameraFrameSync
   using SensorSyncCmd = typename Base::SensorSyncCmd;
   using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;
   using ImageData = typename ImageTopic::Data;
+  using ImageCommitCallback = typename Base::ImageCommitCallback;
 
   static inline constexpr CameraInfo camera_info = CameraInfoV;
   static constexpr const char* sensor_sync_cmd_topic_name = "sensor_sync_cmd";
@@ -78,10 +80,10 @@ class CameraFrameSync
     {
     }
 
-    Subscriber(const char* image_topic_name, const char* imu_topic_name)
-        : image_sub_(image_topic_name),
+    Subscriber(std::string_view image_topic_name, std::string_view imu_topic_name)
+        : image_sub_(image_topic_name.data()),
           imu_queue_(queue_length),
-          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name)), imu_queue_)
+          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name.data())), imu_queue_)
     {
     }
 
@@ -193,12 +195,12 @@ class CameraFrameSync
   };
 
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
-      : image_topic_name_(camera.ImageTopicName()),
-        imu_topic_name_(camera.ImuTopicName()),
+      : image_topic_name_(camera.ImageTopicNameView()),
+        imu_topic_name_(camera.ImuTopicNameView()),
         sensor_name_([&camera]()
                      {
-                       const char* name = camera.Name();
-                       if (name == nullptr || name[0] == '\0')
+                       const std::string_view name = camera.NameView();
+                       if (name.empty())
                        {
                          throw std::runtime_error("CameraFrameSync: camera name is required");
                        }
@@ -208,8 +210,8 @@ class CameraFrameSync
         accl_topic_name_(sensor_name_ + "_accl"),
         quat_topic_name_(sensor_name_ + "_quat"),
         image_event_topic_name_(sensor_name_ + "_image_event"),
-        image_topic_(image_topic_name_, image_topic_config),
-        synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_)),
+        image_topic_(image_topic_name_.data(), image_topic_config),
+        synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_.data())),
         sensor_sync_cmd_topic_(
             LibXR::Topic::FindOrCreate<SensorSyncCmd>(sensor_sync_cmd_topic_name)),
         gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
@@ -229,7 +231,8 @@ class CameraFrameSync
     {
       throw std::runtime_error("CameraFrameSync: initial image slot acquisition failed");
     }
-    if (!camera.RegisterImageSink(this, current_image_.GetData(), CommitImageAdapter))
+    if (!camera.RegisterImageSink(current_image_.GetData(),
+                                  ImageCommitCallback::Create(CommitImageAdapter, this)))
     {
       current_image_.Reset();
       throw std::runtime_error("CameraFrameSync: image sink registration failed");
@@ -243,9 +246,9 @@ class CameraFrameSync
 
   ~CameraFrameSync() = default;
 
-  const char* ImageTopicName() const { return image_topic_name_; }
+  const char* ImageTopicName() const { return image_topic_name_.data(); }
 
-  const char* ImuTopicName() const { return imu_topic_name_; }
+  const char* ImuTopicName() const { return imu_topic_name_.data(); }
 
   void SetOffsetUs(int32_t offset_us)
   {
@@ -258,36 +261,35 @@ class CameraFrameSync
   template <typename T, size_t Capacity>
   using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
 
-  struct TimedGyro
+  struct QueuedGyro
   {
     GyroStamped sample{};
-    uint64_t rx_time_us{};
   };
 
-  struct TimedAccl
+  struct QueuedAccl
   {
     AcclStamped sample{};
-    uint64_t rx_time_us{};
   };
 
-  struct TimedQuat
+  struct QueuedQuat
   {
     QuatStamped sample{};
-    uint64_t rx_time_us{};
   };
 
-  struct TimedImageEvent
+  struct QueuedImageEvent
   {
     ImageEvent sample{};
-    uint64_t rx_time_us{};
     // 图像可能因为等待更多 IMU 而在队列里重试；同一事件只能记一次 cadence。
     bool cadence_observed{false};
+    // 一旦为这张图像选出同步 IMU，就在等待 offset 目标期间固定住它。
+    bool sync_candidate_valid{false};
+    uint64_t sync_candidate_sensor_timestamp_us{0};
+    uint64_t sync_candidate_period_us{0};
   };
 
   struct AssembledImu
   {
     uint64_t sensor_timestamp_us{};
-    uint64_t rx_time_us{};
     std::array<float, 4> rotation_wxyz{};
     std::array<float, 3> angular_velocity_xyz{};
     std::array<float, 3> linear_acceleration_xyz{};
@@ -296,28 +298,26 @@ class CameraFrameSync
   struct ImageReference
   {
     bool valid{false};
-    TimedImageEvent image{};
+    QueuedImageEvent image{};
   };
 
   struct CadenceObservation
   {
-    CameraFrameSyncCore::RxCadenceState gyro{};
-    CameraFrameSyncCore::RxCadenceState accl{};
-    CameraFrameSyncCore::RxCadenceState quat{};
-    CameraFrameSyncCore::RxCadenceState image{};
+    CameraFrameSyncCore::CadenceState gyro{};
+    CameraFrameSyncCore::CadenceState accl{};
+    CameraFrameSyncCore::CadenceState quat{};
+    CameraFrameSyncCore::CadenceState image{};
   };
 
   // 这一组量描述“上一张已接受图像”和“上一条同步 IMU”之间的稳定节拍关系。
   // 锁定后只沿着这组关系递推，不再每帧重新做全局锁定。
   struct SyncRelation
   {
-    uint64_t base_image_rx_period_us{0};
+    uint64_t base_image_sensor_period_us{0};
     uint64_t last_imu_sensor_period_us{0};
-    uint64_t last_imu_rx_period_us{0};
     uint64_t sync_imu_sensor_period_us{0};
-    uint64_t last_image_rx_time_us{0};
+    uint64_t last_image_sensor_timestamp_us{0};
     uint64_t last_sync_imu_sensor_timestamp_us{0};
-    int64_t last_host_skew_us{0};
   };
 
   enum class ImageDecision : uint8_t
@@ -331,7 +331,6 @@ class CameraFrameSync
   {
     const AssembledImu* sync_imu{nullptr};
     uint64_t next_sync_sensor_period_us{0};
-    int64_t host_skew_us{0};
 
     bool Valid() const
     {
@@ -344,52 +343,26 @@ class CameraFrameSync
   static constexpr size_t image_event_ingress_length = 32;
   static constexpr size_t pending_limit = 256;
   static constexpr size_t history_limit = 256;
-  static constexpr uint32_t probe_timeout_ms = 500;
-  static constexpr uint32_t image_timeout_ms = 200;
-  static constexpr uint32_t imu_timeout_ms = 100;
   static constexpr uint32_t relock_confirm_frames = 3;
   static constexpr uint32_t cadence_stable_gaps = 2;
   static constexpr uint64_t raw_cadence_min_tolerance_us = 300ULL;
   static constexpr uint64_t image_cadence_min_tolerance_us = 1500ULL;
 
-  static uint64_t NowUs()
-  {
-    return static_cast<uint64_t>(LibXR::Timebase::GetMicroseconds());
-  }
-
   static uint64_t ImageGapToleranceUs(const SyncRelation& relation)
   {
-    return CameraFrameSyncCore::ImageGapToleranceUs(relation.base_image_rx_period_us,
-                                                    relation.last_imu_rx_period_us);
-  }
-
-  static uint64_t HostSkewToleranceUs(const SyncRelation& relation)
-  {
-    return CameraFrameSyncCore::HostSkewToleranceUs(relation.last_imu_rx_period_us);
-  }
-
-  static uint64_t ProbeSearchWindowUs(const SyncRelation& relation)
-  {
-    return std::max<uint64_t>(100000ULL, relation.base_image_rx_period_us * 2ULL);
-  }
-
-  static uint64_t ProbeTimeoutUs()
-  {
-    return static_cast<uint64_t>(std::max<uint32_t>(probe_timeout_ms, image_timeout_ms * 2U)) *
-           1000ULL;
+    return CameraFrameSyncCore::ImageGapToleranceUs(relation.base_image_sensor_period_us);
   }
 
   void ResetLockedRelation()
   {
     relation_.sync_imu_sensor_period_us = 0;
-    relation_.last_image_rx_time_us = 0;
+    relation_.last_image_sensor_timestamp_us = 0;
     relation_.last_sync_imu_sensor_timestamp_us = 0;
-    relation_.last_host_skew_us = 0;
   }
 
   void ResetImageObservation()
   {
-    relation_.base_image_rx_period_us = 0;
+    relation_.base_image_sensor_period_us = 0;
     last_observed_image_ = {};
     last_normal_image_ = {};
   }
@@ -446,52 +419,54 @@ class CameraFrameSync
     }
   }
 
-  void ObserveRawCadence(CameraFrameSyncCore::RxCadenceState& cadence, uint64_t rx_time_us)
+  void ObserveSampleCadence(CameraFrameSyncCore::CadenceState& cadence, uint64_t timestamp_us)
   {
-    ObserveCadenceUpdate(CameraFrameSyncCore::ObserveRxCadence(
-        cadence, rx_time_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
+    ObserveCadenceUpdate(CameraFrameSyncCore::ObserveCadence(
+        cadence, timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
-  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const TimedImageEvent& image)
+  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const QueuedImageEvent& image)
   {
-    // probe 的 2T 图像 gap 是主动扰动，不算图像流失稳，但要推进 image cadence 的 last_rx。
-    if (probe_pending_ && cadence_.image.stable && relation_.base_image_rx_period_us != 0 &&
-        cadence_.image.has_last_rx && image.rx_time_us > cadence_.image.last_rx_us)
+    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+    // probe 的 2T 图像 gap 是主动扰动，不算图像流失稳，但要推进图像侧基线。
+    if (probe_pending_ && cadence_.image.stable && relation_.base_image_sensor_period_us != 0 &&
+        cadence_.image.has_last_timestamp &&
+        image_timestamp_us > cadence_.image.last_timestamp_us)
     {
-      const uint64_t image_gap_rx_us = image.rx_time_us - cadence_.image.last_rx_us;
-      if (CameraFrameSyncCore::AbsDiffUs(image_gap_rx_us,
-                                         relation_.base_image_rx_period_us * 2ULL) <=
+      const uint64_t image_gap_sensor_us = image_timestamp_us - cadence_.image.last_timestamp_us;
+      if (CameraFrameSyncCore::AbsDiffUs(image_gap_sensor_us,
+                                         relation_.base_image_sensor_period_us * 2ULL) <=
           ImageGapToleranceUs(relation_))
       {
-        cadence_.image.last_rx_us = image.rx_time_us;
+        cadence_.image.last_timestamp_us = image_timestamp_us;
         ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate::STABLE);
         return CameraFrameSyncCore::CadenceUpdate::STABLE;
       }
     }
 
-    const auto update = CameraFrameSyncCore::ObserveRxCadence(
-        cadence_.image, image.rx_time_us, cadence_stable_gaps,
+    const auto update = CameraFrameSyncCore::ObserveCadence(
+        cadence_.image, image_timestamp_us, cadence_stable_gaps,
         image_cadence_min_tolerance_us);
     ObserveCadenceUpdate(update);
     return update;
   }
 
-  void RecordStableImageAnchor(const TimedImageEvent& image)
+  void RecordStableImageAnchor(const QueuedImageEvent& image)
   {
     if (!cadence_.image.stable)
     {
       return;
     }
 
-    relation_.base_image_rx_period_us = cadence_.image.period_us;
+    relation_.base_image_sensor_period_us = cadence_.image.period_us;
     last_normal_image_.valid = true;
     last_normal_image_.image = image;
   }
 
   uint32_t EstimatedStrideSamples() const
   {
-    return CameraFrameSyncCore::EstimateStrideSamples(relation_.base_image_rx_period_us,
-                                                      relation_.last_imu_rx_period_us);
+    return CameraFrameSyncCore::EstimateStrideSamples(relation_.base_image_sensor_period_us,
+                                                      relation_.last_imu_sensor_period_us);
   }
 
   uint64_t EstimatedSyncImuSensorPeriodUs() const
@@ -510,26 +485,27 @@ class CameraFrameSync
     return relation_.last_imu_sensor_period_us * static_cast<uint64_t>(stride_samples);
   }
 
-  bool IsNormalImageGap(uint64_t image_gap_rx_us) const
+  bool IsNormalImageGap(uint64_t image_gap_sensor_us) const
   {
-    if (relation_.base_image_rx_period_us == 0 || image_gap_rx_us == 0)
+    if (relation_.base_image_sensor_period_us == 0 || image_gap_sensor_us == 0)
     {
       return false;
     }
 
-    return CameraFrameSyncCore::AbsDiffUs(image_gap_rx_us, relation_.base_image_rx_period_us) <=
+    return CameraFrameSyncCore::AbsDiffUs(image_gap_sensor_us,
+                                          relation_.base_image_sensor_period_us) <=
            ImageGapToleranceUs(relation_);
   }
 
-  bool IsProbeImageGap(uint64_t image_gap_rx_us) const
+  bool IsProbeImageGap(uint64_t image_gap_sensor_us) const
   {
-    if (relation_.base_image_rx_period_us == 0 || image_gap_rx_us == 0)
+    if (relation_.base_image_sensor_period_us == 0 || image_gap_sensor_us == 0)
     {
       return false;
     }
 
-    return CameraFrameSyncCore::AbsDiffUs(image_gap_rx_us,
-                                          relation_.base_image_rx_period_us * 2ULL) <=
+    return CameraFrameSyncCore::AbsDiffUs(image_gap_sensor_us,
+                                          relation_.base_image_sensor_period_us * 2ULL) <=
            ImageGapToleranceUs(relation_);
   }
 
@@ -541,7 +517,6 @@ class CameraFrameSync
   void ClearPendingProbe()
   {
     probe_pending_ = false;
-    pending_probe_sent_rx_us_ = 0;
   }
 
   bool AcquireInitialWritableImage()
@@ -553,9 +528,9 @@ class CameraFrameSync
     return current_image_.GetData() != nullptr;
   }
 
-  static ImageFrame* CommitImageAdapter(void* ctx)
+  static void CommitImageAdapter(bool, Self* self, ImageFrame*& next_image)
   {
-    return static_cast<Self*>(ctx)->CommitImageAndLeaseNext();
+    next_image = self->CommitImageAndLeaseNext();
   }
 
   ImageFrame* CommitImageAndLeaseNext()
@@ -579,10 +554,8 @@ class CameraFrameSync
 
   static void OnGyroStatic(bool, Self* self, LibXR::RawData& data)
   {
-    self->last_gyro_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
     const auto& gyro = *reinterpret_cast<const GyroStamped*>(data.addr_);
-    if (self->gyro_ingress_.Push(TimedGyro{.sample = gyro, .rx_time_us = NowUs()}) !=
-        LibXR::ErrorCode::OK)
+    if (self->gyro_ingress_.Push(QueuedGyro{.sample = gyro}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -590,10 +563,8 @@ class CameraFrameSync
 
   static void OnAcclStatic(bool, Self* self, LibXR::RawData& data)
   {
-    self->last_accl_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
     const auto& accl = *reinterpret_cast<const AcclStamped*>(data.addr_);
-    if (self->accl_ingress_.Push(TimedAccl{.sample = accl, .rx_time_us = NowUs()}) !=
-        LibXR::ErrorCode::OK)
+    if (self->accl_ingress_.Push(QueuedAccl{.sample = accl}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -601,10 +572,8 @@ class CameraFrameSync
 
   static void OnQuatStatic(bool, Self* self, LibXR::RawData& data)
   {
-    self->last_quat_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
     const auto& quat = *reinterpret_cast<const QuatStamped*>(data.addr_);
-    if (self->quat_ingress_.Push(TimedQuat{.sample = quat, .rx_time_us = NowUs()}) !=
-        LibXR::ErrorCode::OK)
+    if (self->quat_ingress_.Push(QueuedQuat{.sample = quat}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -612,64 +581,62 @@ class CameraFrameSync
 
   static void OnImageEventStatic(bool, Self* self, LibXR::RawData& data)
   {
-    const uint32_t now_ms = LibXR::Thread::GetTime();
-    const uint32_t previous_image_event_rx_ms =
-        self->last_image_event_rx_ms_.exchange(now_ms, std::memory_order_relaxed);
     const auto& image_event = *reinterpret_cast<const ImageEvent*>(data.addr_);
-    if (self->image_event_ingress_.Push(
-            TimedImageEvent{.sample = image_event, .rx_time_us = NowUs()}) !=
+    if (self->image_event_ingress_.Push(QueuedImageEvent{.sample = image_event}) !=
         LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
 
     // 图像事件就是同步触发点：原始回调只入队，所有对齐状态都在这里串行推进。
-    self->ProcessPendingSyncWork(previous_image_event_rx_ms, now_ms);
+    self->ProcessPendingSyncWork();
   }
 
-  void ProcessPendingSyncWork(uint32_t previous_image_event_rx_ms,
-                              uint32_t current_image_event_rx_ms)
+  void ProcessPendingSyncWork()
   {
     LibXR::Mutex::LockGuard lock(sync_state_mutex_);
     DrainIngressQueues();
-    HandleRecoveryTriggers(previous_image_event_rx_ms, current_image_event_rx_ms);
+    HandleOverflowRecovery();
     MaybeSendProbe();
     DrainPendingImageEvents();
   }
 
   void DrainIngressQueues()
   {
-    TimedGyro gyro{};
+    QueuedGyro gyro{};
     while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
     {
-      ObserveRawCadence(cadence_.gyro, gyro.rx_time_us);
+      ObserveSampleCadence(cadence_.gyro,
+                           static_cast<uint64_t>(gyro.sample.sensor_timestamp_us));
       if (pending_gyros_.PushBackDropOldest(gyro))
       {
         overflowed_.store(true, std::memory_order_relaxed);
       }
     }
 
-    TimedAccl accl{};
+    QueuedAccl accl{};
     while (accl_ingress_.Pop(accl) == LibXR::ErrorCode::OK)
     {
-      ObserveRawCadence(cadence_.accl, accl.rx_time_us);
+      ObserveSampleCadence(cadence_.accl,
+                           static_cast<uint64_t>(accl.sample.sensor_timestamp_us));
       if (pending_accls_.PushBackDropOldest(accl))
       {
         overflowed_.store(true, std::memory_order_relaxed);
       }
     }
 
-    TimedQuat quat{};
+    QueuedQuat quat{};
     while (quat_ingress_.Pop(quat) == LibXR::ErrorCode::OK)
     {
-      ObserveRawCadence(cadence_.quat, quat.rx_time_us);
+      ObserveSampleCadence(cadence_.quat,
+                           static_cast<uint64_t>(quat.sample.sensor_timestamp_us));
       if (pending_quats_.PushBackDropOldest(quat))
       {
         overflowed_.store(true, std::memory_order_relaxed);
       }
     }
 
-    TimedImageEvent image_event{};
+    QueuedImageEvent image_event{};
     while (image_event_ingress_.Pop(image_event) == LibXR::ErrorCode::OK)
     {
       if (pending_image_events_.PushBackDropOldest(image_event))
@@ -685,13 +652,11 @@ class CameraFrameSync
   {
     while (CameraFrameSyncCore::TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
-        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, history_limit,
-        [](const GyroStamped& gyro, const AcclStamped& accl, const QuatStamped& quat,
-           uint64_t rx_time_us)
+        relation_.last_imu_sensor_period_us, history_limit,
+        [](const GyroStamped& gyro, const AcclStamped& accl, const QuatStamped& quat)
         {
           return AssembledImu{
               .sensor_timestamp_us = gyro.sensor_timestamp_us,
-              .rx_time_us = rx_time_us,
               .rotation_wxyz = quat.rotation_wxyz,
               .angular_velocity_xyz = gyro.angular_velocity_xyz,
               .linear_acceleration_xyz = accl.linear_acceleration_xyz,
@@ -701,7 +666,7 @@ class CameraFrameSync
     }
   }
 
-  void RememberObservedImage(const TimedImageEvent& image)
+  void RememberObservedImage(const QueuedImageEvent& image)
   {
     last_observed_image_.valid = true;
     last_observed_image_.image = image;
@@ -711,7 +676,7 @@ class CameraFrameSync
   {
     while (!pending_image_events_.Empty())
     {
-      TimedImageEvent& image = pending_image_events_[0];
+      QueuedImageEvent& image = pending_image_events_[0];
       auto cadence_update = CameraFrameSyncCore::CadenceUpdate::NO_GAP;
       if (!image.cadence_observed)
       {
@@ -725,7 +690,10 @@ class CameraFrameSync
         continue;
       }
 
-      if (image.rx_time_us <= last_observed_image_.image.rx_time_us)
+      const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+      const uint64_t last_image_timestamp_us =
+          static_cast<uint64_t>(last_observed_image_.image.sample.sensor_timestamp_us);
+      if (image_timestamp_us <= last_image_timestamp_us)
       {
         pending_image_events_.PopFront();
         ClearPendingProbe();
@@ -735,7 +703,7 @@ class CameraFrameSync
         continue;
       }
 
-      const uint64_t image_gap_rx_us = image.rx_time_us - last_observed_image_.image.rx_time_us;
+      const uint64_t image_gap_sensor_us = image_timestamp_us - last_image_timestamp_us;
       if (cadence_update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
       {
         pending_image_events_.PopFront();
@@ -746,16 +714,21 @@ class CameraFrameSync
       const bool probe_pending = probe_pending_;
 
       ImageDecision decision = ImageDecision::REJECT;
-      if (probe_pending)
+      if (image.sync_candidate_valid)
       {
-        decision = IsProbeImageGap(image_gap_rx_us) ? TryLockFromProbe(image, image_gap_rx_us)
-                                                    : ImageDecision::REJECT;
+        decision = ResumePendingMatch(image);
+      }
+      else if (probe_pending)
+      {
+        decision = IsProbeImageGap(image_gap_sensor_us)
+                       ? TryLockFromProbe(image, image_gap_sensor_us)
+                       : ImageDecision::REJECT;
       }
       else if (IsLockingOrSynced())
       {
-        decision =
-            IsNormalImageGap(image_gap_rx_us) ? TryProcessLockedImage(image, image_gap_rx_us)
-                                              : ImageDecision::REJECT;
+        decision = IsNormalImageGap(image_gap_sensor_us)
+                       ? TryProcessLockedImage(image, image_gap_sensor_us)
+                       : ImageDecision::REJECT;
       }
       else
       {
@@ -802,55 +775,59 @@ class CameraFrameSync
       return;
     }
 
-    if (!CadenceReady() || relation_.base_image_rx_period_us == 0 ||
+    if (!CadenceReady() || relation_.base_image_sensor_period_us == 0 ||
         EstimatedSyncImuSensorPeriodUs() == 0 || !last_normal_image_.valid)
     {
       return;
     }
-
-    const uint64_t now_us = NowUs();
     if (probe_pending_)
     {
-      if (now_us - pending_probe_sent_rx_us_ <= ProbeTimeoutUs())
-      {
-        return;
-      }
-      ClearPendingProbe();
+      return;
     }
 
     SensorSyncCmd cmd{};
     // 下位机只需要做一次 2T 探针，观察到节拍变化后就会自动恢复正常频率。
     sensor_sync_cmd_topic_.Publish(cmd);
     probe_pending_ = true;
-    pending_probe_sent_rx_us_ = now_us;
   }
 
-  static bool IsBetterTrackedMatch(uint64_t host_skew_error_us,
-                                   uint64_t best_host_skew_error_us,
-                                   uint64_t sensor_gap_error_us,
-                                   uint64_t best_sensor_gap_error_us)
-  {
-    return host_skew_error_us < best_host_skew_error_us ||
-           (host_skew_error_us == best_host_skew_error_us &&
-            sensor_gap_error_us < best_sensor_gap_error_us);
-  }
-
-  static bool IsBetterProbeMatch(uint64_t host_gap_error_us,
-                                 uint64_t best_host_gap_error_us,
-                                 uint64_t sensor_gap_error_us,
+  static bool IsBetterProbeMatch(uint64_t sensor_gap_error_us,
                                  uint64_t best_sensor_gap_error_us,
-                                 int64_t abs_probe_skew_us,
-                                 int64_t best_abs_probe_skew_us)
+                                 bool has_future_sample,
+                                 bool best_has_future_sample,
+                                 uint64_t sync_timestamp_us,
+                                 uint64_t best_sync_timestamp_us)
   {
-    return host_gap_error_us < best_host_gap_error_us ||
-           (host_gap_error_us == best_host_gap_error_us &&
+    return (has_future_sample && !best_has_future_sample) ||
+           (has_future_sample == best_has_future_sample &&
             sensor_gap_error_us < best_sensor_gap_error_us) ||
-           (host_gap_error_us == best_host_gap_error_us &&
-            sensor_gap_error_us == best_sensor_gap_error_us &&
-            abs_probe_skew_us < best_abs_probe_skew_us);
+           (sensor_gap_error_us == best_sensor_gap_error_us &&
+            has_future_sample == best_has_future_sample &&
+            sync_timestamp_us > best_sync_timestamp_us);
   }
 
-  ImageDecision PublishMatchedImage(const TimedImageEvent& image,
+  bool ImuHistoryReached(uint64_t target_timestamp_us) const
+  {
+    return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us >= target_timestamp_us;
+  }
+
+  bool ImuHistoryHasFutureSampleAfter(uint64_t sensor_timestamp_us) const
+  {
+    return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us > sensor_timestamp_us;
+  }
+
+  bool ImuHistorySpanReady(uint64_t required_span_us) const
+  {
+    if (imu_history_.Size() < 2)
+    {
+      return false;
+    }
+
+    return imu_history_.Back().sensor_timestamp_us - imu_history_.Front().sensor_timestamp_us >=
+           required_span_us;
+  }
+
+  ImageDecision PublishMatchedImage(const QueuedImageEvent& image,
                                     const SyncMatch& match)
   {
     // 先确定“同步帧是哪一条 IMU”，再只在 IMU 自己时间域里应用 offset 取最终样本。
@@ -864,18 +841,55 @@ class CameraFrameSync
 
     PublishSyncedImu(image.sample.sensor_timestamp_us, *final_imu);
     relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
-    relation_.last_image_rx_time_us = image.rx_time_us;
+    relation_.last_image_sensor_timestamp_us =
+        static_cast<uint64_t>(image.sample.sensor_timestamp_us);
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
-    relation_.last_host_skew_us = match.host_skew_us;
     CameraFrameSyncCore::ObserveGoodFrame(lock_state_, relock_confirm_frames);
     return ImageDecision::ACCEPT;
   }
 
-  SyncMatch BuildTrackedSyncMatch(const TimedImageEvent& image,
-                                  const AssembledImu& sync_imu,
+  ImageDecision PublishOrRememberMatch(QueuedImageEvent& image, const SyncMatch& match)
+  {
+    const ImageDecision decision = PublishMatchedImage(image, match);
+    if (decision == ImageDecision::WAIT)
+    {
+      image.sync_candidate_valid = true;
+      image.sync_candidate_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
+      image.sync_candidate_period_us = match.next_sync_sensor_period_us;
+      return decision;
+    }
+
+    image.sync_candidate_valid = false;
+    image.sync_candidate_sensor_timestamp_us = 0;
+    image.sync_candidate_period_us = 0;
+    return decision;
+  }
+
+  ImageDecision ResumePendingMatch(QueuedImageEvent& image)
+  {
+    if (!image.sync_candidate_valid)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const AssembledImu* sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
+        imu_history_, image.sync_candidate_sensor_timestamp_us, 0);
+    if (sync_imu == nullptr ||
+        sync_imu->sensor_timestamp_us != image.sync_candidate_sensor_timestamp_us)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    return PublishOrRememberMatch(
+        image, SyncMatch{
+                   .sync_imu = sync_imu,
+                   .next_sync_sensor_period_us = image.sync_candidate_period_us,
+               });
+  }
+
+  SyncMatch BuildTrackedSyncMatch(const AssembledImu& sync_imu,
                                   uint64_t expected_sync_sensor_gap_us,
-                                  uint64_t sensor_gap_tolerance_us,
-                                  uint64_t host_skew_tolerance_us) const
+                                  uint64_t sensor_gap_tolerance_us) const
   {
     if (sync_imu.sensor_timestamp_us <= relation_.last_sync_imu_sensor_timestamp_us)
     {
@@ -891,112 +905,36 @@ class CameraFrameSync
       return {};
     }
 
-    const int64_t host_skew_us =
-        static_cast<int64_t>(image.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
-    const uint64_t host_skew_error_us =
-        CameraFrameSyncCore::AbsDiffSigned(host_skew_us, relation_.last_host_skew_us);
-    if (host_skew_error_us > host_skew_tolerance_us)
-    {
-      return {};
-    }
-
     return SyncMatch{
         .sync_imu = &sync_imu,
         .next_sync_sensor_period_us = sync_sensor_gap_us,
-        .host_skew_us = host_skew_us,
     };
   }
 
-  SyncMatch SelectTrackedSyncMatch(const TimedImageEvent& image,
-                                   uint64_t expected_sync_sensor_gap_us,
-                                   uint64_t sensor_gap_tolerance_us,
-                                   uint64_t host_skew_tolerance_us,
-                                   uint64_t search_window_us) const
+  SyncMatch SelectTrackedSyncMatch(uint64_t expected_sync_sensor_gap_us,
+                                   uint64_t sensor_gap_tolerance_us) const
   {
     const uint64_t expected_sync_sensor_timestamp_us =
         relation_.last_sync_imu_sensor_timestamp_us + expected_sync_sensor_gap_us;
-
-    // 稳态跟踪优先走“预测下一帧在哪”，命中后可以避免每帧都扫描整段历史。
     const AssembledImu* predicted_sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
         imu_history_, expected_sync_sensor_timestamp_us, sensor_gap_tolerance_us);
-    if (predicted_sync_imu != nullptr)
-    {
-      const SyncMatch predicted_match = BuildTrackedSyncMatch(
-          image, *predicted_sync_imu, expected_sync_sensor_gap_us,
-          sensor_gap_tolerance_us, host_skew_tolerance_us);
-      if (predicted_match.Valid())
-      {
-        return predicted_match;
-      }
-    }
-
-    SyncMatch best_match{};
-    uint64_t best_host_skew_error_us = std::numeric_limits<uint64_t>::max();
-    uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
-
-    for (size_t i = imu_history_.Size(); i > 0; --i)
-    {
-      const AssembledImu& sync_imu = imu_history_[i - 1];
-      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, image.rx_time_us) >
-          search_window_us)
-      {
-        if (sync_imu.rx_time_us + search_window_us < image.rx_time_us)
-        {
-          break;
-        }
-        continue;
-      }
-
-      const SyncMatch match = BuildTrackedSyncMatch(
-          image, sync_imu, expected_sync_sensor_gap_us,
-          sensor_gap_tolerance_us, host_skew_tolerance_us);
-      if (!match.Valid())
-      {
-        continue;
-      }
-
-      const uint64_t host_skew_error_us =
-          CameraFrameSyncCore::AbsDiffSigned(match.host_skew_us, relation_.last_host_skew_us);
-      const uint64_t sensor_gap_error_us =
-          CameraFrameSyncCore::AbsDiffUs(match.next_sync_sensor_period_us,
-                                         expected_sync_sensor_gap_us);
-      if (IsBetterTrackedMatch(host_skew_error_us, best_host_skew_error_us,
-                               sensor_gap_error_us, best_sensor_gap_error_us))
-      {
-        best_match = match;
-        best_host_skew_error_us = host_skew_error_us;
-        best_sensor_gap_error_us = sensor_gap_error_us;
-      }
-    }
-
-    return best_match;
+    return predicted_sync_imu != nullptr
+               ? BuildTrackedSyncMatch(
+                     *predicted_sync_imu, expected_sync_sensor_gap_us, sensor_gap_tolerance_us)
+               : SyncMatch{};
   }
 
-  SyncMatch SelectProbeSyncMatch(const TimedImageEvent& probe,
-                                 uint64_t image_gap_rx_us,
-                                 uint64_t expected_probe_sensor_gap_us,
-                                 uint64_t sensor_gap_tolerance_us,
-                                 uint64_t search_window_us,
-                                 uint64_t host_gap_tolerance_us) const
+  SyncMatch SelectProbeSyncMatch(uint64_t expected_probe_sensor_gap_us,
+                                 uint64_t sensor_gap_tolerance_us) const
   {
-    // probe 期望看到的是 2T 图像 gap；这里在 IMU 历史里找一对满足同样双周期关系的同步帧。
     SyncMatch best_match{};
-    uint64_t best_host_gap_error_us = std::numeric_limits<uint64_t>::max();
     uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
-    int64_t best_abs_probe_skew_us = std::numeric_limits<int64_t>::max();
+    bool best_has_future_sample = false;
+    uint64_t best_sync_timestamp_us = 0;
 
     for (size_t i = imu_history_.Size(); i > 0; --i)
     {
       const AssembledImu& sync_imu = imu_history_[i - 1];
-      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, probe.rx_time_us) >
-          search_window_us)
-      {
-        if (sync_imu.rx_time_us + search_window_us < probe.rx_time_us)
-        {
-          break;
-        }
-        continue;
-      }
       if (sync_imu.sensor_timestamp_us < expected_probe_sensor_gap_us)
       {
         continue;
@@ -1006,14 +944,8 @@ class CameraFrameSync
           sync_imu.sensor_timestamp_us - expected_probe_sensor_gap_us;
       const AssembledImu* prev_sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
           imu_history_, prev_target_sensor_timestamp_us, sensor_gap_tolerance_us);
-      if (prev_sync_imu == nullptr || sync_imu.rx_time_us <= prev_sync_imu->rx_time_us)
-      {
-        continue;
-      }
-
-      const uint64_t host_gap_error_us = CameraFrameSyncCore::AbsDiffUs(
-          sync_imu.rx_time_us - prev_sync_imu->rx_time_us, image_gap_rx_us);
-      if (host_gap_error_us > host_gap_tolerance_us)
+      if (prev_sync_imu == nullptr ||
+          sync_imu.sensor_timestamp_us <= prev_sync_imu->sensor_timestamp_us)
       {
         continue;
       }
@@ -1022,15 +954,11 @@ class CameraFrameSync
           sync_imu.sensor_timestamp_us - prev_sync_imu->sensor_timestamp_us;
       const uint64_t sensor_gap_error_us =
           CameraFrameSyncCore::AbsDiffUs(sync_sensor_gap_us, expected_probe_sensor_gap_us);
-      const int64_t probe_skew_us =
-          static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
-      const int64_t abs_probe_skew_us =
-          probe_skew_us >= 0 ? probe_skew_us : -probe_skew_us;
-
+      const bool has_future_sample = ImuHistoryHasFutureSampleAfter(sync_imu.sensor_timestamp_us);
       if (sync_sensor_gap_us < 2 ||
-          !IsBetterProbeMatch(host_gap_error_us, best_host_gap_error_us,
-                              sensor_gap_error_us, best_sensor_gap_error_us,
-                              abs_probe_skew_us, best_abs_probe_skew_us))
+          !IsBetterProbeMatch(sensor_gap_error_us, best_sensor_gap_error_us,
+                              has_future_sample, best_has_future_sample,
+                              sync_imu.sensor_timestamp_us, best_sync_timestamp_us))
       {
         continue;
       }
@@ -1038,19 +966,18 @@ class CameraFrameSync
       best_match = SyncMatch{
           .sync_imu = &sync_imu,
           .next_sync_sensor_period_us = sync_sensor_gap_us / 2ULL,
-          .host_skew_us = probe_skew_us,
       };
-      best_host_gap_error_us = host_gap_error_us;
       best_sensor_gap_error_us = sensor_gap_error_us;
-      best_abs_probe_skew_us = abs_probe_skew_us;
+      best_has_future_sample = has_future_sample;
+      best_sync_timestamp_us = sync_imu.sensor_timestamp_us;
     }
 
     return best_match;
   }
 
-  ImageDecision TryLockFromProbe(const TimedImageEvent& probe, uint64_t image_gap_rx_us)
+  ImageDecision TryLockFromProbe(QueuedImageEvent& probe, uint64_t image_gap_sensor_us)
   {
-    if (!last_normal_image_.valid || !IsProbeImageGap(image_gap_rx_us))
+    if (!last_normal_image_.valid || !IsProbeImageGap(image_gap_sensor_us))
     {
       return ImageDecision::REJECT;
     }
@@ -1065,41 +992,32 @@ class CameraFrameSync
     const uint64_t sensor_gap_tolerance_us =
         CameraFrameSyncCore::SyncSensorGapToleranceUs(expected_probe_sensor_gap_us,
                                                       relation_.last_imu_sensor_period_us);
-    const uint64_t search_window_us = ProbeSearchWindowUs(relation_);
-    const uint64_t host_gap_tolerance_us = HostSkewToleranceUs(relation_);
-    const bool newest_imu_has_not_crossed_probe_rx_time =
-        imu_history_.Back().rx_time_us <= probe.rx_time_us;
-    if (imu_history_.Back().rx_time_us + host_gap_tolerance_us <= probe.rx_time_us)
+    if (!ImuHistorySpanReady(expected_probe_sensor_gap_us))
     {
       return ImageDecision::WAIT;
     }
 
-    const SyncMatch match = SelectProbeSyncMatch(
-        probe, image_gap_rx_us, expected_probe_sensor_gap_us,
-        sensor_gap_tolerance_us, search_window_us, host_gap_tolerance_us);
+    const SyncMatch match =
+        SelectProbeSyncMatch(expected_probe_sensor_gap_us, sensor_gap_tolerance_us);
     if (!match.Valid())
-    {
-      return newest_imu_has_not_crossed_probe_rx_time ? ImageDecision::WAIT
-                                                      : ImageDecision::REJECT;
-    }
-    // 还没看到 probe 时刻之后的新 IMU，就继续等，避免把“稍早但暂时最接近”的候选过早锁进去。
-    if (match.sync_imu->rx_time_us < probe.rx_time_us &&
-        newest_imu_has_not_crossed_probe_rx_time)
-    {
-      return ImageDecision::WAIT;
-    }
-
-    return PublishMatchedImage(probe, match);
-  }
-
-  ImageDecision TryProcessLockedImage(const TimedImageEvent& image, uint64_t image_gap_rx_us)
-  {
-    if (relation_.last_image_rx_time_us == 0 || relation_.last_sync_imu_sensor_timestamp_us == 0)
     {
       return ImageDecision::REJECT;
     }
 
-    if (image.rx_time_us <= relation_.last_image_rx_time_us || !IsNormalImageGap(image_gap_rx_us))
+    return PublishOrRememberMatch(probe, match);
+  }
+
+  ImageDecision TryProcessLockedImage(QueuedImageEvent& image, uint64_t image_gap_sensor_us)
+  {
+    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+    if (relation_.last_image_sensor_timestamp_us == 0 ||
+        relation_.last_sync_imu_sensor_timestamp_us == 0)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    if (image_timestamp_us <= relation_.last_image_sensor_timestamp_us ||
+        !IsNormalImageGap(image_gap_sensor_us))
     {
       return ImageDecision::REJECT;
     }
@@ -1113,38 +1031,21 @@ class CameraFrameSync
     const uint64_t sensor_gap_tolerance_us =
         CameraFrameSyncCore::SyncSensorGapToleranceUs(expected_sync_sensor_gap_us,
                                                       relation_.last_imu_sensor_period_us);
-    const uint64_t host_skew_tolerance_us = HostSkewToleranceUs(relation_);
-    const uint64_t search_window_us = ProbeSearchWindowUs(relation_);
-
-    const int64_t expected_sync_rx_time_us =
-        static_cast<int64_t>(image.rx_time_us) - relation_.last_host_skew_us;
-    const bool newest_imu_has_not_crossed_expected_sync_rx_time =
-        expected_sync_rx_time_us > 0 && !imu_history_.Empty() &&
-        imu_history_.Back().rx_time_us <= static_cast<uint64_t>(expected_sync_rx_time_us);
-    if (expected_sync_rx_time_us > 0 && !imu_history_.Empty() &&
-        imu_history_.Back().rx_time_us + host_skew_tolerance_us <=
-            static_cast<uint64_t>(expected_sync_rx_time_us))
+    const uint64_t expected_sync_sensor_timestamp_us =
+        relation_.last_sync_imu_sensor_timestamp_us + expected_sync_sensor_gap_us;
+    if (!ImuHistoryReached(expected_sync_sensor_timestamp_us))
     {
       return ImageDecision::WAIT;
     }
 
-    // 稳态下不再重做全局锁定，而是沿着上一帧的 host skew 和 sensor gap 继续跟踪。
-    const SyncMatch match = SelectTrackedSyncMatch(
-        image, expected_sync_sensor_gap_us, sensor_gap_tolerance_us,
-        host_skew_tolerance_us, search_window_us);
+    const SyncMatch match =
+        SelectTrackedSyncMatch(expected_sync_sensor_gap_us, sensor_gap_tolerance_us);
     if (!match.Valid())
     {
-      return newest_imu_has_not_crossed_expected_sync_rx_time ? ImageDecision::WAIT
-                                                              : ImageDecision::REJECT;
-    }
-    // 稳态同理：只有当最新 IMU 已经越过期望点，才允许接受一个更早的候选。
-    if (match.sync_imu->rx_time_us < static_cast<uint64_t>(expected_sync_rx_time_us) &&
-        newest_imu_has_not_crossed_expected_sync_rx_time)
-    {
-      return ImageDecision::WAIT;
+      return ImageDecision::REJECT;
     }
 
-    return PublishMatchedImage(image, match);
+    return PublishOrRememberMatch(image, match);
   }
 
   const AssembledImu* FindFinalImu(const AssembledImu& sync_imu, int32_t offset_us) const
@@ -1181,28 +1082,9 @@ class CameraFrameSync
     synced_imu_topic_.Publish(synced);
   }
 
-  void HandleRecoveryTriggers(uint32_t previous_image_event_rx_ms,
-                              uint32_t current_image_event_rx_ms)
+  void HandleOverflowRecovery()
   {
-    const uint32_t last_imu_rx_ms =
-        std::max(last_gyro_rx_ms_.load(std::memory_order_relaxed),
-                 std::max(last_accl_rx_ms_.load(std::memory_order_relaxed),
-                          last_quat_rx_ms_.load(std::memory_order_relaxed)));
-
-    const bool image_timeout =
-        previous_image_event_rx_ms != 0 &&
-        static_cast<uint32_t>(current_image_event_rx_ms - previous_image_event_rx_ms) >
-            image_timeout_ms;
-    const bool imu_timeout =
-        last_imu_rx_ms != 0 &&
-        static_cast<uint32_t>(current_image_event_rx_ms - last_imu_rx_ms) >
-            imu_timeout_ms;
-    const bool probe_timeout =
-        probe_pending_ && pending_probe_sent_rx_us_ != 0 &&
-        (NowUs() - pending_probe_sent_rx_us_) > ProbeTimeoutUs();
-
-    if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout || imu_timeout ||
-        probe_timeout)
+    if (overflowed_.exchange(false, std::memory_order_relaxed))
     {
       ClearPendingProbe();
       ResetLockedRelation();
@@ -1212,8 +1094,8 @@ class CameraFrameSync
   }
 
  private:
-  const char* image_topic_name_;
-  const char* imu_topic_name_;
+  std::string_view image_topic_name_;
+  std::string_view imu_topic_name_;
   std::string sensor_name_{};
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
@@ -1234,17 +1116,17 @@ class CameraFrameSync
   LibXR::Topic::Callback image_event_cb_{};
 
   // 每个回调各自入自己的 SPMC ingress，避免把多个 producer 压到同一个队列里。
-  LibXR::LockFreeQueue<TimedGyro> gyro_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<TimedAccl> accl_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<TimedQuat> quat_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<TimedImageEvent> image_event_ingress_{image_event_ingress_length};
+  LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<QueuedImageEvent> image_event_ingress_{image_event_ingress_length};
   std::atomic<bool> overflowed_{false};
 
   // 下面这些状态只在 image_event 触发的串行路径里访问。
-  FixedRingBuffer<TimedGyro, pending_limit> pending_gyros_{};
-  FixedRingBuffer<TimedAccl, pending_limit> pending_accls_{};
-  FixedRingBuffer<TimedQuat, pending_limit> pending_quats_{};
-  FixedRingBuffer<TimedImageEvent, pending_limit> pending_image_events_{};
+  FixedRingBuffer<QueuedGyro, pending_limit> pending_gyros_{};
+  FixedRingBuffer<QueuedAccl, pending_limit> pending_accls_{};
+  FixedRingBuffer<QueuedQuat, pending_limit> pending_quats_{};
+  FixedRingBuffer<QueuedImageEvent, pending_limit> pending_image_events_{};
   FixedRingBuffer<AssembledImu, history_limit> imu_history_{};
   LibXR::Mutex sync_state_mutex_{};
 
@@ -1255,10 +1137,4 @@ class CameraFrameSync
   ImageReference last_observed_image_{};
   ImageReference last_normal_image_{};
   bool probe_pending_{false};
-  uint64_t pending_probe_sent_rx_us_{0};
-
-  std::atomic<uint32_t> last_image_event_rx_ms_{0};
-  std::atomic<uint32_t> last_gyro_rx_ms_{0};
-  std::atomic<uint32_t> last_accl_rx_ms_{0};
-  std::atomic<uint32_t> last_quat_rx_ms_{0};
 };
