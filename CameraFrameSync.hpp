@@ -396,6 +396,12 @@ class CameraFrameSync
     ResetImageObservation();
   }
 
+  void SetObservingState()
+  {
+    lock_state_.state = SyncState::OBSERVING;
+    lock_state_.lock_confirm_count = 0;
+  }
+
   void EnterObserving()
   {
     if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
@@ -403,16 +409,15 @@ class CameraFrameSync
       return;
     }
 
-    lock_state_.state = SyncState::OBSERVING;
-    lock_state_.lock_confirm_count = 0;
+    SetObservingState();
   }
 
-  void EnterRecovering()
+  void ResetSyncTracking()
   {
     ClearPendingProbe();
-    CameraFrameSyncCore::EnterRecovering(lock_state_);
     ResetLockedRelation();
     ResetImageObservation();
+    SetObservingState();
   }
 
   bool CadenceReady() const
@@ -432,7 +437,7 @@ class CameraFrameSync
         EnterObserving();
         break;
       case CameraFrameSyncCore::CadenceUpdate::BROKEN:
-        EnterRecovering();
+        ResetSyncTracking();
         break;
     }
   }
@@ -713,8 +718,10 @@ class CameraFrameSync
       if (image.rx_time_us <= last_observed_image_.image.rx_time_us)
       {
         pending_image_events_.PopFront();
+        ClearPendingProbe();
+        ResetLockedRelation();
         ResetCadenceObservation();
-        EnterRecovering();
+        SetObservingState();
         continue;
       }
 
@@ -773,7 +780,7 @@ class CameraFrameSync
       {
         ClearPendingProbe();
       }
-      EnterRecovering();
+      ResetSyncTracking();
       MaybeSendProbe();
     }
   }
@@ -1168,8 +1175,10 @@ class CameraFrameSync
     if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout || imu_timeout ||
         probe_timeout)
     {
+      ClearPendingProbe();
+      ResetLockedRelation();
       ResetCadenceObservation();
-      EnterRecovering();
+      SetObservingState();
     }
   }
 

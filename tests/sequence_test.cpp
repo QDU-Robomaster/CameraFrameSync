@@ -207,6 +207,12 @@ class SequenceHarness
     ResetImageObservation();
   }
 
+  void SetObservingState()
+  {
+    lock_state_.state = SyncState::OBSERVING;
+    lock_state_.lock_confirm_count = 0;
+  }
+
   void ClearPendingProbe() { probe_pending_ = false; }
 
   void EnterObserving()
@@ -216,16 +222,15 @@ class SequenceHarness
       return;
     }
 
-    lock_state_.state = SyncState::OBSERVING;
-    lock_state_.lock_confirm_count = 0;
+    SetObservingState();
   }
 
-  void EnterRecovering()
+  void ResetSyncTracking()
   {
     ClearPendingProbe();
-    CameraFrameSyncCore::EnterRecovering(lock_state_);
     ResetLockedRelation();
     ResetImageObservation();
+    SetObservingState();
   }
 
   bool IsLockingOrSynced() const
@@ -250,7 +255,7 @@ class SequenceHarness
         EnterObserving();
         break;
       case CadenceUpdate::BROKEN:
-        EnterRecovering();
+        ResetSyncTracking();
         break;
     }
   }
@@ -423,8 +428,10 @@ class SequenceHarness
       if (image.rx_time_us <= last_observed_image_.image.rx_time_us)
       {
         pending_images_.PopFront();
+        ClearPendingProbe();
+        ResetLockedRelation();
         ResetCadenceObservation();
-        EnterRecovering();
+        SetObservingState();
         continue;
       }
 
@@ -483,7 +490,7 @@ class SequenceHarness
       {
         ClearPendingProbe();
       }
-      EnterRecovering();
+      ResetSyncTracking();
       MaybeSendProbe();
     }
   }
@@ -984,7 +991,7 @@ void TestBadProbeGapRejects()
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
               "bad probe gap should not publish");
   ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({3}), "bad probe gap reject tag");
-  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING, "bad probe gap state");
+  ExpectEqual(harness.CurrentState(), SyncState::OBSERVING, "bad probe gap should reset to observing");
 }
 
 void TestStartupJitterKeepsObservingUntilStable()
@@ -1042,7 +1049,8 @@ void TestImageCadenceBreakResetsAndRelocks()
 
   harness.PushImage(34000, 34, 34120, 6);
   harness.Drain();
-  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING, "cadence break should recover");
+  ExpectEqual(harness.CurrentState(), SyncState::OBSERVING,
+              "cadence break should reset to observing");
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1), "break should not send new probe immediately");
 
   harness.PushImage(38000, 38, 38120, 7);

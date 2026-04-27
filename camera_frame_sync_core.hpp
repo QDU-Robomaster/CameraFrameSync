@@ -88,16 +88,14 @@ class FixedRingBuffer
 
 enum class SyncState : uint8_t
 {
-  UNSYNCED = 0,
-  OBSERVING = 1,
-  LOCKING = 2,
-  SYNCED = 3,
-  RECOVERING = 4,
+  OBSERVING = 0,
+  LOCKING = 1,
+  SYNCED = 2,
 };
 
 struct SyncLockState
 {
-  SyncState state{SyncState::UNSYNCED};
+  SyncState state{SyncState::OBSERVING};
   uint32_t lock_confirm_count{0};
 };
 
@@ -268,9 +266,7 @@ inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_
 {
   switch (lock_state.state)
   {
-    case SyncState::UNSYNCED:
     case SyncState::OBSERVING:
-    case SyncState::RECOVERING:
       lock_state.state = SyncState::LOCKING;
       lock_state.lock_confirm_count = 1;
       break;
@@ -284,12 +280,6 @@ inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_
     case SyncState::SYNCED:
       break;
   }
-}
-
-inline void EnterRecovering(SyncLockState& lock_state)
-{
-  lock_state.state = SyncState::RECOVERING;
-  lock_state.lock_confirm_count = 0;
 }
 
 template <typename PendingGyroContainer, typename PendingAcclContainer,

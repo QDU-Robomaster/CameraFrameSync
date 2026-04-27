@@ -58,17 +58,20 @@
 
 模块内部的粗状态可以理解成：
 
-- `UNSYNCED`
-  - 还没看到足够数据
 - `OBSERVING`
+  - 启动后默认就处在这里
   - 一直观察 `gyro / accl / quat / image_event` 四路到达节拍
   - 只有四路都稳定，才允许发一次 `sensor_sync_cmd`
 - `LOCKING`
   - 已经看到 probe 的 `2T` 图像 gap，正在确认锁定关系
 - `SYNCED`
   - 已经进入稳态跟踪
-- `RECOVERING`
-  - 刚发现同步关系失效，清掉锁定关系后回到重新观察
+
+这里不再单独保留 `RECOVERING` 状态：
+
+- 发现同步关系失效时，直接执行一次 reset
+- 清掉当前锁定关系、图像基线、待发 probe
+- 然后立刻回到 `OBSERVING`
 
 ## 详细流程
 
@@ -90,7 +93,7 @@
 10. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
 11. 恢复策略分两层：
    - 一般节拍失稳或匹配失败：
-     - 进入 `RECOVERING`
+     - 直接 reset 回 `OBSERVING`
      - 清掉锁定关系与图像基线
      - 继续跑常驻节拍观察，等稳定后再发下一次 probe
    - 超时、队列溢出这类硬故障：
