@@ -167,31 +167,6 @@ inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
 }
 
 template <typename ImuHistoryContainer>
-const typename ImuHistoryContainer::ValueType* FindByRxTime(
-    const ImuHistoryContainer& imu_history, uint64_t expected_rx_time_us, uint64_t tolerance_us)
-{
-  const typename ImuHistoryContainer::ValueType* best = nullptr;
-  uint64_t best_error = std::numeric_limits<uint64_t>::max();
-
-  for (size_t i = imu_history.Size(); i > 0; --i)
-  {
-    const auto& imu = imu_history[i - 1];
-    const uint64_t error = AbsDiffUs(imu.rx_time_us, expected_rx_time_us);
-    if (error < best_error)
-    {
-      best = &imu;
-      best_error = error;
-    }
-    if (imu.rx_time_us + tolerance_us < expected_rx_time_us)
-    {
-      break;
-    }
-  }
-
-  return (best != nullptr && best_error <= tolerance_us) ? best : nullptr;
-}
-
-template <typename ImuHistoryContainer>
 const typename ImuHistoryContainer::ValueType* FindBySensorTimestamp(
     const ImuHistoryContainer& imu_history, uint64_t expected_timestamp_us,
     uint64_t tolerance_us)

@@ -55,6 +55,7 @@ class CameraFrameSync
   using ImageData = typename ImageTopic::Data;
 
   static inline constexpr CameraInfo camera_info = CameraInfoV;
+  static constexpr const char* kSensorSyncCmdTopicName = "sensor_sync_cmd";
   static constexpr LibXR::LinuxSharedTopicConfig image_topic_config{
       .slot_num = 8,
       .subscriber_num = 8,
@@ -202,21 +203,22 @@ class CameraFrameSync
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
       : image_topic_name_(camera.ImageTopicName()),
         imu_topic_name_(camera.ImuTopicName()),
-        topic_prefix_([&camera]()
-                      {
-                        const char* name = camera.Name();
-                        return (name != nullptr && name[0] != '\0') ? std::string(name)
-                                                                     : std::string("camera");
-                      }()),
-        gyro_topic_name_(topic_prefix_ + "_gyro"),
-        accl_topic_name_(topic_prefix_ + "_accl"),
-        quat_topic_name_(topic_prefix_ + "_quat"),
-        image_event_topic_name_(topic_prefix_ + "_image_event"),
-        sensor_sync_cmd_topic_name_("sensor_sync_cmd"),
+        sensor_name_([&camera]()
+                     {
+                       const char* name = camera.Name();
+                       if (name == nullptr || name[0] == '\0')
+                       {
+                         throw std::runtime_error("CameraFrameSync: camera name is required");
+                       }
+                       return std::string(name);
+                     }()),
+        gyro_topic_name_(sensor_name_ + "_gyro"),
+        accl_topic_name_(sensor_name_ + "_accl"),
+        quat_topic_name_(sensor_name_ + "_quat"),
+        image_event_topic_name_(sensor_name_ + "_image_event"),
         image_topic_(image_topic_name_, image_topic_config),
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_)),
-        sensor_sync_cmd_topic_(
-            LibXR::Topic::FindOrCreate<SensorSyncCmd>(sensor_sync_cmd_topic_name_.c_str())),
+        sensor_sync_cmd_topic_(LibXR::Topic::FindOrCreate<SensorSyncCmd>(kSensorSyncCmdTopicName)),
         gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
         accl_topic_(LibXR::Topic::FindOrCreate<AcclStamped>(accl_topic_name_.c_str())),
         quat_topic_(LibXR::Topic::FindOrCreate<QuatStamped>(quat_topic_name_.c_str())),
@@ -260,16 +262,7 @@ class CameraFrameSync
 
   const char* ImageEventTopicName() const { return image_event_topic_name_.c_str(); }
 
-  const char* SensorSyncCmdTopicName() const
-  {
-    return sensor_sync_cmd_topic_name_.c_str();
-  }
-
-  void PublishSensorSyncCmd(const SensorSyncCmd& cmd)
-  {
-    SensorSyncCmd publish_value = cmd;
-    sensor_sync_cmd_topic_.Publish(publish_value);
-  }
+  const char* SensorSyncCmdTopicName() const { return kSensorSyncCmdTopicName; }
 
   void SetSyncPolicy(const SyncPolicy& policy)
   {
@@ -322,6 +315,8 @@ class CameraFrameSync
     TimedImageEvent image{};
   };
 
+  // 这一组量描述“上一张已接受图像”和“上一条同步 IMU”之间的稳定节拍关系。
+  // 锁定后只沿着这组关系递推，不再每帧重新做全局锁定。
   struct SyncRelation
   {
     uint64_t base_image_rx_period_us{0};
@@ -753,6 +748,7 @@ class CameraFrameSync
     }
 
     SensorSyncCmd cmd{};
+    // 下位机只需要做一次 2T 探针，观察到节拍变化后就会自动恢复正常频率。
     sensor_sync_cmd_topic_.Publish(cmd);
     probe_pending_ = true;
     pending_probe_sent_rx_us_ = now_us;
@@ -1129,12 +1125,11 @@ class CameraFrameSync
  private:
   const char* image_topic_name_;
   const char* imu_topic_name_;
-  std::string topic_prefix_{};
+  std::string sensor_name_{};
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
   std::string quat_topic_name_{};
   std::string image_event_topic_name_{};
-  std::string sensor_sync_cmd_topic_name_{};
 
   ImageTopic image_topic_;
   ImageData current_image_{};

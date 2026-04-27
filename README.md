@@ -12,10 +12,10 @@
 - 图像写入接口
   - `CameraBase<Info>::RegisterImageSink(...)`
 - 原始小话题
-  - `<camera_name>_gyro`
-  - `<camera_name>_accl`
-  - `<camera_name>_quat`
-  - `<camera_name>_image_event`
+  - `<camera.Name()>_gyro`
+  - `<camera.Name()>_accl`
+  - `<camera.Name()>_quat`
+  - `<camera.Name()>_image_event`
 - 一次性同步探针命令
   - `sensor_sync_cmd`
 
@@ -25,6 +25,12 @@
   - `camera.ImageTopicName()`
 - 同步后 IMU 话题
   - `camera.ImuTopicName()`
+
+其中：
+
+- `sensor_sync_cmd` 是固定名字，不跟随相机名变化
+- 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
+- `camera.Name()` 必须非空；模块内部不再做隐式回退
 
 ## 当前同步策略
 
@@ -38,6 +44,12 @@
 - **不会**再把图像域时间戳和 IMU 域时间戳直接拿来做跨域最近邻匹配
 - `rx_time` 只用于主机侧锁定同步关系
 - `sensor_timestamp_us` 只在 IMU 域内用于 `offset` 推导
+
+另外，`CameraFrameSync` 本身不创建独立同步线程：
+
+- `gyro / accl / quat` 回调只入队
+- `image_event` 回调是唯一串行同步触发点
+- 所有重同步、探针发送、图像匹配、IMU 发布都在这条 `image_event` 路径里推进
 
 ## 详细流程
 
