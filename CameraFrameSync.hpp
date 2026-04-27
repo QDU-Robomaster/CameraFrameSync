@@ -279,6 +279,8 @@ class CameraFrameSync
   {
     ImageEvent sample{};
     uint64_t rx_time_us{};
+    // 图像可能因为等待更多 IMU 而在队列里重试；同一事件只能记一次 cadence。
+    bool cadence_observed{false};
   };
 
   struct AssembledImu
@@ -706,8 +708,13 @@ class CameraFrameSync
   {
     while (!pending_image_events_.Empty())
     {
-      const TimedImageEvent image = pending_image_events_.Front();
-      const auto cadence_update = ObserveImageCadence(image);
+      TimedImageEvent& image = pending_image_events_[0];
+      auto cadence_update = CameraFrameSyncCore::CadenceUpdate::NO_GAP;
+      if (!image.cadence_observed)
+      {
+        cadence_update = ObserveImageCadence(image);
+        image.cadence_observed = true;
+      }
       if (!last_observed_image_.valid)
       {
         RememberObservedImage(image);
@@ -1057,7 +1064,9 @@ class CameraFrameSync
                                                       relation_.last_imu_sensor_period_us);
     const uint64_t search_window_us = ProbeSearchWindowUs(relation_);
     const uint64_t host_gap_tolerance_us = HostSkewToleranceUs(relation_);
-    if (imu_history_.Back().rx_time_us + host_gap_tolerance_us < probe.rx_time_us)
+    const bool newest_imu_has_not_crossed_probe_rx_time =
+        imu_history_.Back().rx_time_us <= probe.rx_time_us;
+    if (imu_history_.Back().rx_time_us + host_gap_tolerance_us <= probe.rx_time_us)
     {
       return ImageDecision::WAIT;
     }
@@ -1067,7 +1076,14 @@ class CameraFrameSync
         sensor_gap_tolerance_us, search_window_us, host_gap_tolerance_us);
     if (!match.Valid())
     {
-      return ImageDecision::REJECT;
+      return newest_imu_has_not_crossed_probe_rx_time ? ImageDecision::WAIT
+                                                      : ImageDecision::REJECT;
+    }
+    // 还没看到 probe 时刻之后的新 IMU，就继续等，避免把“稍早但暂时最接近”的候选过早锁进去。
+    if (match.sync_imu->rx_time_us < probe.rx_time_us &&
+        newest_imu_has_not_crossed_probe_rx_time)
+    {
+      return ImageDecision::WAIT;
     }
 
     return PublishMatchedImage(probe, match);
@@ -1097,10 +1113,13 @@ class CameraFrameSync
     const uint64_t host_skew_tolerance_us = HostSkewToleranceUs(relation_);
     const uint64_t search_window_us = ProbeSearchWindowUs(relation_);
 
-    int64_t expected_sync_rx_time_us =
+    const int64_t expected_sync_rx_time_us =
         static_cast<int64_t>(image.rx_time_us) - relation_.last_host_skew_us;
+    const bool newest_imu_has_not_crossed_expected_sync_rx_time =
+        expected_sync_rx_time_us > 0 && !imu_history_.Empty() &&
+        imu_history_.Back().rx_time_us <= static_cast<uint64_t>(expected_sync_rx_time_us);
     if (expected_sync_rx_time_us > 0 && !imu_history_.Empty() &&
-        imu_history_.Back().rx_time_us + host_skew_tolerance_us <
+        imu_history_.Back().rx_time_us + host_skew_tolerance_us <=
             static_cast<uint64_t>(expected_sync_rx_time_us))
     {
       return ImageDecision::WAIT;
@@ -1112,7 +1131,14 @@ class CameraFrameSync
         host_skew_tolerance_us, search_window_us);
     if (!match.Valid())
     {
-      return ImageDecision::REJECT;
+      return newest_imu_has_not_crossed_expected_sync_rx_time ? ImageDecision::WAIT
+                                                              : ImageDecision::REJECT;
+    }
+    // 稳态同理：只有当最新 IMU 已经越过期望点，才允许接受一个更早的候选。
+    if (match.sync_imu->rx_time_us < static_cast<uint64_t>(expected_sync_rx_time_us) &&
+        newest_imu_has_not_crossed_expected_sync_rx_time)
+    {
+      return ImageDecision::WAIT;
     }
 
     return PublishMatchedImage(image, match);
