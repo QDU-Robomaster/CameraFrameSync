@@ -296,6 +296,14 @@ class CameraFrameSync
     TimedImageEvent image{};
   };
 
+  struct CadenceObservation
+  {
+    CameraFrameSyncCore::RxCadenceState gyro{};
+    CameraFrameSyncCore::RxCadenceState accl{};
+    CameraFrameSyncCore::RxCadenceState quat{};
+    CameraFrameSyncCore::RxCadenceState image{};
+  };
+
   // 这一组量描述“上一张已接受图像”和“上一条同步 IMU”之间的稳定节拍关系。
   // 锁定后只沿着这组关系递推，不再每帧重新做全局锁定。
   struct SyncRelation
@@ -336,6 +344,9 @@ class CameraFrameSync
   static constexpr uint32_t kImageTimeoutMs = 200;
   static constexpr uint32_t kImuTimeoutMs = 100;
   static constexpr uint32_t kRelockConfirmFrames = 3;
+  static constexpr uint32_t kCadenceStableGaps = 2;
+  static constexpr uint64_t kRawCadenceMinToleranceUs = 300ULL;
+  static constexpr uint64_t kImageCadenceMinToleranceUs = 1500ULL;
 
   static uint64_t NowUs()
   {
@@ -372,10 +383,99 @@ class CameraFrameSync
     relation_.last_host_skew_us = 0;
   }
 
+  void ResetImageObservation()
+  {
+    relation_.base_image_rx_period_us = 0;
+    last_observed_image_ = {};
+    last_normal_image_ = {};
+  }
+
+  void ResetCadenceObservation()
+  {
+    cadence_ = {};
+    ResetImageObservation();
+  }
+
+  void EnterObserving()
+  {
+    if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
+    {
+      return;
+    }
+
+    lock_state_.state = SyncState::OBSERVING;
+    lock_state_.lock_confirm_count = 0;
+  }
+
   void EnterRecovering()
   {
+    ClearPendingProbe();
     CameraFrameSyncCore::EnterRecovering(lock_state_);
     ResetLockedRelation();
+    ResetImageObservation();
+  }
+
+  bool CadenceReady() const
+  {
+    return cadence_.gyro.stable && cadence_.accl.stable && cadence_.quat.stable &&
+           cadence_.image.stable;
+  }
+
+  void ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate update)
+  {
+    switch (update)
+    {
+      case CameraFrameSyncCore::CadenceUpdate::NO_GAP:
+        break;
+      case CameraFrameSyncCore::CadenceUpdate::WARMING:
+      case CameraFrameSyncCore::CadenceUpdate::STABLE:
+        EnterObserving();
+        break;
+      case CameraFrameSyncCore::CadenceUpdate::BROKEN:
+        EnterRecovering();
+        break;
+    }
+  }
+
+  void ObserveRawCadence(CameraFrameSyncCore::RxCadenceState& cadence, uint64_t rx_time_us)
+  {
+    ObserveCadenceUpdate(CameraFrameSyncCore::ObserveRxCadence(
+        cadence, rx_time_us, kCadenceStableGaps, kRawCadenceMinToleranceUs));
+  }
+
+  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const TimedImageEvent& image)
+  {
+    // probe 的 2T 图像 gap 是主动扰动，不算图像流失稳，但要推进 image cadence 的 last_rx。
+    if (probe_pending_ && cadence_.image.stable && relation_.base_image_rx_period_us != 0 &&
+        cadence_.image.has_last_rx && image.rx_time_us > cadence_.image.last_rx_us)
+    {
+      const uint64_t image_gap_rx_us = image.rx_time_us - cadence_.image.last_rx_us;
+      if (CameraFrameSyncCore::AbsDiffUs(image_gap_rx_us,
+                                         relation_.base_image_rx_period_us * 2ULL) <=
+          ImageGapToleranceUs(relation_))
+      {
+        cadence_.image.last_rx_us = image.rx_time_us;
+        ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate::STABLE);
+        return CameraFrameSyncCore::CadenceUpdate::STABLE;
+      }
+    }
+
+    const auto update = CameraFrameSyncCore::ObserveRxCadence(
+        cadence_.image, image.rx_time_us, kCadenceStableGaps, kImageCadenceMinToleranceUs);
+    ObserveCadenceUpdate(update);
+    return update;
+  }
+
+  void RecordStableImageAnchor(const TimedImageEvent& image)
+  {
+    if (!cadence_.image.stable)
+    {
+      return;
+    }
+
+    relation_.base_image_rx_period_us = cadence_.image.period_us;
+    last_normal_image_.valid = true;
+    last_normal_image_.image = image;
   }
 
   uint32_t EstimatedStrideSamples() const
@@ -532,6 +632,7 @@ class CameraFrameSync
     TimedGyro gyro{};
     while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
     {
+      ObserveRawCadence(cadence_.gyro, gyro.rx_time_us);
       if (pending_gyros_.PushBackDropOldest(gyro))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -541,6 +642,7 @@ class CameraFrameSync
     TimedAccl accl{};
     while (accl_ingress_.Pop(accl) == LibXR::ErrorCode::OK)
     {
+      ObserveRawCadence(cadence_.accl, accl.rx_time_us);
       if (pending_accls_.PushBackDropOldest(accl))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -550,6 +652,7 @@ class CameraFrameSync
     TimedQuat quat{};
     while (quat_ingress_.Pop(quat) == LibXR::ErrorCode::OK)
     {
+      ObserveRawCadence(cadence_.quat, quat.rx_time_us);
       if (pending_quats_.PushBackDropOldest(quat))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -594,27 +697,12 @@ class CameraFrameSync
     last_observed_image_.image = image;
   }
 
-  void ObserveNormalImagePeriod(const TimedImageEvent& image, uint64_t image_gap_rx_us)
-  {
-    if (image_gap_rx_us == 0)
-    {
-      return;
-    }
-
-    if (relation_.base_image_rx_period_us == 0 || IsNormalImageGap(image_gap_rx_us))
-    {
-      relation_.base_image_rx_period_us = image_gap_rx_us;
-    }
-
-    last_normal_image_.valid = true;
-    last_normal_image_.image = image;
-  }
-
   void DrainPendingImageEvents()
   {
     while (!pending_image_events_.Empty())
     {
       const TimedImageEvent image = pending_image_events_.Front();
+      const auto cadence_update = ObserveImageCadence(image);
       if (!last_observed_image_.valid)
       {
         RememberObservedImage(image);
@@ -625,12 +713,19 @@ class CameraFrameSync
       if (image.rx_time_us <= last_observed_image_.image.rx_time_us)
       {
         pending_image_events_.PopFront();
+        ResetCadenceObservation();
         EnterRecovering();
-        MaybeSendProbe();
         continue;
       }
 
       const uint64_t image_gap_rx_us = image.rx_time_us - last_observed_image_.image.rx_time_us;
+      if (cadence_update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
+      {
+        pending_image_events_.PopFront();
+        RememberObservedImage(image);
+        continue;
+      }
+
       const bool probe_pending = probe_pending_;
 
       ImageDecision decision = ImageDecision::REJECT;
@@ -647,7 +742,7 @@ class CameraFrameSync
       }
       else
       {
-        ObserveNormalImagePeriod(image, image_gap_rx_us);
+        RecordStableImageAnchor(image);
         RememberObservedImage(image);
         pending_image_events_.PopFront();
         MaybeSendProbe();
@@ -668,7 +763,7 @@ class CameraFrameSync
         }
         else
         {
-          ObserveNormalImagePeriod(image, image_gap_rx_us);
+          RecordStableImageAnchor(image);
         }
         RememberObservedImage(image);
         continue;
@@ -678,7 +773,6 @@ class CameraFrameSync
       {
         ClearPendingProbe();
       }
-      RememberObservedImage(image);
       EnterRecovering();
       MaybeSendProbe();
     }
@@ -691,8 +785,8 @@ class CameraFrameSync
       return;
     }
 
-    if (relation_.base_image_rx_period_us == 0 || EstimatedSyncImuSensorPeriodUs() == 0 ||
-        !last_normal_image_.valid)
+    if (!CadenceReady() || relation_.base_image_rx_period_us == 0 ||
+        EstimatedSyncImuSensorPeriodUs() == 0 || !last_normal_image_.valid)
     {
       return;
     }
@@ -1074,7 +1168,7 @@ class CameraFrameSync
     if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout || imu_timeout ||
         probe_timeout)
     {
-      ClearPendingProbe();
+      ResetCadenceObservation();
       EnterRecovering();
     }
   }
@@ -1118,6 +1212,7 @@ class CameraFrameSync
 
   std::atomic<int32_t> offset_us_{0};
   SyncLockState lock_state_{};
+  CadenceObservation cadence_{};
   SyncRelation relation_{};
   ImageReference last_observed_image_{};
   ImageReference last_normal_image_{};

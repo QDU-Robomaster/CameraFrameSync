@@ -54,21 +54,48 @@
 - `gyro / accl / quat` 回调只入队
 - `image_event` 回调是唯一串行同步触发点
 - 所有重同步、探针发送、图像匹配、IMU 发布都在这条 `image_event` 路径里推进
+- 节拍稳定观察是常驻的，不是只在启动时做一次
+
+模块内部的粗状态可以理解成：
+
+- `UNSYNCED`
+  - 还没看到足够数据
+- `OBSERVING`
+  - 一直观察 `gyro / accl / quat / image_event` 四路到达节拍
+  - 只有四路都稳定，才允许发一次 `sensor_sync_cmd`
+- `LOCKING`
+  - 已经看到 probe 的 `2T` 图像 gap，正在确认锁定关系
+- `SYNCED`
+  - 已经进入稳态跟踪
+- `RECOVERING`
+  - 刚发现同步关系失效，清掉锁定关系后回到重新观察
 
 ## 详细流程
 
 1. `gyro / accl / quat` 回调只负责入各自 ingress 队列
 2. `image_event` 回调作为唯一同步触发点，串行排空所有 ingress
 3. 以 `gyro` 为主时间轴，向后找第一条时间不早于它的 `accl / quat`，组装原始 IMU 历史
-4. 对正常图像流记录 `rx_time` 周期，估算 `image_rate / imu_rate` 的整数步长
-5. 发出一次性 `sensor_sync_cmd` 后，等待 `image_event` 出现 `T -> 2T -> T` 的节拍变化
-6. 对 probe 帧：
+4. 持续观察 `gyro / accl / quat / image_event` 四路 `rx_time` 节拍
+   - 任一路还没稳定，就继续停在 `OBSERVING`
+   - 任一路在稳定后又失稳，就立刻清掉当前锁定关系
+5. 对正常图像流记录基线 `T`，并据此估算 `image_rate / imu_rate` 的整数步长
+6. 四路节拍都稳定后，自动发出一次性 `sensor_sync_cmd`
+7. 等待 `image_event` 出现一次 `T -> 2T -> T` 的 probe 节拍变化
+   - 这里的 `2T` 是主动探针，不算 image cadence 失稳
+8. 对 probe 帧：
    - 利用“前一张普通图像 -> 当前 probe 图像”的**双周期变化**
    - 在主机侧 `rx_time` 上搜索最合理的同步 gyro 帧
    - 锁住 `image -> sync gyro frame` 的对应关系
-7. 锁定后，后续图像先按上一帧关系预测下一条同步 IMU，再用 `host skew` 与 IMU 域周期做校验
-8. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
-9. 若出现超时、队列溢出、host skew 突变、图像周期异常、探针超时等情况，则进入 `RECOVERING` 并重新发探针
+9. 锁定后，后续图像先按上一帧关系预测下一条同步 IMU，再用 `host skew` 与 IMU 域周期做校验
+10. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
+11. 恢复策略分两层：
+   - 一般节拍失稳或匹配失败：
+     - 进入 `RECOVERING`
+     - 清掉锁定关系与图像基线
+     - 继续跑常驻节拍观察，等稳定后再发下一次 probe
+   - 超时、队列溢出这类硬故障：
+     - 额外清掉 cadence 观察状态
+     - 从头重新观察四路节拍
 
 ## `Subscriber` 语义
 

@@ -89,15 +89,33 @@ class FixedRingBuffer
 enum class SyncState : uint8_t
 {
   UNSYNCED = 0,
-  LOCKING = 1,
-  SYNCED = 2,
-  RECOVERING = 3,
+  OBSERVING = 1,
+  LOCKING = 2,
+  SYNCED = 3,
+  RECOVERING = 4,
 };
 
 struct SyncLockState
 {
   SyncState state{SyncState::UNSYNCED};
   uint32_t lock_confirm_count{0};
+};
+
+enum class CadenceUpdate : uint8_t
+{
+  NO_GAP = 0,
+  WARMING = 1,
+  STABLE = 2,
+  BROKEN = 3,
+};
+
+struct RxCadenceState
+{
+  bool has_last_rx{false};
+  bool stable{false};
+  uint64_t last_rx_us{0};
+  uint64_t period_us{0};
+  uint32_t stable_count{0};
 };
 
 inline uint64_t AbsDiffUs(uint64_t lhs, uint64_t rhs)
@@ -166,6 +184,60 @@ inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
   return std::max<uint64_t>(4000ULL, base);
 }
 
+inline CadenceUpdate ObserveRxCadence(RxCadenceState& cadence, uint64_t rx_time_us,
+                                      uint32_t required_stable_gaps,
+                                      uint64_t min_tolerance_us)
+{
+  if (!cadence.has_last_rx)
+  {
+    cadence.has_last_rx = true;
+    cadence.last_rx_us = rx_time_us;
+    return CadenceUpdate::NO_GAP;
+  }
+
+  if (rx_time_us <= cadence.last_rx_us)
+  {
+    const bool broken = cadence.stable;
+    // 坏点只作为新的观察起点，不把这次异常 gap 本身算进稳定计数。
+    cadence.has_last_rx = true;
+    cadence.last_rx_us = rx_time_us;
+    cadence.stable = false;
+    cadence.period_us = 0;
+    cadence.stable_count = 0;
+    return broken ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
+  }
+
+  const uint64_t gap_us = rx_time_us - cadence.last_rx_us;
+  cadence.last_rx_us = rx_time_us;
+
+  if (cadence.period_us == 0)
+  {
+    cadence.period_us = gap_us;
+    cadence.stable_count = 1;
+    cadence.stable = required_stable_gaps <= 1;
+    return cadence.stable ? CadenceUpdate::STABLE : CadenceUpdate::WARMING;
+  }
+
+  const uint64_t tolerance_us = std::max<uint64_t>(min_tolerance_us, cadence.period_us / 3U);
+  if (AbsDiffUs(gap_us, cadence.period_us) <= tolerance_us)
+  {
+    cadence.period_us = gap_us;
+    if (cadence.stable_count < required_stable_gaps)
+    {
+      cadence.stable_count++;
+    }
+    cadence.stable = cadence.stable_count >= required_stable_gaps;
+    return cadence.stable ? CadenceUpdate::STABLE : CadenceUpdate::WARMING;
+  }
+
+  const bool broken = cadence.stable;
+  // gap 不符合当前节拍时，直接丢掉旧周期，从当前样本重新开始观察。
+  cadence.stable = false;
+  cadence.period_us = 0;
+  cadence.stable_count = 0;
+  return broken ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
+}
+
 template <typename ImuHistoryContainer>
 const typename ImuHistoryContainer::ValueType* FindBySensorTimestamp(
     const ImuHistoryContainer& imu_history, uint64_t expected_timestamp_us,
@@ -197,6 +269,7 @@ inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_
   switch (lock_state.state)
   {
     case SyncState::UNSYNCED:
+    case SyncState::OBSERVING:
     case SyncState::RECOVERING:
       lock_state.state = SyncState::LOCKING;
       lock_state.lock_confirm_count = 1;
