@@ -31,6 +31,7 @@
 - `sensor_sync_cmd` 是固定名字，不跟随相机名变化
 - 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
+- 对下游稳定暴露的只有共享图像与同步后 `imu`；原始小话题只服务于模块内部同步
 
 ## 当前同步策略
 

@@ -254,16 +254,6 @@ class CameraFrameSync
 
   const char* ImuTopicName() const { return imu_topic_name_; }
 
-  const char* GyroTopicName() const { return gyro_topic_name_.c_str(); }
-
-  const char* AcclTopicName() const { return accl_topic_name_.c_str(); }
-
-  const char* QuatTopicName() const { return quat_topic_name_.c_str(); }
-
-  const char* ImageEventTopicName() const { return image_event_topic_name_.c_str(); }
-
-  const char* SensorSyncCmdTopicName() const { return kSensorSyncCmdTopicName; }
-
   void SetSyncPolicy(const SyncPolicy& policy)
   {
     LibXR::Mutex::LockGuard lock(sync_policy_mutex_);
