@@ -267,7 +267,8 @@ class CameraFrameSync
 
   void PublishSensorSyncCmd(const SensorSyncCmd& cmd)
   {
-    sensor_sync_cmd_topic_.Publish(cmd);
+    SensorSyncCmd publish_value = cmd;
+    sensor_sync_cmd_topic_.Publish(publish_value);
   }
 
   void SetSyncPolicy(const SyncPolicy& policy)
@@ -650,7 +651,7 @@ class CameraFrameSync
       pending_probe_sent_rx_us_ = 0;
     }
 
-    const SensorSyncCmd cmd{.cmd_id = next_probe_cmd_id_++};
+    SensorSyncCmd cmd{.cmd_id = next_probe_cmd_id_++};
     sensor_sync_cmd_topic_.Publish(cmd);
     pending_probe_cmd_id_ = cmd.cmd_id;
     pending_probe_sent_rx_us_ = now_us;
