@@ -150,7 +150,7 @@ class CameraFrameSync
     }
 
    private:
-    static constexpr size_t kQueueLength = 64;
+    static constexpr size_t kQueueLength = 32;
 
     static uint64_t MakeDeadline(uint32_t timeout_ms)
     {
@@ -338,10 +338,11 @@ class CameraFrameSync
     }
   };
 
-  static constexpr size_t kImuIngressLength = 1024;
-  static constexpr size_t kImageEventIngressLength = 256;
-  static constexpr size_t kPendingLimit = 2048;
-  static constexpr size_t kHistoryLimit = 2048;
+  // 这里按“100Hz 图像基线 + 1kHz IMU + 100ms 级搜索窗口”留余量，不再保留 1k/2k 级大队列。
+  static constexpr size_t kImuIngressLength = 128;
+  static constexpr size_t kImageEventIngressLength = 32;
+  static constexpr size_t kPendingLimit = 256;
+  static constexpr size_t kHistoryLimit = 256;
   static constexpr uint32_t kProbeTimeoutMs = 500;
   static constexpr uint32_t kImageTimeoutMs = 200;
   static constexpr uint32_t kImuTimeoutMs = 100;
