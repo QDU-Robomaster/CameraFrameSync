@@ -282,6 +282,94 @@ inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_
   }
 }
 
+enum class ChannelSampleSearchResult : uint8_t
+{
+  WAIT = 0,
+  FOUND = 1,
+  MISSED = 2,
+};
+
+template <typename PendingSampleContainer>
+ChannelSampleSearchResult SelectNearestChannelSampleIndex(
+    const PendingSampleContainer& pending_samples, uint64_t anchor_sensor_timestamp_us,
+    uint64_t half_period_window_us, size_t& out_index)
+{
+  if (pending_samples.Empty())
+  {
+    return ChannelSampleSearchResult::WAIT;
+  }
+
+  // 启动初期还没有稳定周期时，先退回旧策略：选第一条不早于 gyro 的样本。
+  if (half_period_window_us == 0)
+  {
+    for (size_t i = 0; i < pending_samples.Size(); ++i)
+    {
+      if (pending_samples[i].sample.sensor_timestamp_us >= anchor_sensor_timestamp_us)
+      {
+        out_index = i;
+        return ChannelSampleSearchResult::FOUND;
+      }
+    }
+    return ChannelSampleSearchResult::WAIT;
+  }
+
+  size_t first_not_earlier_index = pending_samples.Size();
+  for (size_t i = 0; i < pending_samples.Size(); ++i)
+  {
+    if (pending_samples[i].sample.sensor_timestamp_us >= anchor_sensor_timestamp_us)
+    {
+      first_not_earlier_index = i;
+      break;
+    }
+  }
+
+  size_t best_index = pending_samples.Size();
+  uint64_t best_error_us = std::numeric_limits<uint64_t>::max();
+  auto consider = [&](size_t index)
+  {
+    const uint64_t candidate_timestamp_us = pending_samples[index].sample.sensor_timestamp_us;
+    const uint64_t error_us = AbsDiffUs(candidate_timestamp_us, anchor_sensor_timestamp_us);
+    if (error_us > half_period_window_us)
+    {
+      return;
+    }
+
+    // 窗口内优先选离 gyro 最近的样本；如果前后距离完全相同，保留“优先更晚样本”的倾向。
+    if (best_index == pending_samples.Size() || error_us < best_error_us ||
+        (error_us == best_error_us &&
+         candidate_timestamp_us >= anchor_sensor_timestamp_us &&
+         pending_samples[best_index].sample.sensor_timestamp_us < anchor_sensor_timestamp_us))
+    {
+      best_index = index;
+      best_error_us = error_us;
+    }
+  };
+
+  if (first_not_earlier_index < pending_samples.Size())
+  {
+    consider(first_not_earlier_index);
+  }
+  if (first_not_earlier_index > 0)
+  {
+    consider(first_not_earlier_index - 1);
+  }
+
+  if (best_index != pending_samples.Size())
+  {
+    out_index = best_index;
+    return ChannelSampleSearchResult::FOUND;
+  }
+
+  const uint64_t window_end_us = anchor_sensor_timestamp_us + half_period_window_us;
+  if (first_not_earlier_index < pending_samples.Size() &&
+      pending_samples[first_not_earlier_index].sample.sensor_timestamp_us > window_end_us)
+  {
+    return ChannelSampleSearchResult::MISSED;
+  }
+
+  return ChannelSampleSearchResult::WAIT;
+}
+
 template <typename PendingGyroContainer, typename PendingAcclContainer,
           typename PendingQuatContainer, typename ImuHistoryContainer,
           typename MakeImuFn>
@@ -299,29 +387,25 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
   }
 
   const auto& gyro = pending_gyros.Front();
-  size_t accl_index = pending_accls.Size();
-  for (size_t i = 0; i < pending_accls.Size(); ++i)
-  {
-    if (pending_accls[i].sample.sensor_timestamp_us >= gyro.sample.sensor_timestamp_us)
-    {
-      accl_index = i;
-      break;
-    }
-  }
+  const uint64_t half_period_window_us = last_imu_sensor_period_us / 2U;
+  size_t accl_index = 0;
+  const ChannelSampleSearchResult accl_search = SelectNearestChannelSampleIndex(
+      pending_accls, gyro.sample.sensor_timestamp_us, half_period_window_us, accl_index);
+  size_t quat_index = 0;
+  const ChannelSampleSearchResult quat_search = SelectNearestChannelSampleIndex(
+      pending_quats, gyro.sample.sensor_timestamp_us, half_period_window_us, quat_index);
 
-  size_t quat_index = pending_quats.Size();
-  for (size_t i = 0; i < pending_quats.Size(); ++i)
-  {
-    if (pending_quats[i].sample.sensor_timestamp_us >= gyro.sample.sensor_timestamp_us)
-    {
-      quat_index = i;
-      break;
-    }
-  }
-
-  if (accl_index == pending_accls.Size() || quat_index == pending_quats.Size())
+  if (accl_search == ChannelSampleSearchResult::WAIT ||
+      quat_search == ChannelSampleSearchResult::WAIT)
   {
     return false;
+  }
+  if (accl_search == ChannelSampleSearchResult::MISSED ||
+      quat_search == ChannelSampleSearchResult::MISSED)
+  {
+    // 某一路已经越过 gyro 的半周期窗口还没找到可配对样本，说明这条 gyro 不再可组装，直接跳过。
+    pending_gyros.PopFront();
+    return true;
   }
 
   if (!imu_history.Empty())

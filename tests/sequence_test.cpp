@@ -1113,31 +1113,83 @@ void TestPositiveOffsetUsesLaterImu()
               "positive offset final imu");
 }
 
-void TestForwardSearchUsesLaterAcclAndQuat()
+void TestNearestSearchUsesClosestAcclAndQuat()
 {
-  SequenceHarness harness;
+  {
+    FixedRingBuffer<TimedTestGyro, 8> pending_gyros{};
+    FixedRingBuffer<TimedTestAccl, 8> pending_accls{};
+    FixedRingBuffer<TimedTestQuat, 8> pending_quats{};
+    FixedRingBuffer<TestImu, 8> imu_history{};
+    uint64_t last_imu_sensor_period_us = 1000;
+    uint64_t last_imu_rx_period_us = 1000;
 
-  FeedDefaultImuTriplets(harness, 1, 19);
-  harness.PushGyro(20000, 20000);
-  harness.PushAccl(20050, 20050);
-  harness.PushQuat(20060, 20060);
-  harness.Drain();
+    pending_gyros.PushBackDropOldest({{20000}, 20000});
+    // 默认“向后找”场景：后继样本在半周期窗口内更近，应优先选它。
+    pending_accls.PushBackDropOldest({{19000}, 19020});
+    pending_accls.PushBackDropOldest({{20050}, 20020});
+    pending_quats.PushBackDropOldest({{19000}, 19040});
+    pending_quats.PushBackDropOldest({{20060}, 20040});
 
-  PushImageSequenceAndDrain(harness, {
-                                        {4000, 4, 4100, 0},
-                                        StepImage(8, 0, 1),
-                                        StepImage(12, 0, 2),
-                                        StepImage(20, 0, 3),
-                                    });
+    const bool built = TryBuildFrontImu(
+        pending_gyros, pending_accls, pending_quats, imu_history, last_imu_sensor_period_us,
+        last_imu_rx_period_us, 8,
+        [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat, uint64_t rx_time_us)
+        {
+          return TestImu{
+              .sensor_timestamp_us = gyro.sensor_timestamp_us,
+              .rx_time_us = rx_time_us,
+              .accl_timestamp_us = accl.sensor_timestamp_us,
+              .quat_timestamp_us = quat.sensor_timestamp_us,
+          };
+        });
 
-  ExpectEqual(harness.PublishedSyncImuTimestamps(), std::vector<uint64_t>({20000}),
-              "forward search sync imu timestamp");
-  ExpectEqual(harness.PublishedAcclTimestamps(), std::vector<uint64_t>({20050}),
-              "forward search accl timestamp");
-  ExpectEqual(harness.PublishedQuatTimestamps(), std::vector<uint64_t>({20060}),
-              "forward search quat timestamp");
-  ExpectEqual(harness.PublishedFinalImuTimestamps(), std::vector<uint64_t>({20000}),
-              "forward search final imu");
+    ExpectEqual(built, true, "prefer later built");
+    ExpectEqual(imu_history.Size(), static_cast<size_t>(1), "prefer later history size");
+    ExpectEqual(imu_history.Back().sensor_timestamp_us, static_cast<uint64_t>(20000),
+                "prefer later gyro timestamp");
+    ExpectEqual(imu_history.Back().accl_timestamp_us, static_cast<uint64_t>(20050),
+                "prefer later accl timestamp");
+    ExpectEqual(imu_history.Back().quat_timestamp_us, static_cast<uint64_t>(20060),
+                "prefer later quat timestamp");
+  }
+
+  {
+    FixedRingBuffer<TimedTestGyro, 8> pending_gyros{};
+    FixedRingBuffer<TimedTestAccl, 8> pending_accls{};
+    FixedRingBuffer<TimedTestQuat, 8> pending_quats{};
+    FixedRingBuffer<TestImu, 8> imu_history{};
+    uint64_t last_imu_sensor_period_us = 1000;
+    uint64_t last_imu_rx_period_us = 1000;
+
+    pending_gyros.PushBackDropOldest({{20000}, 20000});
+    // 半周期窗口内前驱更近时，应优先选它，而不是机械地只取后继样本。
+    pending_accls.PushBackDropOldest({{19960}, 19020});
+    pending_accls.PushBackDropOldest({{20220}, 20020});
+    pending_quats.PushBackDropOldest({{19970}, 19040});
+    pending_quats.PushBackDropOldest({{20230}, 20040});
+
+    const bool built = TryBuildFrontImu(
+        pending_gyros, pending_accls, pending_quats, imu_history, last_imu_sensor_period_us,
+        last_imu_rx_period_us, 8,
+        [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat, uint64_t rx_time_us)
+        {
+          return TestImu{
+              .sensor_timestamp_us = gyro.sensor_timestamp_us,
+              .rx_time_us = rx_time_us,
+              .accl_timestamp_us = accl.sensor_timestamp_us,
+              .quat_timestamp_us = quat.sensor_timestamp_us,
+          };
+        });
+
+    ExpectEqual(built, true, "prefer earlier built");
+    ExpectEqual(imu_history.Size(), static_cast<size_t>(1), "prefer earlier history size");
+    ExpectEqual(imu_history.Back().sensor_timestamp_us, static_cast<uint64_t>(20000),
+                "prefer earlier gyro timestamp");
+    ExpectEqual(imu_history.Back().accl_timestamp_us, static_cast<uint64_t>(19960),
+                "prefer earlier accl timestamp");
+    ExpectEqual(imu_history.Back().quat_timestamp_us, static_cast<uint64_t>(19970),
+                "prefer earlier quat timestamp");
+  }
 }
 
 void TestProbeFrameWaitsForLateImu()
@@ -1477,7 +1529,7 @@ int main()
   const NamedCase cases[] = {
       {"正确/稳定观察后自动发probe并锁定", TestCadenceMustStabilizeBeforeProbe},
       {"正确/正offset在IMU域内取后继样本", TestPositiveOffsetUsesLaterImu},
-      {"正确/gyro前向找后继accl与quat", TestForwardSearchUsesLaterAcclAndQuat},
+      {"正确/gyro半周期窗口内选择最近accl与quat", TestNearestSearchUsesClosestAcclAndQuat},
       {"正确/probe帧会等待迟到的同步IMU", TestProbeFrameWaitsForLateImu},
       {"正确/稳态图像会等待迟到的同步IMU", TestTrackedFrameWaitsForLateImu},
       {"正确/offset目标样本未到时保持等待", TestPositiveOffsetWaitsForFutureImu},
