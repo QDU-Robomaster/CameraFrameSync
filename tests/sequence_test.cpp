@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -69,6 +70,14 @@ struct TestImu
   uint64_t rx_time_us{};
   uint64_t accl_timestamp_us{};
   uint64_t quat_timestamp_us{};
+};
+
+struct ImageInput
+{
+  uint64_t sensor_timestamp_us{};
+  uint32_t sensor_step_index{};
+  uint64_t rx_time_us{};
+  uint32_t tag{};
 };
 
 struct ImageReference
@@ -939,56 +948,134 @@ void ExpectEqual(const T& actual, const T& expected, const std::string& label)
   }
 }
 
-void FeedImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
-                     uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us = 0)
+static constexpr uint64_t kDefaultSensorStepUs = 1000ULL;
+static constexpr uint64_t kDefaultRxStepUs = 1000ULL;
+static constexpr uint64_t kDefaultAcclRxOffsetUs = 20ULL;
+static constexpr uint64_t kDefaultQuatRxOffsetUs = 40ULL;
+
+uint64_t StepTimestampUs(uint32_t step_index)
+{
+  return static_cast<uint64_t>(step_index) * kDefaultSensorStepUs;
+}
+
+ImageInput StepImage(uint32_t step_index, uint64_t image_rx_bias_us, uint32_t tag)
+{
+  const uint64_t sensor_timestamp_us = StepTimestampUs(step_index);
+  return ImageInput{
+      .sensor_timestamp_us = sensor_timestamp_us,
+      .sensor_step_index = step_index,
+      .rx_time_us = sensor_timestamp_us + image_rx_bias_us,
+      .tag = tag,
+  };
+}
+
+void PushImageAndDrain(SequenceHarness& harness, const ImageInput& image)
+{
+  harness.PushImage(image.sensor_timestamp_us, image.sensor_step_index, image.rx_time_us,
+                    image.tag);
+  harness.Drain();
+}
+
+void PushImageSequenceAndDrain(SequenceHarness& harness,
+                               std::initializer_list<ImageInput> images)
+{
+  for (const ImageInput& image : images)
+  {
+    PushImageAndDrain(harness, image);
+  }
+}
+
+void PushImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
+                     uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us,
+                     bool drain_after_each_sample)
 {
   for (uint32_t index = begin_index; index <= end_index; ++index)
   {
     const uint64_t sensor_timestamp_us = static_cast<uint64_t>(index) * sensor_step_us;
     const uint64_t rx_time_us = static_cast<uint64_t>(index) * rx_step_us + rx_bias_us;
     harness.PushGyro(sensor_timestamp_us, rx_time_us);
-    harness.PushAccl(sensor_timestamp_us, rx_time_us + 20);
-    harness.PushQuat(sensor_timestamp_us, rx_time_us + 40);
-    harness.Drain();
+    harness.PushAccl(sensor_timestamp_us, rx_time_us + kDefaultAcclRxOffsetUs);
+    harness.PushQuat(sensor_timestamp_us, rx_time_us + kDefaultQuatRxOffsetUs);
+    if (drain_after_each_sample)
+    {
+      harness.Drain();
+    }
   }
+}
+
+void FeedImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
+                     uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us = 0)
+{
+  PushImuTriplets(harness, begin_index, end_index, sensor_step_us, rx_step_us, rx_bias_us, true);
 }
 
 void QueueImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
                       uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us = 0)
 {
-  for (uint32_t index = begin_index; index <= end_index; ++index)
-  {
-    const uint64_t sensor_timestamp_us = static_cast<uint64_t>(index) * sensor_step_us;
-    const uint64_t rx_time_us = static_cast<uint64_t>(index) * rx_step_us + rx_bias_us;
-    harness.PushGyro(sensor_timestamp_us, rx_time_us);
-    harness.PushAccl(sensor_timestamp_us, rx_time_us + 20);
-    harness.PushQuat(sensor_timestamp_us, rx_time_us + 40);
-  }
+  PushImuTriplets(harness, begin_index, end_index, sensor_step_us, rx_step_us, rx_bias_us, false);
+}
+
+void FeedDefaultImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
+                            uint64_t rx_bias_us = 0)
+{
+  FeedImuTriplets(harness, begin_index, end_index, kDefaultSensorStepUs, kDefaultRxStepUs,
+                  rx_bias_us);
+}
+
+void QueueDefaultImuTriplets(SequenceHarness& harness, uint32_t begin_index, uint32_t end_index,
+                             uint64_t rx_bias_us = 0)
+{
+  QueueImuTriplets(harness, begin_index, end_index, kDefaultSensorStepUs, kDefaultRxStepUs,
+                   rx_bias_us);
+}
+
+void PrimeProbeReadyState(SequenceHarness& harness, uint32_t imu_end_index,
+                          uint64_t image_rx_bias_us)
+{
+  FeedDefaultImuTriplets(harness, 1, imu_end_index);
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(4, image_rx_bias_us, 0),
+                                        StepImage(8, image_rx_bias_us, 1),
+                                        StepImage(12, image_rx_bias_us, 2),
+                                    });
+}
+
+void BuildInitialSyncedState(SequenceHarness& harness, uint32_t imu_end_index,
+                             uint64_t image_rx_bias_us)
+{
+  FeedDefaultImuTriplets(harness, 1, imu_end_index);
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(4, image_rx_bias_us, 0),
+                                        StepImage(8, image_rx_bias_us, 1),
+                                        StepImage(12, image_rx_bias_us, 2),
+                                        StepImage(20, image_rx_bias_us, 3),
+                                        StepImage(24, image_rx_bias_us, 4),
+                                        StepImage(28, image_rx_bias_us, 5),
+                                    });
 }
 
 void TestCadenceMustStabilizeBeforeProbe()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 28, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
+  FeedDefaultImuTriplets(harness, 1, 28);
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(4, 120, 0),
+                                        StepImage(8, 120, 1),
+                                    });
 
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(0), "probe should not arm early");
   ExpectEqual(harness.CurrentState(), SyncState::OBSERVING, "startup observing state");
 
-  harness.PushImage(12000, 12, 12120, 2);
-  harness.Drain();
-  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1), "probe should arm after stable cadence");
+  PushImageAndDrain(harness, StepImage(12, 120, 2));
+  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
+              "probe should arm after stable cadence");
 
-  harness.PushImage(20000, 20, 20120, 3);
-  harness.Drain();
-  harness.PushImage(24000, 24, 24120, 4);
-  harness.Drain();
-  harness.PushImage(28000, 28, 28120, 5);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(20, 120, 3),
+                                        StepImage(24, 120, 4),
+                                        StepImage(28, 120, 5),
+                                    });
 
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3, 4, 5}),
               "publish tags after startup observe");
@@ -1003,15 +1090,13 @@ void TestPositiveOffsetUsesLaterImu()
   SequenceHarness harness;
   harness.SetOffsetUs(700);
 
-  FeedImuTriplets(harness, 1, 24, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12120, 2);
-  harness.Drain();
-  harness.PushImage(20000, 20, 20120, 3);
-  harness.Drain();
+  FeedDefaultImuTriplets(harness, 1, 24);
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(4, 120, 0),
+                                        StepImage(8, 120, 1),
+                                        StepImage(12, 120, 2),
+                                        StepImage(20, 120, 3),
+                                    });
 
   ExpectEqual(harness.PublishedFinalImuTimestamps(), std::vector<uint64_t>({21000}),
               "positive offset final imu");
@@ -1021,20 +1106,18 @@ void TestForwardSearchUsesLaterAcclAndQuat()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 19, 1000, 1000);
+  FeedDefaultImuTriplets(harness, 1, 19);
   harness.PushGyro(20000, 20000);
   harness.PushAccl(20050, 20050);
   harness.PushQuat(20060, 20060);
   harness.Drain();
 
-  harness.PushImage(4000, 4, 4100, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8000, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12000, 2);
-  harness.Drain();
-  harness.PushImage(20000, 20, 20000, 3);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        {4000, 4, 4100, 0},
+                                        StepImage(8, 0, 1),
+                                        StepImage(12, 0, 2),
+                                        StepImage(20, 0, 3),
+                                    });
 
   ExpectEqual(harness.PublishedSyncImuTimestamps(), std::vector<uint64_t>({20000}),
               "forward search sync imu timestamp");
@@ -1065,18 +1148,11 @@ void TestProbeFrameWaitsForLateImu()
   {
     SequenceHarness harness;
 
-    FeedImuTriplets(harness, 1, 16, 1000, 1000);
-    harness.PushImage(4000, 4, 4000 + test_case.image_rx_bias_us, 0);
-    harness.Drain();
-    harness.PushImage(8000, 8, 8000 + test_case.image_rx_bias_us, 1);
-    harness.Drain();
-    harness.PushImage(12000, 12, 12000 + test_case.image_rx_bias_us, 2);
-    harness.Drain();
+    PrimeProbeReadyState(harness, 16, test_case.image_rx_bias_us);
     ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
                 std::string(test_case.name) + " probe should arm before late imu");
 
-    harness.PushImage(20000, 20, 20000 + test_case.image_rx_bias_us, 3);
-    harness.Drain();
+    PushImageAndDrain(harness, StepImage(20, test_case.image_rx_bias_us, 3));
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
                 std::string(test_case.name) + " should keep probe image pending");
     ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
@@ -1084,7 +1160,7 @@ void TestProbeFrameWaitsForLateImu()
     ExpectEqual(harness.CurrentState(), SyncState::OBSERVING,
                 std::string(test_case.name) + " should stay observing before first lock");
 
-    FeedImuTriplets(harness, 17, test_case.publish_end_index, 1000, 1000);
+    FeedDefaultImuTriplets(harness, 17, test_case.publish_end_index);
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
                 std::string(test_case.name) + " should publish after imu arrives");
     if (test_case.check_exact_sync_timestamp)
@@ -1117,24 +1193,16 @@ void TestTrackedFrameWaitsForLateImu()
   {
     SequenceHarness harness;
 
-    FeedImuTriplets(harness, 1, 20, 1000, 1000);
-    harness.PushImage(4000, 4, 4000 + test_case.image_rx_bias_us, 0);
-    harness.Drain();
-    harness.PushImage(8000, 8, 8000 + test_case.image_rx_bias_us, 1);
-    harness.Drain();
-    harness.PushImage(12000, 12, 12000 + test_case.image_rx_bias_us, 2);
-    harness.Drain();
-    harness.PushImage(20000, 20, 20000 + test_case.image_rx_bias_us, 3);
-    harness.Drain();
+    PrimeProbeReadyState(harness, 20, test_case.image_rx_bias_us);
+    PushImageAndDrain(harness, StepImage(20, test_case.image_rx_bias_us, 3));
     if (test_case.lock_publish_end_index > 20)
     {
-      FeedImuTriplets(harness, 21, test_case.lock_publish_end_index, 1000, 1000);
+      FeedDefaultImuTriplets(harness, 21, test_case.lock_publish_end_index);
     }
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
                 std::string(test_case.name) + " tracked wait bootstrap publish");
 
-    harness.PushImage(24000, 24, 24000 + test_case.image_rx_bias_us, 4);
-    harness.Drain();
+    PushImageAndDrain(harness, StepImage(24, test_case.image_rx_bias_us, 4));
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
                 std::string(test_case.name) + " should keep tracked image pending");
     ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
@@ -1142,8 +1210,8 @@ void TestTrackedFrameWaitsForLateImu()
     ExpectEqual(harness.CurrentState(), SyncState::LOCKING,
                 std::string(test_case.name) + " should stay locking");
 
-    FeedImuTriplets(harness, test_case.lock_publish_end_index + 1,
-                    test_case.tracked_publish_end_index, 1000, 1000);
+    FeedDefaultImuTriplets(harness, test_case.lock_publish_end_index + 1,
+                           test_case.tracked_publish_end_index);
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3, 4}),
                 std::string(test_case.name) + " should publish after imu arrives");
     if (test_case.check_exact_sync_timestamps)
@@ -1177,22 +1245,15 @@ void TestPositiveOffsetWaitsForFutureImu()
     SequenceHarness harness;
     harness.SetOffsetUs(test_case.offset_us);
 
-    FeedImuTriplets(harness, 1, 20, 1000, 1000);
-    harness.PushImage(4000, 4, 4000 + test_case.image_rx_bias_us, 0);
-    harness.Drain();
-    harness.PushImage(8000, 8, 8000 + test_case.image_rx_bias_us, 1);
-    harness.Drain();
-    harness.PushImage(12000, 12, 12000 + test_case.image_rx_bias_us, 2);
-    harness.Drain();
-    harness.PushImage(20000, 20, 20000 + test_case.image_rx_bias_us, 3);
-    harness.Drain();
+    PrimeProbeReadyState(harness, 20, test_case.image_rx_bias_us);
+    PushImageAndDrain(harness, StepImage(20, test_case.image_rx_bias_us, 3));
 
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
                 std::string(test_case.name) + " should keep image pending");
     ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
                 std::string(test_case.name) + " should not reject image");
 
-    QueueImuTriplets(harness, 21, test_case.future_end_index, 1000, 1000);
+    QueueDefaultImuTriplets(harness, 21, test_case.future_end_index);
     harness.Drain();
     ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
                 std::string(test_case.name) + " should publish after future sample arrives");
@@ -1208,17 +1269,10 @@ void TestBadProbeGapRejects()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 20, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12120, 2);
-  harness.Drain();
+  PrimeProbeReadyState(harness, 20, 120);
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1), "probe should arm once");
 
-  harness.PushImage(16000, 16, 16120, 3);
-  harness.Drain();
+  PushImageAndDrain(harness, StepImage(16, 120, 3));
 
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
               "bad probe gap should not publish");
@@ -1230,30 +1284,29 @@ void TestStartupJitterKeepsObservingUntilStable()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 40, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
-  harness.PushImage(14500, 14, 14620, 2);
-  harness.Drain();
+  FeedDefaultImuTriplets(harness, 1, 40);
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(4, 120, 0),
+                                        StepImage(8, 120, 1),
+                                        {14500, 14, 14620, 2},
+                                    });
 
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(0), "jitter should block probe");
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
               "jitter should not publish");
 
-  harness.PushImage(18500, 18, 18620, 3);
-  harness.Drain();
-  harness.PushImage(22500, 22, 22620, 4);
-  harness.Drain();
-  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1), "probe after cadence restabilizes");
+  PushImageSequenceAndDrain(harness, {
+                                        {18500, 18, 18620, 3},
+                                        {22500, 22, 22620, 4},
+                                    });
+  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
+              "probe after cadence restabilizes");
 
-  harness.PushImage(30500, 30, 30620, 5);
-  harness.Drain();
-  harness.PushImage(34500, 34, 34620, 6);
-  harness.Drain();
-  harness.PushImage(38500, 38, 38620, 7);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        {30500, 30, 30620, 5},
+                                        {34500, 34, 34620, 6},
+                                        {38500, 38, 38620, 7},
+                                    });
 
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({5, 6, 7}),
               "publish tags after startup jitter");
@@ -1264,39 +1317,27 @@ void TestImageCadenceBreakResetsAndRelocks()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 58, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12120, 2);
-  harness.Drain();
-  harness.PushImage(20000, 20, 20120, 3);
-  harness.Drain();
-  harness.PushImage(24000, 24, 24120, 4);
-  harness.Drain();
-  harness.PushImage(28000, 28, 28120, 5);
-  harness.Drain();
+  BuildInitialSyncedState(harness, 58, 120);
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "initial sync state");
 
-  harness.PushImage(34000, 34, 34120, 6);
-  harness.Drain();
+  PushImageAndDrain(harness, StepImage(34, 120, 6));
   ExpectEqual(harness.CurrentState(), SyncState::OBSERVING,
               "cadence break should reset to observing");
-  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1), "break should not send new probe immediately");
+  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
+              "break should not send new probe immediately");
 
-  harness.PushImage(38000, 38, 38120, 7);
-  harness.Drain();
-  harness.PushImage(42000, 42, 42120, 8);
-  harness.Drain();
-  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(2), "restabilized cadence should send second probe");
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(38, 120, 7),
+                                        StepImage(42, 120, 8),
+                                    });
+  ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(2),
+              "restabilized cadence should send second probe");
 
-  harness.PushImage(50000, 50, 50120, 9);
-  harness.Drain();
-  harness.PushImage(54000, 54, 54120, 10);
-  harness.Drain();
-  harness.PushImage(58000, 58, 58120, 11);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(50, 120, 9),
+                                        StepImage(54, 120, 10),
+                                        StepImage(58, 120, 11),
+                                    });
 
   ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
               "cadence break should reset, not mark match reject");
@@ -1309,19 +1350,7 @@ void TestRawImuCadenceBreakResetsAndRelocks()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 56, 1000, 1000);
-  harness.PushImage(4000, 4, 4120, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8120, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12120, 2);
-  harness.Drain();
-  harness.PushImage(20000, 20, 20120, 3);
-  harness.Drain();
-  harness.PushImage(24000, 24, 24120, 4);
-  harness.Drain();
-  harness.PushImage(28000, 28, 28120, 5);
-  harness.Drain();
+  BuildInitialSyncedState(harness, 56, 120);
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "raw imu break bootstrap state");
 
   harness.PushGyro(29000, 29600);
@@ -1333,21 +1362,20 @@ void TestRawImuCadenceBreakResetsAndRelocks()
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
               "raw imu break should not immediately resend probe");
 
-  QueueImuTriplets(harness, 30, 56, 1000, 1000, 600);
+  QueueDefaultImuTriplets(harness, 30, 56, 600);
   harness.Drain();
-  harness.PushImage(32000, 32, 32120, 6);
-  harness.Drain();
-  harness.PushImage(36000, 36, 36120, 7);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(32, 120, 6),
+                                        StepImage(36, 120, 7),
+                                    });
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(2),
               "raw imu restabilize should send second probe");
 
-  harness.PushImage(44000, 44, 44120, 9);
-  harness.Drain();
-  harness.PushImage(48000, 48, 48120, 10);
-  harness.Drain();
-  harness.PushImage(52000, 52, 52120, 11);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(44, 120, 9),
+                                        StepImage(48, 120, 10),
+                                        StepImage(52, 120, 11),
+                                    });
 
   ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
               "raw imu cadence break should relock without extra rejects");
@@ -1360,35 +1388,26 @@ void TestCompositeMixedSequence()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, 1, 16, 1000, 1000);
-  harness.PushImage(4000, 4, 4000, 0);
-  harness.Drain();
-  harness.PushImage(8000, 8, 8000, 1);
-  harness.Drain();
-  harness.PushImage(12000, 12, 12000, 2);
-  harness.Drain();
+  PrimeProbeReadyState(harness, 16, 0);
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(1),
               "composite first probe should arm");
 
-  harness.PushImage(20000, 20, 20000, 3);
-  harness.Drain();
+  PushImageAndDrain(harness, StepImage(20, 0, 3));
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({}),
               "composite late probe should stay pending");
 
-  FeedImuTriplets(harness, 17, 20, 1000, 1000);
+  FeedDefaultImuTriplets(harness, 17, 20);
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
               "composite late probe should publish after imu arrives");
 
-  harness.PushImage(24000, 24, 24000, 4);
-  harness.Drain();
+  PushImageAndDrain(harness, StepImage(24, 0, 4));
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3}),
               "composite late tracked frame should stay pending");
 
-  FeedImuTriplets(harness, 21, 24, 1000, 1000);
-  QueueImuTriplets(harness, 25, 28, 1000, 1000);
+  FeedDefaultImuTriplets(harness, 21, 24);
+  QueueDefaultImuTriplets(harness, 25, 28);
   harness.Drain();
-  harness.PushImage(28000, 28, 28000, 5);
-  harness.Drain();
+  PushImageAndDrain(harness, StepImage(28, 0, 5));
   ExpectEqual(harness.PublishedImageTags(), std::vector<uint32_t>({3, 4, 5}),
               "composite steady publish before raw imu break");
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED,
@@ -1401,21 +1420,20 @@ void TestCompositeMixedSequence()
   ExpectEqual(harness.CurrentState(), SyncState::OBSERVING,
               "composite raw imu break should reset to observing");
 
-  QueueImuTriplets(harness, 30, 56, 1000, 1000, 600);
+  QueueDefaultImuTriplets(harness, 30, 56, 600);
   harness.Drain();
-  harness.PushImage(32000, 32, 32000, 6);
-  harness.Drain();
-  harness.PushImage(36000, 36, 36000, 7);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(32, 0, 6),
+                                        StepImage(36, 0, 7),
+                                    });
   ExpectEqual(harness.ProbeSentCount(), static_cast<uint32_t>(2),
               "composite second probe should arm after restabilize");
 
-  harness.PushImage(44000, 44, 44000, 9);
-  harness.Drain();
-  harness.PushImage(48000, 48, 48000, 10);
-  harness.Drain();
-  harness.PushImage(52000, 52, 52000, 11);
-  harness.Drain();
+  PushImageSequenceAndDrain(harness, {
+                                        StepImage(44, 0, 9),
+                                        StepImage(48, 0, 10),
+                                        StepImage(52, 0, 11),
+                                    });
 
   ExpectEqual(harness.RejectTags(), std::vector<uint32_t>({}),
               "composite sequence should not reject frames");
