@@ -32,6 +32,9 @@
 - 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
 - 对下游稳定暴露的只有共享图像与同步后 `imu`；原始小话题只服务于模块内部同步
+- 运行时只保留一个调节点：
+  - `offset_us`
+  - 它表示在 IMU 自己的 `sensor_timestamp_us` 时间域里，对最终取样位置做常量平移
 
 ## 当前同步策略
 

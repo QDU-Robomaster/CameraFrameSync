@@ -70,14 +70,6 @@ class CameraFrameSync
     const ImageFrame* GetImageFrame() const { return image.GetData(); }
   };
 
-  struct SyncPolicy
-  {
-    int32_t offset_us{0};
-    uint32_t image_timeout_ms{200};
-    uint32_t imu_timeout_ms{100};
-    uint32_t relock_confirm_frames{3};
-  };
-
   class Subscriber
   {
    public:
@@ -254,10 +246,9 @@ class CameraFrameSync
 
   const char* ImuTopicName() const { return imu_topic_name_; }
 
-  void SetSyncPolicy(const SyncPolicy& policy)
+  void SetOffsetUs(int32_t offset_us)
   {
-    LibXR::Mutex::LockGuard lock(sync_policy_mutex_);
-    sync_policy_ = SanitizeSyncPolicy(policy);
+    offset_us_.store(offset_us, std::memory_order_relaxed);
   }
 
  private:
@@ -342,29 +333,9 @@ class CameraFrameSync
   static constexpr size_t kPendingLimit = 2048;
   static constexpr size_t kHistoryLimit = 2048;
   static constexpr uint32_t kProbeTimeoutMs = 500;
-
-  static SyncPolicy SanitizeSyncPolicy(SyncPolicy policy)
-  {
-    if (policy.image_timeout_ms == 0)
-    {
-      policy.image_timeout_ms = 200;
-    }
-    if (policy.imu_timeout_ms == 0)
-    {
-      policy.imu_timeout_ms = 100;
-    }
-    if (policy.relock_confirm_frames == 0)
-    {
-      policy.relock_confirm_frames = 3;
-    }
-    return policy;
-  }
-
-  SyncPolicy SnapshotSyncPolicy()
-  {
-    LibXR::Mutex::LockGuard lock(sync_policy_mutex_);
-    return sync_policy_;
-  }
+  static constexpr uint32_t kImageTimeoutMs = 200;
+  static constexpr uint32_t kImuTimeoutMs = 100;
+  static constexpr uint32_t kRelockConfirmFrames = 3;
 
   static uint64_t NowUs()
   {
@@ -387,9 +358,9 @@ class CameraFrameSync
     return std::max<uint64_t>(100000ULL, relation.base_image_rx_period_us * 2ULL);
   }
 
-  static uint64_t ProbeTimeoutUs(uint32_t image_timeout_ms)
+  static uint64_t ProbeTimeoutUs()
   {
-    return static_cast<uint64_t>(std::max<uint32_t>(kProbeTimeoutMs, image_timeout_ms * 2U)) *
+    return static_cast<uint64_t>(std::max<uint32_t>(kProbeTimeoutMs, kImageTimeoutMs * 2U)) *
            1000ULL;
   }
 
@@ -550,11 +521,10 @@ class CameraFrameSync
                               uint32_t current_image_event_rx_ms)
   {
     LibXR::Mutex::LockGuard lock(sync_state_mutex_);
-    const SyncPolicy policy = SnapshotSyncPolicy();
     DrainIngressQueues();
-    HandleRecoveryTriggers(policy, previous_image_event_rx_ms, current_image_event_rx_ms);
-    MaybeSendProbe(policy);
-    DrainPendingImageEvents(policy);
+    HandleRecoveryTriggers(previous_image_event_rx_ms, current_image_event_rx_ms);
+    MaybeSendProbe();
+    DrainPendingImageEvents();
   }
 
   void DrainIngressQueues()
@@ -640,7 +610,7 @@ class CameraFrameSync
     last_normal_image_.image = image;
   }
 
-  void DrainPendingImageEvents(const SyncPolicy& policy)
+  void DrainPendingImageEvents()
   {
     while (!pending_image_events_.Empty())
     {
@@ -656,7 +626,7 @@ class CameraFrameSync
       {
         pending_image_events_.PopFront();
         EnterRecovering();
-        MaybeSendProbe(policy);
+        MaybeSendProbe();
         continue;
       }
 
@@ -666,13 +636,13 @@ class CameraFrameSync
       ImageDecision decision = ImageDecision::REJECT;
       if (probe_pending)
       {
-        decision = IsProbeImageGap(image_gap_rx_us) ? TryLockFromProbe(image, image_gap_rx_us, policy)
+        decision = IsProbeImageGap(image_gap_rx_us) ? TryLockFromProbe(image, image_gap_rx_us)
                                                     : ImageDecision::REJECT;
       }
       else if (IsLockingOrSynced())
       {
         decision =
-            IsNormalImageGap(image_gap_rx_us) ? TryProcessLockedImage(image, image_gap_rx_us, policy)
+            IsNormalImageGap(image_gap_rx_us) ? TryProcessLockedImage(image, image_gap_rx_us)
                                               : ImageDecision::REJECT;
       }
       else
@@ -680,7 +650,7 @@ class CameraFrameSync
         ObserveNormalImagePeriod(image, image_gap_rx_us);
         RememberObservedImage(image);
         pending_image_events_.PopFront();
-        MaybeSendProbe(policy);
+        MaybeSendProbe();
         continue;
       }
 
@@ -710,11 +680,11 @@ class CameraFrameSync
       }
       RememberObservedImage(image);
       EnterRecovering();
-      MaybeSendProbe(policy);
+      MaybeSendProbe();
     }
   }
 
-  void MaybeSendProbe(const SyncPolicy& policy)
+  void MaybeSendProbe()
   {
     if (IsLockingOrSynced())
     {
@@ -730,7 +700,7 @@ class CameraFrameSync
     const uint64_t now_us = NowUs();
     if (probe_pending_)
     {
-      if (now_us - pending_probe_sent_rx_us_ <= ProbeTimeoutUs(policy.image_timeout_ms))
+      if (now_us - pending_probe_sent_rx_us_ <= ProbeTimeoutUs())
       {
         return;
       }
@@ -770,15 +740,15 @@ class CameraFrameSync
   }
 
   ImageDecision PublishMatchedImage(const TimedImageEvent& image,
-                                    const SyncMatch& match,
-                                    const SyncPolicy& policy)
+                                    const SyncMatch& match)
   {
     // 先确定“同步帧是哪一条 IMU”，再只在 IMU 自己时间域里应用 offset 取最终样本。
-    const AssembledImu* final_imu = FindFinalImu(*match.sync_imu, policy.offset_us);
+    const int32_t offset_us = offset_us_.load(std::memory_order_relaxed);
+    const AssembledImu* final_imu = FindFinalImu(*match.sync_imu, offset_us);
     if (final_imu == nullptr)
     {
-      return NeedMoreImuForOffset(*match.sync_imu, policy.offset_us) ? ImageDecision::WAIT
-                                                                     : ImageDecision::REJECT;
+      return NeedMoreImuForOffset(*match.sync_imu, offset_us) ? ImageDecision::WAIT
+                                                              : ImageDecision::REJECT;
     }
 
     PublishSyncedImu(image.sample.sensor_timestamp_us, *final_imu);
@@ -786,7 +756,7 @@ class CameraFrameSync
     relation_.last_image_rx_time_us = image.rx_time_us;
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
     relation_.last_host_skew_us = match.host_skew_us;
-    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, policy.relock_confirm_frames);
+    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, kRelockConfirmFrames);
     return ImageDecision::ACCEPT;
   }
 
@@ -967,8 +937,7 @@ class CameraFrameSync
     return best_match;
   }
 
-  ImageDecision TryLockFromProbe(const TimedImageEvent& probe, uint64_t image_gap_rx_us,
-                                 const SyncPolicy& policy)
+  ImageDecision TryLockFromProbe(const TimedImageEvent& probe, uint64_t image_gap_rx_us)
   {
     if (!last_normal_image_.valid || !IsProbeImageGap(image_gap_rx_us))
     {
@@ -1000,11 +969,10 @@ class CameraFrameSync
       return ImageDecision::REJECT;
     }
 
-    return PublishMatchedImage(probe, match, policy);
+    return PublishMatchedImage(probe, match);
   }
 
-  ImageDecision TryProcessLockedImage(const TimedImageEvent& image, uint64_t image_gap_rx_us,
-                                      const SyncPolicy& policy)
+  ImageDecision TryProcessLockedImage(const TimedImageEvent& image, uint64_t image_gap_rx_us)
   {
     if (relation_.last_image_rx_time_us == 0 || relation_.last_sync_imu_sensor_timestamp_us == 0)
     {
@@ -1046,7 +1014,7 @@ class CameraFrameSync
       return ImageDecision::REJECT;
     }
 
-    return PublishMatchedImage(image, match, policy);
+    return PublishMatchedImage(image, match);
   }
 
   const AssembledImu* FindFinalImu(const AssembledImu& sync_imu, int32_t offset_us) const
@@ -1083,8 +1051,7 @@ class CameraFrameSync
     synced_imu_topic_.Publish(synced);
   }
 
-  void HandleRecoveryTriggers(const SyncPolicy& policy,
-                              uint32_t previous_image_event_rx_ms,
+  void HandleRecoveryTriggers(uint32_t previous_image_event_rx_ms,
                               uint32_t current_image_event_rx_ms)
   {
     const uint32_t last_imu_rx_ms =
@@ -1095,14 +1062,14 @@ class CameraFrameSync
     const bool image_timeout =
         previous_image_event_rx_ms != 0 &&
         static_cast<uint32_t>(current_image_event_rx_ms - previous_image_event_rx_ms) >
-            policy.image_timeout_ms;
+            kImageTimeoutMs;
     const bool imu_timeout =
         last_imu_rx_ms != 0 &&
         static_cast<uint32_t>(current_image_event_rx_ms - last_imu_rx_ms) >
-            policy.imu_timeout_ms;
+            kImuTimeoutMs;
     const bool probe_timeout =
         probe_pending_ && pending_probe_sent_rx_us_ != 0 &&
-        (NowUs() - pending_probe_sent_rx_us_) > ProbeTimeoutUs(policy.image_timeout_ms);
+        (NowUs() - pending_probe_sent_rx_us_) > ProbeTimeoutUs();
 
     if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout || imu_timeout ||
         probe_timeout)
@@ -1149,8 +1116,7 @@ class CameraFrameSync
   FixedRingBuffer<AssembledImu, kHistoryLimit> imu_history_{};
   LibXR::Mutex sync_state_mutex_{};
 
-  LibXR::Mutex sync_policy_mutex_{};
-  SyncPolicy sync_policy_ = SanitizeSyncPolicy(SyncPolicy{});
+  std::atomic<int32_t> offset_us_{0};
   SyncLockState lock_state_{};
   SyncRelation relation_{};
   ImageReference last_observed_image_{};
