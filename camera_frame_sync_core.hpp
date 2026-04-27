@@ -8,8 +8,8 @@
 
 namespace CameraFrameSyncCore
 {
-// 这里只保留“按时间序列对齐图像和 IMU”相关的纯逻辑。
-// 生产代码和独立序列测试共用这一份，避免两边各写一套。
+// 这里只保留同步器和序列测试共享的“纯时序工具”。
+// 具体状态机仍放在 CameraFrameSync 里，避免 helper 继续膨胀成另一套框架。
 
 template <typename T, size_t Capacity>
 class FixedRingBuffer
@@ -31,7 +31,6 @@ class FixedRingBuffer
 
   const T& operator[](size_t index) const { return storage_[PhysicalIndex(index)]; }
 
-  // 队列满时覆盖最旧样本，调用方可据返回值决定是否进入恢复态。
   bool PushBackDropOldest(const T& value)
   {
     if (size_ < Capacity)
@@ -101,16 +100,12 @@ struct SyncLockState
   uint32_t lock_confirm_count{0};
 };
 
-struct SyncCadenceState
-{
-  uint32_t last_image_sequence{std::numeric_limits<uint32_t>::max()};
-  uint64_t last_image_timestamp_us{0};
-  uint64_t last_synced_imu_timestamp_us{0};
-  uint64_t last_imu_period_us{0};
-  uint64_t last_image_period_us{0};
-};
-
 inline uint64_t AbsDiffUs(uint64_t lhs, uint64_t rhs)
+{
+  return lhs >= rhs ? (lhs - rhs) : (rhs - lhs);
+}
+
+inline int64_t AbsDiffSigned(int64_t lhs, int64_t rhs)
 {
   return lhs >= rhs ? (lhs - rhs) : (rhs - lhs);
 }
@@ -126,61 +121,88 @@ inline uint64_t ApplyOffsetUs(uint64_t base_us, int32_t offset_us)
   return base_us > abs_offset ? (base_us - abs_offset) : 0ULL;
 }
 
-template <typename ImageEventLike>
-uint64_t ImageEventTargetTimestampUs(const ImageEventLike& image_event, int32_t offset_us)
+inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_period_us)
 {
-  return ApplyOffsetUs(image_event.sensor_timestamp_us, offset_us);
-}
-
-template <typename ImageEventLike>
-bool NeedMoreImuForImage(const ImageEventLike& image_event, bool has_imu_history,
-                         uint64_t newest_imu_timestamp_us, int32_t offset_us)
-{
-  if (!has_imu_history)
+  if (image_period_us == 0 || imu_period_us == 0)
   {
-    return true;
+    return 0;
   }
 
-  return newest_imu_timestamp_us < ImageEventTargetTimestampUs(image_event, offset_us);
+  const uint64_t half = imu_period_us / 2;
+  const uint64_t rounded = (image_period_us + half) / imu_period_us;
+  return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
 }
 
-inline uint64_t MatchToleranceUs(uint64_t last_imu_period_us)
+inline uint64_t SequenceSearchToleranceUs(uint64_t imu_rx_period_us)
 {
-  return std::max<uint64_t>(1000ULL,
-                            last_imu_period_us != 0 ? last_imu_period_us * 2 : 10000ULL);
+  return std::max<uint64_t>(3000ULL,
+                            imu_rx_period_us != 0 ? imu_rx_period_us * 4 : 12000ULL);
 }
 
-inline uint64_t CadenceToleranceUs(uint64_t last_imu_period_us)
+inline uint64_t OffsetSearchToleranceUs(uint64_t imu_sensor_period_us, uint32_t stride_samples)
 {
-  return std::max<uint64_t>(2000ULL,
-                            last_imu_period_us != 0 ? last_imu_period_us * 2 : 2000ULL);
+  const uint64_t base =
+      imu_sensor_period_us != 0 ? imu_sensor_period_us * std::max<uint32_t>(2U, stride_samples)
+                                : static_cast<uint64_t>(std::max<uint32_t>(2U, stride_samples)) *
+                                      2000ULL;
+  return std::max<uint64_t>(4000ULL, base);
 }
 
-template <typename ImageEventLike, typename ImuHistoryContainer>
-const typename ImuHistoryContainer::ValueType* FindMatchedImu(
-    const ImageEventLike& image_event, const ImuHistoryContainer& imu_history,
-    int32_t offset_us, uint64_t last_imu_period_us)
+template <typename ImuHistoryContainer>
+const typename ImuHistoryContainer::ValueType* FindBySequence(
+    const ImuHistoryContainer& imu_history, uint32_t expected_sequence,
+    uint32_t max_error_samples, uint32_t* matched_error_samples = nullptr)
 {
-  if (imu_history.Empty())
-  {
-    return nullptr;
-  }
-
-  const uint64_t target_us = ImageEventTargetTimestampUs(image_event, offset_us);
-  const uint64_t tolerance_us = MatchToleranceUs(last_imu_period_us);
-
   const typename ImuHistoryContainer::ValueType* best = nullptr;
-  uint64_t best_error = std::numeric_limits<uint64_t>::max();
+  uint32_t best_error = std::numeric_limits<uint32_t>::max();
+
   for (size_t i = imu_history.Size(); i > 0; --i)
   {
     const auto& imu = imu_history[i - 1];
-    const uint64_t error = AbsDiffUs(imu.timestamp_us, target_us);
+    const uint32_t error = imu.sensor_sequence >= expected_sequence
+                               ? (imu.sensor_sequence - expected_sequence)
+                               : (expected_sequence - imu.sensor_sequence);
     if (error < best_error)
     {
       best = &imu;
       best_error = error;
     }
-    if (imu.timestamp_us + tolerance_us < target_us)
+    if (imu.sensor_sequence + max_error_samples < expected_sequence)
+    {
+      break;
+    }
+  }
+
+  if (best == nullptr || best_error > max_error_samples)
+  {
+    return nullptr;
+  }
+
+  if (matched_error_samples != nullptr)
+  {
+    *matched_error_samples = best_error;
+  }
+  return best;
+}
+
+template <typename ImuHistoryContainer>
+const typename ImuHistoryContainer::ValueType* FindBySensorTimestamp(
+    const ImuHistoryContainer& imu_history, uint64_t expected_timestamp_us,
+    uint64_t tolerance_us)
+{
+  const typename ImuHistoryContainer::ValueType* best = nullptr;
+  uint64_t best_error = std::numeric_limits<uint64_t>::max();
+
+  for (size_t i = imu_history.Size(); i > 0; --i)
+  {
+    const auto& imu = imu_history[i - 1];
+    const uint64_t error = AbsDiffUs(imu.sensor_timestamp_us, expected_timestamp_us);
+    if (error < best_error)
+    {
+      best = &imu;
+      best_error = error;
+    }
+    if (imu.sensor_timestamp_us + tolerance_us < expected_timestamp_us)
     {
       break;
     }
@@ -189,58 +211,8 @@ const typename ImuHistoryContainer::ValueType* FindMatchedImu(
   return (best != nullptr && best_error <= tolerance_us) ? best : nullptr;
 }
 
-template <typename ImageEventLike, typename ImuLike>
-bool IsCadenceStable(const ImageEventLike& image_event, const ImuLike& imu,
-                     const SyncCadenceState& state)
+inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_frames)
 {
-  if (state.last_image_timestamp_us == 0)
-  {
-    return true;
-  }
-
-  if (image_event.sensor_timestamp_us <= state.last_image_timestamp_us ||
-      imu.timestamp_us <= state.last_synced_imu_timestamp_us)
-  {
-    return false;
-  }
-
-  const uint64_t image_dt = image_event.sensor_timestamp_us - state.last_image_timestamp_us;
-  const uint64_t imu_dt = imu.timestamp_us - state.last_synced_imu_timestamp_us;
-  const uint64_t tolerance_us = CadenceToleranceUs(state.last_imu_period_us);
-
-  if (state.last_image_period_us != 0 &&
-      AbsDiffUs(image_dt, state.last_image_period_us) > tolerance_us)
-  {
-    return false;
-  }
-  if (state.last_image_sequence != std::numeric_limits<uint32_t>::max() &&
-      image_event.image_sequence != state.last_image_sequence + 1)
-  {
-    return false;
-  }
-  if (AbsDiffUs(imu_dt, image_dt) > tolerance_us)
-  {
-    return false;
-  }
-
-  return true;
-}
-
-template <typename ImageEventLike, typename ImuLike>
-void AcceptMatch(const ImageEventLike& image_event, const ImuLike& imu,
-                 SyncCadenceState& cadence_state, SyncLockState& lock_state,
-                 uint32_t relock_confirm_frames)
-{
-  if (cadence_state.last_image_timestamp_us != 0)
-  {
-    cadence_state.last_image_period_us =
-        image_event.sensor_timestamp_us - cadence_state.last_image_timestamp_us;
-  }
-
-  cadence_state.last_image_timestamp_us = image_event.sensor_timestamp_us;
-  cadence_state.last_synced_imu_timestamp_us = imu.timestamp_us;
-  cadence_state.last_image_sequence = image_event.image_sequence;
-
   switch (lock_state.state)
   {
     case SyncState::UNSYNCED:
@@ -262,26 +234,8 @@ void AcceptMatch(const ImageEventLike& image_event, const ImuLike& imu,
 
 inline void EnterRecovering(SyncLockState& lock_state)
 {
-  if (lock_state.state != SyncState::UNSYNCED)
-  {
-    lock_state.state = SyncState::RECOVERING;
-    lock_state.lock_confirm_count = 0;
-  }
-}
-
-inline void ResetCadence(SyncCadenceState& cadence_state)
-{
-  cadence_state.last_image_sequence = std::numeric_limits<uint32_t>::max();
-  cadence_state.last_image_timestamp_us = 0;
-  cadence_state.last_synced_imu_timestamp_us = 0;
-  cadence_state.last_image_period_us = 0;
-}
-
-inline void EnterRecovering(SyncLockState& lock_state,
-                            SyncCadenceState& cadence_state)
-{
-  EnterRecovering(lock_state);
-  ResetCadence(cadence_state);
+  lock_state.state = SyncState::RECOVERING;
+  lock_state.lock_confirm_count = 0;
 }
 
 template <typename PendingGyroContainer, typename PendingAcclContainer,
@@ -291,7 +245,8 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
                       PendingAcclContainer& pending_accls,
                       PendingQuatContainer& pending_quats,
                       ImuHistoryContainer& imu_history,
-                      uint64_t& last_imu_period_us, size_t history_limit,
+                      uint64_t& last_imu_sensor_period_us,
+                      uint64_t& last_imu_rx_period_us, size_t history_limit,
                       MakeImuFn&& make_imu)
 {
   if (pending_gyros.Empty())
@@ -303,7 +258,7 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
   size_t accl_index = pending_accls.Size();
   for (size_t i = 0; i < pending_accls.Size(); ++i)
   {
-    if (pending_accls[i].sensor_timestamp_us >= gyro.sensor_timestamp_us)
+    if (pending_accls[i].sample.sensor_timestamp_us >= gyro.sample.sensor_timestamp_us)
     {
       accl_index = i;
       break;
@@ -313,7 +268,7 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
   size_t quat_index = pending_quats.Size();
   for (size_t i = 0; i < pending_quats.Size(); ++i)
   {
-    if (pending_quats[i].sensor_timestamp_us >= gyro.sensor_timestamp_us)
+    if (pending_quats[i].sample.sensor_timestamp_us >= gyro.sample.sensor_timestamp_us)
     {
       quat_index = i;
       break;
@@ -325,17 +280,26 @@ bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
     return false;
   }
 
-  if (!imu_history.Empty() && gyro.sensor_timestamp_us > imu_history.Back().timestamp_us)
+  if (!imu_history.Empty())
   {
-    last_imu_period_us = gyro.sensor_timestamp_us - imu_history.Back().timestamp_us;
+    if (gyro.sample.sensor_timestamp_us > imu_history.Back().sensor_timestamp_us)
+    {
+      last_imu_sensor_period_us =
+          gyro.sample.sensor_timestamp_us - imu_history.Back().sensor_timestamp_us;
+    }
+    if (gyro.rx_time_us > imu_history.Back().rx_time_us)
+    {
+      last_imu_rx_period_us = gyro.rx_time_us - imu_history.Back().rx_time_us;
+    }
   }
 
   if (imu_history.Size() >= history_limit)
   {
     imu_history.PopFront();
   }
-  imu_history.PushBackDropOldest(make_imu(gyro, pending_accls[accl_index],
-                                          pending_quats[quat_index]));
+  imu_history.PushBackDropOldest(
+      make_imu(gyro.sample, pending_accls[accl_index].sample, pending_quats[quat_index].sample,
+               gyro.rx_time_us));
 
   pending_gyros.PopFront();
   pending_accls.PopFrontN(accl_index + 1);

@@ -1,8 +1,10 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../camera_frame_sync_core.hpp"
@@ -14,61 +16,121 @@ using namespace CameraFrameSyncCore;
 struct TestGyro
 {
   uint64_t sensor_timestamp_us{};
+  uint32_t sensor_sequence{};
 };
 
 struct TestAccl
 {
   uint64_t sensor_timestamp_us{};
+  uint32_t sensor_sequence{};
 };
 
 struct TestQuat
 {
   uint64_t sensor_timestamp_us{};
+  uint32_t sensor_sequence{};
+};
+
+struct TimedTestGyro
+{
+  TestGyro sample{};
+  uint64_t rx_time_us{};
+};
+
+struct TimedTestAccl
+{
+  TestAccl sample{};
+  uint64_t rx_time_us{};
+};
+
+struct TimedTestQuat
+{
+  TestQuat sample{};
+  uint64_t rx_time_us{};
 };
 
 struct TestImageEvent
 {
   uint64_t sensor_timestamp_us{};
   uint32_t image_sequence{};
+  uint32_t sync_cmd_id{};
+};
+
+struct TimedTestImage
+{
+  TestImageEvent sample{};
+  uint64_t rx_time_us{};
 };
 
 struct TestImu
 {
-  uint64_t timestamp_us{};
+  uint64_t sensor_timestamp_us{};
+  uint32_t sensor_sequence{};
+  uint64_t rx_time_us{};
   uint64_t accl_timestamp_us{};
   uint64_t quat_timestamp_us{};
+};
+
+struct SyncRelation
+{
+  uint32_t stride_samples{0};
+  uint32_t last_image_sequence{std::numeric_limits<uint32_t>::max()};
+  uint32_t last_sync_imu_sequence{std::numeric_limits<uint32_t>::max()};
+  uint64_t base_image_rx_period_us{0};
+  uint64_t last_imu_sensor_period_us{0};
+  uint64_t last_imu_rx_period_us{0};
+  int64_t last_host_skew_us{0};
+};
+
+struct NormalImageReference
+{
+  bool valid{false};
+  TimedTestImage image{};
 };
 
 class SequenceHarness
 {
  public:
   template <typename T, size_t Capacity>
-  using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
+  using Ring = FixedRingBuffer<T, Capacity>;
 
   void SetOffsetUs(int32_t offset_us) { offset_us_ = offset_us; }
 
   void SetRelockConfirmFrames(uint32_t frames) { relock_confirm_frames_ = frames; }
 
-  void PushGyro(uint64_t timestamp_us) { pending_gyros_.PushBackDropOldest({timestamp_us}); }
-
-  void PushAccl(uint64_t timestamp_us) { pending_accls_.PushBackDropOldest({timestamp_us}); }
-
-  void PushQuat(uint64_t timestamp_us) { pending_quats_.PushBackDropOldest({timestamp_us}); }
-
-  void PushImage(uint64_t timestamp_us, uint32_t sequence)
+  void PushGyro(uint64_t sensor_timestamp_us, uint32_t sequence, uint64_t rx_time_us)
   {
-    pending_image_events_.PushBackDropOldest({timestamp_us, sequence});
+    pending_gyros_.PushBackDropOldest({{sensor_timestamp_us, sequence}, rx_time_us});
+  }
+
+  void PushAccl(uint64_t sensor_timestamp_us, uint32_t sequence, uint64_t rx_time_us)
+  {
+    pending_accls_.PushBackDropOldest({{sensor_timestamp_us, sequence}, rx_time_us});
+  }
+
+  void PushQuat(uint64_t sensor_timestamp_us, uint32_t sequence, uint64_t rx_time_us)
+  {
+    pending_quats_.PushBackDropOldest({{sensor_timestamp_us, sequence}, rx_time_us});
+  }
+
+  void PushImage(uint64_t sensor_timestamp_us, uint32_t image_sequence, uint64_t rx_time_us,
+                 uint32_t sync_cmd_id = 0)
+  {
+    pending_images_.PushBackDropOldest(
+        {{sensor_timestamp_us, image_sequence, sync_cmd_id}, rx_time_us});
   }
 
   void Drain()
   {
     while (TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
-        cadence_state_.last_imu_period_us, kHistoryLimit,
-        [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat)
+        relation_.last_imu_sensor_period_us, relation_.last_imu_rx_period_us, kHistoryLimit,
+        [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat, uint64_t rx_time_us)
         {
           return TestImu{
-              .timestamp_us = gyro.sensor_timestamp_us,
+              .sensor_timestamp_us = gyro.sensor_timestamp_us,
+              .sensor_sequence = gyro.sensor_sequence,
+              .rx_time_us = rx_time_us,
               .accl_timestamp_us = accl.sensor_timestamp_us,
               .quat_timestamp_us = quat.sensor_timestamp_us,
           };
@@ -76,80 +138,318 @@ class SequenceHarness
     {
     }
 
-    while (!pending_image_events_.Empty())
+    while (!pending_images_.Empty())
     {
-      const TestImageEvent image_event = pending_image_events_.Front();
-      const bool has_imu_history = !imu_history_.Empty();
-      const uint64_t newest_imu_ts =
-          has_imu_history ? imu_history_.Back().timestamp_us : 0ULL;
-      if (NeedMoreImuForImage(image_event, has_imu_history, newest_imu_ts, offset_us_))
+      const TimedTestImage image = pending_images_.Front();
+      ObserveNormalImagePeriod(image);
+
+      ImageDecision decision = ImageDecision::REJECT;
+      if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
+      {
+        decision = TryProcessLockedImage(image);
+      }
+      else if (image.sample.sync_cmd_id != 0)
+      {
+        decision = TryLockFromProbe(image);
+      }
+      else
+      {
+        pending_images_.PopFront();
+        continue;
+      }
+
+      if (decision == ImageDecision::WAIT)
       {
         break;
       }
 
-      pending_image_events_.PopFront();
-      const TestImu* imu =
-          FindMatchedImu(image_event, imu_history_, offset_us_,
-                         cadence_state_.last_imu_period_us);
-      if (imu == nullptr)
+      pending_images_.PopFront();
+      if (decision == ImageDecision::REJECT)
       {
-        no_match_timestamps_.push_back(image_event.sensor_timestamp_us);
-        EnterRecovering(lock_state_, cadence_state_);
-        continue;
+        reject_image_sequences_.push_back(image.sample.image_sequence);
+        EnterRecovering(lock_state_);
+        ResetLockedRelation();
       }
-      if (!IsCadenceStable(image_event, *imu, cadence_state_))
-      {
-        cadence_reject_timestamps_.push_back(image_event.sensor_timestamp_us);
-        EnterRecovering(lock_state_, cadence_state_);
-        continue;
-      }
-
-      published_images_.push_back(image_event.sensor_timestamp_us);
-      published_imus_.push_back(*imu);
-      AcceptMatch(image_event, *imu, cadence_state_, lock_state_,
-                  relock_confirm_frames_);
     }
   }
 
-  size_t PendingImageCount() const { return pending_image_events_.Size(); }
+  const std::vector<uint32_t>& PublishedImages() const { return published_images_; }
 
-  size_t PendingGyroCount() const { return pending_gyros_.Size(); }
-
-  size_t PendingAcclCount() const { return pending_accls_.Size(); }
-
-  size_t PendingQuatCount() const { return pending_quats_.Size(); }
-
-  const std::vector<uint64_t>& PublishedImages() const { return published_images_; }
-
-  const std::vector<TestImu>& PublishedImus() const { return published_imus_; }
-
-  const std::vector<uint64_t>& CadenceRejects() const
+  const std::vector<uint32_t>& PublishedSyncImuSequences() const
   {
-    return cadence_reject_timestamps_;
+    return published_sync_imu_sequences_;
   }
 
-  const std::vector<uint64_t>& NoMatchRejects() const { return no_match_timestamps_; }
+  const std::vector<uint64_t>& PublishedFinalImuTimestamps() const
+  {
+    return published_final_imu_timestamps_;
+  }
+
+  const std::vector<uint64_t>& PublishedAcclTimestamps() const
+  {
+    return published_accl_timestamps_;
+  }
+
+  const std::vector<uint64_t>& PublishedQuatTimestamps() const
+  {
+    return published_quat_timestamps_;
+  }
+
+  const std::vector<uint32_t>& RejectImageSequences() const { return reject_image_sequences_; }
 
   SyncState CurrentState() const { return lock_state_.state; }
 
   uint32_t LockConfirmCount() const { return lock_state_.lock_confirm_count; }
 
  private:
-  static constexpr size_t kHistoryLimit = 2048;
+  enum class ImageDecision : uint8_t
+  {
+    WAIT = 0,
+    ACCEPT = 1,
+    REJECT = 2,
+  };
 
+  static constexpr size_t kHistoryLimit = 256;
+
+  uint32_t EstimatedStrideSamples() const
+  {
+    return EstimateStrideSamples(relation_.base_image_rx_period_us, relation_.last_imu_rx_period_us);
+  }
+
+  void ResetLockedRelation()
+  {
+    relation_.stride_samples = relation_.stride_samples != 0 ? relation_.stride_samples
+                                                             : EstimatedStrideSamples();
+    relation_.last_image_sequence = std::numeric_limits<uint32_t>::max();
+    relation_.last_sync_imu_sequence = std::numeric_limits<uint32_t>::max();
+    relation_.last_host_skew_us = 0;
+  }
+
+  static uint32_t SequenceToleranceSamples(const SyncRelation& relation)
+  {
+    return std::max<uint32_t>(1U, relation.stride_samples / 4U);
+  }
+
+  static uint64_t ProbeSearchWindowUs(const SyncRelation& relation)
+  {
+    return std::max<uint64_t>(100000ULL, relation.base_image_rx_period_us * 2ULL);
+  }
+
+  void ObserveNormalImagePeriod(const TimedTestImage& image)
+  {
+    if (image.sample.sync_cmd_id != 0)
+    {
+      return;
+    }
+
+    if (last_normal_image_.valid &&
+        image.sample.image_sequence == last_normal_image_.image.sample.image_sequence + 1 &&
+        image.rx_time_us > last_normal_image_.image.rx_time_us)
+    {
+      relation_.base_image_rx_period_us = image.rx_time_us - last_normal_image_.image.rx_time_us;
+      relation_.stride_samples = EstimatedStrideSamples();
+    }
+
+    last_normal_image_.valid = true;
+    last_normal_image_.image = image;
+  }
+
+  const TestImu* FindFinalImu(const TestImu& sync_imu) const
+  {
+    const uint64_t target_timestamp_us = ApplyOffsetUs(sync_imu.sensor_timestamp_us, offset_us_);
+    return FindBySensorTimestamp(
+        imu_history_, target_timestamp_us,
+        OffsetSearchToleranceUs(relation_.last_imu_sensor_period_us, relation_.stride_samples));
+  }
+
+  bool NeedMoreImuForOffset(const TestImu& sync_imu) const
+  {
+    if (imu_history_.Empty())
+    {
+      return true;
+    }
+
+    const uint64_t target_timestamp_us = ApplyOffsetUs(sync_imu.sensor_timestamp_us, offset_us_);
+    return target_timestamp_us > imu_history_.Back().sensor_timestamp_us;
+  }
+
+  void Publish(const TimedTestImage& image, const TestImu& sync_imu, const TestImu& final_imu)
+  {
+    published_images_.push_back(image.sample.image_sequence);
+    published_sync_imu_sequences_.push_back(sync_imu.sensor_sequence);
+    published_final_imu_timestamps_.push_back(final_imu.sensor_timestamp_us);
+    published_accl_timestamps_.push_back(final_imu.accl_timestamp_us);
+    published_quat_timestamps_.push_back(final_imu.quat_timestamp_us);
+  }
+
+  ImageDecision TryLockFromProbe(const TimedTestImage& probe)
+  {
+    if (!last_normal_image_.valid ||
+        last_normal_image_.image.sample.image_sequence + 1 != probe.sample.image_sequence)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const uint32_t stride_samples =
+        relation_.stride_samples != 0 ? relation_.stride_samples : EstimatedStrideSamples();
+    if (stride_samples == 0 || imu_history_.Empty())
+    {
+      return ImageDecision::WAIT;
+    }
+
+    const uint32_t doubled_gap_samples = stride_samples * 2U;
+    if (imu_history_.Back().sensor_sequence < doubled_gap_samples)
+    {
+      return ImageDecision::WAIT;
+    }
+
+    const uint64_t search_window_us = ProbeSearchWindowUs(relation_);
+    const int64_t skew_tolerance_us =
+        static_cast<int64_t>(SequenceSearchToleranceUs(relation_.last_imu_rx_period_us));
+
+    const TestImu* best_sync_imu = nullptr;
+    int64_t best_delta_error_us = std::numeric_limits<int64_t>::max();
+    int64_t best_probe_skew_us = std::numeric_limits<int64_t>::max();
+
+    for (size_t i = imu_history_.Size(); i > 0; --i)
+    {
+      const TestImu& sync_imu = imu_history_[i - 1];
+      if (sync_imu.sensor_sequence < doubled_gap_samples)
+      {
+        break;
+      }
+      if (AbsDiffUs(sync_imu.rx_time_us, probe.rx_time_us) > search_window_us)
+      {
+        continue;
+      }
+
+      const TestImu* prev_sync_imu =
+          FindBySequence(imu_history_, sync_imu.sensor_sequence - doubled_gap_samples,
+                         SequenceToleranceSamples(relation_));
+      if (prev_sync_imu == nullptr)
+      {
+        continue;
+      }
+
+      const int64_t probe_skew_us =
+          static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
+      const int64_t prev_skew_us =
+          static_cast<int64_t>(last_normal_image_.image.rx_time_us) -
+          static_cast<int64_t>(prev_sync_imu->rx_time_us);
+      const int64_t delta_error_us = AbsDiffSigned(probe_skew_us, prev_skew_us);
+      const int64_t abs_probe_skew_us = probe_skew_us >= 0 ? probe_skew_us : -probe_skew_us;
+
+      if (delta_error_us < best_delta_error_us ||
+          (delta_error_us == best_delta_error_us && abs_probe_skew_us < best_probe_skew_us))
+      {
+        best_sync_imu = &sync_imu;
+        best_delta_error_us = delta_error_us;
+        best_probe_skew_us = abs_probe_skew_us;
+      }
+    }
+
+    if (best_sync_imu == nullptr || best_delta_error_us > skew_tolerance_us)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const TestImu* final_imu = FindFinalImu(*best_sync_imu);
+    if (final_imu == nullptr)
+    {
+      return NeedMoreImuForOffset(*best_sync_imu) ? ImageDecision::WAIT : ImageDecision::REJECT;
+    }
+
+    Publish(probe, *best_sync_imu, *final_imu);
+    relation_.stride_samples = stride_samples;
+    relation_.last_image_sequence = probe.sample.image_sequence;
+    relation_.last_sync_imu_sequence = best_sync_imu->sensor_sequence;
+    relation_.last_host_skew_us =
+        static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(best_sync_imu->rx_time_us);
+    ObserveGoodFrame(lock_state_, relock_confirm_frames_);
+    return ImageDecision::ACCEPT;
+  }
+
+  ImageDecision TryProcessLockedImage(const TimedTestImage& image)
+  {
+    if (relation_.last_image_sequence == std::numeric_limits<uint32_t>::max() ||
+        relation_.last_sync_imu_sequence == std::numeric_limits<uint32_t>::max() ||
+        relation_.stride_samples == 0)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    if (image.sample.image_sequence <= relation_.last_image_sequence)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const uint32_t image_gap = image.sample.image_sequence - relation_.last_image_sequence;
+    uint64_t expected_sequence =
+        static_cast<uint64_t>(relation_.last_sync_imu_sequence) +
+        static_cast<uint64_t>(image_gap) * static_cast<uint64_t>(relation_.stride_samples);
+    if (image.sample.sync_cmd_id != 0)
+    {
+      expected_sequence += relation_.stride_samples;
+    }
+    if (expected_sequence > std::numeric_limits<uint32_t>::max())
+    {
+      return ImageDecision::REJECT;
+    }
+
+    if (imu_history_.Empty() ||
+        imu_history_.Back().sensor_sequence + SequenceToleranceSamples(relation_) <
+            expected_sequence)
+    {
+      return ImageDecision::WAIT;
+    }
+
+    const TestImu* sync_imu = FindBySequence(imu_history_, static_cast<uint32_t>(expected_sequence),
+                                             SequenceToleranceSamples(relation_));
+    if (sync_imu == nullptr)
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const int64_t host_skew_us =
+        static_cast<int64_t>(image.rx_time_us) - static_cast<int64_t>(sync_imu->rx_time_us);
+    const int64_t host_skew_error_us = AbsDiffSigned(host_skew_us, relation_.last_host_skew_us);
+    if (host_skew_error_us >
+        static_cast<int64_t>(SequenceSearchToleranceUs(relation_.last_imu_rx_period_us)))
+    {
+      return ImageDecision::REJECT;
+    }
+
+    const TestImu* final_imu = FindFinalImu(*sync_imu);
+    if (final_imu == nullptr)
+    {
+      return NeedMoreImuForOffset(*sync_imu) ? ImageDecision::WAIT : ImageDecision::REJECT;
+    }
+
+    Publish(image, *sync_imu, *final_imu);
+    relation_.last_image_sequence = image.sample.image_sequence;
+    relation_.last_sync_imu_sequence = sync_imu->sensor_sequence;
+    relation_.last_host_skew_us = host_skew_us;
+    ObserveGoodFrame(lock_state_, relock_confirm_frames_);
+    return ImageDecision::ACCEPT;
+  }
+
+ private:
   int32_t offset_us_{0};
   uint32_t relock_confirm_frames_{3};
   SyncLockState lock_state_{};
-  SyncCadenceState cadence_state_{};
-  FixedRingBuffer<TestGyro, kHistoryLimit> pending_gyros_{};
-  FixedRingBuffer<TestAccl, kHistoryLimit> pending_accls_{};
-  FixedRingBuffer<TestQuat, kHistoryLimit> pending_quats_{};
-  FixedRingBuffer<TestImageEvent, kHistoryLimit> pending_image_events_{};
-  FixedRingBuffer<TestImu, kHistoryLimit> imu_history_{};
-  std::vector<uint64_t> published_images_{};
-  std::vector<TestImu> published_imus_{};
-  std::vector<uint64_t> cadence_reject_timestamps_{};
-  std::vector<uint64_t> no_match_timestamps_{};
+  SyncRelation relation_{};
+  NormalImageReference last_normal_image_{};
+  Ring<TimedTestGyro, kHistoryLimit> pending_gyros_{};
+  Ring<TimedTestAccl, kHistoryLimit> pending_accls_{};
+  Ring<TimedTestQuat, kHistoryLimit> pending_quats_{};
+  Ring<TimedTestImage, kHistoryLimit> pending_images_{};
+  Ring<TestImu, kHistoryLimit> imu_history_{};
+  std::vector<uint32_t> published_images_{};
+  std::vector<uint32_t> published_sync_imu_sequences_{};
+  std::vector<uint64_t> published_final_imu_timestamps_{};
+  std::vector<uint64_t> published_accl_timestamps_{};
+  std::vector<uint64_t> published_quat_timestamps_{};
+  std::vector<uint32_t> reject_image_sequences_{};
 };
 
 struct TestFailure : public std::exception
@@ -181,215 +481,127 @@ void ExpectTrue(bool cond, const std::string& label)
   }
 }
 
-std::vector<uint64_t> Range(uint64_t begin_us, uint64_t end_us, uint64_t step_us)
+void FeedImuTriplets(SequenceHarness& harness, uint32_t begin_sequence, uint32_t end_sequence,
+                     uint64_t sensor_step_us, uint64_t rx_step_us, uint64_t rx_bias_us = 0)
 {
-  std::vector<uint64_t> values;
-  for (uint64_t ts = begin_us; ts <= end_us; ts += step_us)
+  for (uint32_t seq = begin_sequence; seq <= end_sequence; ++seq)
   {
-    values.push_back(ts);
-  }
-  return values;
-}
-
-void FeedImuTriplets(SequenceHarness& harness, const std::vector<uint64_t>& timestamps)
-{
-  for (uint64_t ts : timestamps)
-  {
-    harness.PushGyro(ts);
-    harness.PushAccl(ts);
-    harness.PushQuat(ts);
+    const uint64_t sensor_timestamp_us = static_cast<uint64_t>(seq) * sensor_step_us;
+    const uint64_t rx_time_us = static_cast<uint64_t>(seq) * rx_step_us + rx_bias_us;
+    harness.PushGyro(sensor_timestamp_us, seq, rx_time_us);
+    harness.PushAccl(sensor_timestamp_us, seq, rx_time_us + 20);
+    harness.PushQuat(sensor_timestamp_us, seq, rx_time_us + 40);
     harness.Drain();
   }
 }
 
-void TestNormalTenToOne()
+void TestProbeLockAndTrack()
 {
   SequenceHarness harness;
-  uint32_t image_seq = 0;
-  for (uint64_t ts = 1000; ts <= 30000; ts += 1000)
-  {
-    harness.PushGyro(ts);
-    harness.PushAccl(ts);
-    harness.PushQuat(ts);
-    if (ts % 10000 == 0)
-    {
-      harness.PushImage(ts, image_seq++);
-    }
-    harness.Drain();
-  }
 
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000, 20000, 30000}),
-              "normal publish sequence");
-  ExpectTrue(harness.CadenceRejects().empty(), "normal case should not reject");
-  ExpectEqual(harness.PendingImageCount(), static_cast<size_t>(0), "normal pending image");
+  FeedImuTriplets(harness, 1, 24, 1000, 1000);
+  harness.PushImage(4000, 0, 4120);
+  harness.Drain();
+  harness.PushImage(8000, 1, 8120);
+  harness.Drain();
+  harness.PushImage(16000, 2, 16120, 1);
+  harness.Drain();
+  harness.PushImage(20000, 3, 20120);
+  harness.Drain();
+  harness.PushImage(24000, 4, 24120);
+  harness.Drain();
+
+  ExpectEqual(harness.PublishedImages(), std::vector<uint32_t>({2, 3, 4}),
+              "probe lock publish images");
+  ExpectEqual(harness.PublishedSyncImuSequences(), std::vector<uint32_t>({16, 20, 24}),
+              "probe lock sync imu sequences");
+  ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "probe lock final state");
 }
 
-void TestEarlyImageWaitsForImuCatchup()
+void TestPositiveOffsetUsesLaterImu()
 {
   SequenceHarness harness;
+  harness.SetOffsetUs(700);
 
-  FeedImuTriplets(harness, Range(1000, 10000, 1000));
-  harness.PushImage(10000, 0);
+  FeedImuTriplets(harness, 1, 20, 1000, 1000);
+  harness.PushImage(4000, 0, 4120);
+  harness.Drain();
+  harness.PushImage(8000, 1, 8120);
+  harness.Drain();
+  harness.PushImage(16000, 2, 16120, 7);
   harness.Drain();
 
-  FeedImuTriplets(harness, {11000, 12000});
-  harness.PushImage(20000, 1);
-  harness.Drain();
-  ExpectEqual(harness.PendingImageCount(), static_cast<size_t>(1),
-              "early image should stay pending");
-  ExpectTrue(harness.CadenceRejects().empty(), "early image should not reject early");
-
-  FeedImuTriplets(harness, Range(13000, 20000, 1000));
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000, 20000}),
-              "catch-up publish sequence");
-  ExpectEqual(harness.PendingImageCount(), static_cast<size_t>(0), "catch-up pending image");
-}
-
-void TestMissingQuatWaitsInsteadOfDropping()
-{
-  SequenceHarness harness;
-
-  FeedImuTriplets(harness, Range(1000, 10000, 1000));
-  harness.PushImage(10000, 0);
-  harness.Drain();
-
-  for (uint64_t ts = 11000; ts <= 20000; ts += 1000)
-  {
-    harness.PushGyro(ts);
-    harness.PushAccl(ts);
-    if (ts < 20000)
-    {
-      harness.PushQuat(ts);
-    }
-    harness.Drain();
-  }
-  harness.PushImage(20000, 1);
-  harness.Drain();
-
-  ExpectEqual(harness.PendingImageCount(), static_cast<size_t>(1),
-              "missing quat should keep image pending");
-  ExpectEqual(harness.PendingGyroCount(), static_cast<size_t>(1),
-              "missing quat should block matching gyro");
-  ExpectEqual(harness.PendingQuatCount(), static_cast<size_t>(0),
-              "missing quat queue should really be empty");
-
-  harness.PushQuat(20000);
-  harness.Drain();
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000, 20000}),
-              "late quat publish sequence");
+  ExpectEqual(harness.PublishedFinalImuTimestamps(), std::vector<uint64_t>({17000}),
+              "positive offset final imu");
 }
 
 void TestForwardSearchUsesLaterAcclAndQuat()
 {
   SequenceHarness harness;
 
-  harness.PushGyro(10000);
-  harness.PushAccl(9900);
-  harness.PushAccl(10100);
-  harness.PushQuat(9950);
-  harness.PushQuat(10020);
+  FeedImuTriplets(harness, 1, 15, 1000, 1000);
+  harness.PushGyro(16000, 16, 16000);
+  harness.PushAccl(15900, 16, 15900);
+  harness.PushAccl(16050, 16, 16050);
+  harness.PushQuat(15950, 16, 15950);
+  harness.PushQuat(16060, 16, 16060);
   harness.Drain();
 
-  ExpectEqual(harness.PublishedImus().size(), static_cast<size_t>(0),
-              "raw assembly test should not publish image");
-  ExpectEqual(harness.PendingGyroCount(), static_cast<size_t>(0), "gyro should assemble");
-  ExpectEqual(harness.PendingAcclCount(), static_cast<size_t>(0), "used accls should drain");
-  ExpectEqual(harness.PendingQuatCount(), static_cast<size_t>(0), "used quats should drain");
-
-  harness.PushImage(10000, 0);
+  harness.PushImage(4000, 0, 4100);
   harness.Drain();
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000}),
-              "forward search publish");
-  ExpectEqual(harness.PublishedImus().front().accl_timestamp_us, static_cast<uint64_t>(10100),
+  harness.PushImage(8000, 1, 8100);
+  harness.Drain();
+  harness.PushImage(16000, 2, 16100, 3);
+  harness.Drain();
+
+  ExpectEqual(harness.PublishedSyncImuSequences(), std::vector<uint32_t>({16}),
+              "forward search sync imu");
+  ExpectEqual(harness.PublishedAcclTimestamps(), std::vector<uint64_t>({16050}),
               "forward search accl timestamp");
-  ExpectEqual(harness.PublishedImus().front().quat_timestamp_us, static_cast<uint64_t>(10020),
+  ExpectEqual(harness.PublishedQuatTimestamps(), std::vector<uint64_t>({16060}),
               "forward search quat timestamp");
+  ExpectEqual(harness.PublishedFinalImuTimestamps(), std::vector<uint64_t>({16000}),
+              "forward search final imu");
 }
 
-void TestPositiveOffsetPicksLaterImu()
-{
-  SequenceHarness harness;
-  harness.SetOffsetUs(800);
-
-  FeedImuTriplets(harness, Range(1000, 11000, 1000));
-  harness.PushImage(10000, 0);
-  harness.Drain();
-
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000}),
-              "positive offset publish");
-  ExpectEqual(harness.PublishedImus().front().timestamp_us, static_cast<uint64_t>(11000),
-              "positive offset target imu");
-}
-
-void TestNegativeOffsetPicksEarlierImu()
-{
-  SequenceHarness harness;
-  harness.SetOffsetUs(-800);
-
-  FeedImuTriplets(harness, Range(1000, 10000, 1000));
-  harness.PushImage(10000, 0);
-  harness.Drain();
-
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000}),
-              "negative offset publish");
-  ExpectEqual(harness.PublishedImus().front().timestamp_us, static_cast<uint64_t>(9000),
-              "negative offset target imu");
-}
-
-void TestImageSequenceGapRejects()
+void TestProbeSequenceGapRejects()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, Range(1000, 10000, 1000));
-  harness.PushImage(10000, 0);
+  FeedImuTriplets(harness, 1, 20, 1000, 1000);
+  harness.PushImage(4000, 0, 4120);
+  harness.Drain();
+  harness.PushImage(8000, 1, 8120);
+  harness.Drain();
+  harness.PushImage(16000, 3, 16120, 9);
   harness.Drain();
 
-  FeedImuTriplets(harness, Range(11000, 20000, 1000));
-  harness.PushImage(20000, 2);
-  harness.Drain();
-
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000}),
-              "gap reject publish sequence");
-  ExpectEqual(harness.CadenceRejects(), std::vector<uint64_t>({20000}),
-              "gap reject timestamps");
+  ExpectEqual(harness.PublishedImages(), std::vector<uint32_t>({}),
+              "gap reject should not publish");
+  ExpectEqual(harness.RejectImageSequences(), std::vector<uint32_t>({3}),
+              "gap reject image sequence");
+  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING, "gap reject state");
 }
 
-void TestImagePeriodJumpRejects()
+void TestLockedSkewJumpRejects()
 {
   SequenceHarness harness;
 
-  FeedImuTriplets(harness, Range(1000, 20000, 1000));
-  harness.PushImage(10000, 0);
+  FeedImuTriplets(harness, 1, 24, 1000, 1000);
+  harness.PushImage(4000, 0, 4120);
   harness.Drain();
-  harness.PushImage(20000, 1);
+  harness.PushImage(8000, 1, 8120);
   harness.Drain();
-
-  FeedImuTriplets(harness, Range(21000, 36000, 1000));
-  harness.PushImage(36000, 2);
+  harness.PushImage(16000, 2, 16120, 1);
   harness.Drain();
-
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000, 20000}),
-              "period jump publish sequence");
-  ExpectEqual(harness.CadenceRejects(), std::vector<uint64_t>({36000}),
-              "period jump reject timestamps");
-}
-
-void TestDuplicateTimestampRejects()
-{
-  SequenceHarness harness;
-
-  FeedImuTriplets(harness, Range(1000, 20000, 1000));
-  harness.PushImage(10000, 0);
-  harness.Drain();
-  harness.PushImage(20000, 1);
-  harness.Drain();
-  harness.PushImage(20000, 2);
+  harness.PushImage(20000, 3, 35000);
   harness.Drain();
 
-  ExpectEqual(harness.PublishedImages(), std::vector<uint64_t>({10000, 20000}),
-              "duplicate timestamp publish sequence");
-  ExpectEqual(harness.CadenceRejects(), std::vector<uint64_t>({20000}),
-              "duplicate timestamp reject timestamps");
+  ExpectEqual(harness.PublishedImages(), std::vector<uint32_t>({2}),
+              "skew jump only probe image should publish");
+  ExpectEqual(harness.RejectImageSequences(), std::vector<uint32_t>({3}),
+              "skew jump reject sequence");
+  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING, "skew jump state");
 }
 
 void TestRecoveringNeedsThreeGoodFramesToRelock()
@@ -397,42 +609,34 @@ void TestRecoveringNeedsThreeGoodFramesToRelock()
   SequenceHarness harness;
   harness.SetRelockConfirmFrames(3);
 
-  FeedImuTriplets(harness, Range(1000, 10000, 1000));
-  harness.PushImage(10000, 0);
+  FeedImuTriplets(harness, 1, 48, 1000, 1000);
+  harness.PushImage(4000, 0, 4120);
   harness.Drain();
-  ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "first frame should start locking");
-  ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(1),
-              "first frame lock count");
-
-  FeedImuTriplets(harness, Range(11000, 20000, 1000));
-  harness.PushImage(20000, 1);
+  harness.PushImage(8000, 1, 8120);
   harness.Drain();
-  ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "second frame still locking");
-  ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(2),
-              "second frame lock count");
-
-  FeedImuTriplets(harness, Range(21000, 30000, 1000));
-  harness.PushImage(30000, 3);
+  harness.PushImage(16000, 2, 16120, 1);
   harness.Drain();
-  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING,
-              "bad frame should enter recovering");
-  ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(0),
-              "recovering should reset lock count");
+  ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "first probe should start locking");
 
-  FeedImuTriplets(harness, Range(31000, 40000, 1000));
-  harness.PushImage(40000, 4);
+  harness.PushImage(20000, 3, 35000);
   harness.Drain();
-  ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "relock frame 1");
-  ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(1), "relock count 1");
+  ExpectEqual(harness.CurrentState(), SyncState::RECOVERING, "bad frame should recover");
 
-  FeedImuTriplets(harness, Range(41000, 50000, 1000));
-  harness.PushImage(50000, 5);
+  harness.PushImage(24000, 4, 24120);
+  harness.Drain();
+  harness.PushImage(28000, 5, 28120);
+  harness.Drain();
+  harness.PushImage(36000, 6, 36120, 2);
+  harness.Drain();
+  ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "second probe lock frame 1");
+  ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(1), "second probe lock count");
+
+  harness.PushImage(40000, 7, 40120);
   harness.Drain();
   ExpectEqual(harness.CurrentState(), SyncState::LOCKING, "relock frame 2");
   ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(2), "relock count 2");
 
-  FeedImuTriplets(harness, Range(51000, 60000, 1000));
-  harness.PushImage(60000, 6);
+  harness.PushImage(44000, 8, 44120);
   harness.Drain();
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "relock frame 3 should sync");
   ExpectEqual(harness.LockConfirmCount(), static_cast<uint32_t>(3), "relock count 3");
@@ -451,15 +655,11 @@ struct NamedCase
 int main()
 {
   const NamedCase cases[] = {
-      {"正确/标准10比1", TestNormalTenToOne},
-      {"正确/图像早到后续补齐", TestEarlyImageWaitsForImuCatchup},
-      {"正确/缺quat时等待", TestMissingQuatWaitsInsteadOfDropping},
+      {"正确/探针锁定后按固定步长跟踪", TestProbeLockAndTrack},
+      {"正确/正offset在IMU域内取后继样本", TestPositiveOffsetUsesLaterImu},
       {"正确/gyro前向找后继accl与quat", TestForwardSearchUsesLaterAcclAndQuat},
-      {"正确/正offset选后继imu", TestPositiveOffsetPicksLaterImu},
-      {"正确/负offset选前驱imu", TestNegativeOffsetPicksEarlierImu},
-      {"错误/图像序列号跳变", TestImageSequenceGapRejects},
-      {"错误/图像周期突变", TestImagePeriodJumpRejects},
-      {"错误/重复时间戳", TestDuplicateTimestampRejects},
+      {"错误/探针前图像序列不连续", TestProbeSequenceGapRejects},
+      {"错误/锁定后host skew突变", TestLockedSkewJumpRejects},
       {"错误后恢复/三帧重新锁定", TestRecoveringNeedsThreeGoodFramesToRelock},
   };
 
