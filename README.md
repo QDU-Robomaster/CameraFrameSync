@@ -50,7 +50,7 @@
    - 利用“前一张普通图像 -> 当前 probe 图像”的**双周期变化**
    - 在主机侧 `rx_time` 上搜索最合理的同步 gyro 帧
    - 锁住 `image -> sync gyro frame` 的对应关系
-7. 锁定后，后续图像按 `host skew` 稳定性与 IMU 域周期一致性继续跟踪，不依赖 `seq/id`
+7. 锁定后，后续图像先按上一帧关系预测下一条同步 IMU，再用 `host skew` 与 IMU 域周期做校验
 8. 最后以该 gyro 的 `sensor_timestamp_us + offset_us` 为目标，在 IMU 历史里取最终样本
 9. 若出现超时、队列溢出、host skew 突变、图像周期异常、探针超时等情况，则进入 `RECOVERING` 并重新发探针
 

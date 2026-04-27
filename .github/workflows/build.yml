@@ -60,7 +60,7 @@ jobs:
       - name: Pull CameraBase dependency
         run: |
           git clone --depth=1 \
-            --branch feat/camerabase-raw-imu-sync-20260426 \
+            --branch feat/camerabase-seqfree-sync-20260427 \
             https://github.com/QDU-Robomaster/CameraBase \
             ./Modules/CameraBase
 

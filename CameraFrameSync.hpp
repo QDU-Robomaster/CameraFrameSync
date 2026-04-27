@@ -340,6 +340,18 @@ class CameraFrameSync
     REJECT = 2,
   };
 
+  struct SyncMatch
+  {
+    const AssembledImu* sync_imu{nullptr};
+    uint64_t next_sync_sensor_period_us{0};
+    int64_t host_skew_us{0};
+
+    bool Valid() const
+    {
+      return sync_imu != nullptr && next_sync_sensor_period_us != 0;
+    }
+  };
+
   static constexpr size_t kImuIngressLength = 1024;
   static constexpr size_t kImageEventIngressLength = 256;
   static constexpr size_t kPendingLimit = 2048;
@@ -453,6 +465,17 @@ class CameraFrameSync
     return CameraFrameSyncCore::AbsDiffUs(image_gap_rx_us,
                                           relation_.base_image_rx_period_us * 2ULL) <=
            ImageGapToleranceUs(relation_);
+  }
+
+  bool IsLockingOrSynced() const
+  {
+    return lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED;
+  }
+
+  void ClearPendingProbe()
+  {
+    probe_pending_ = false;
+    pending_probe_sent_rx_us_ = 0;
   }
 
   bool AcquireInitialWritableImage()
@@ -661,7 +684,7 @@ class CameraFrameSync
         decision = IsProbeImageGap(image_gap_rx_us) ? TryLockFromProbe(image, image_gap_rx_us, policy)
                                                     : ImageDecision::REJECT;
       }
-      else if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
+      else if (IsLockingOrSynced())
       {
         decision =
             IsNormalImageGap(image_gap_rx_us) ? TryProcessLockedImage(image, image_gap_rx_us, policy)
@@ -686,8 +709,7 @@ class CameraFrameSync
       {
         if (probe_pending)
         {
-          probe_pending_ = false;
-          pending_probe_sent_rx_us_ = 0;
+          ClearPendingProbe();
         }
         else
         {
@@ -699,8 +721,7 @@ class CameraFrameSync
 
       if (probe_pending)
       {
-        probe_pending_ = false;
-        pending_probe_sent_rx_us_ = 0;
+        ClearPendingProbe();
       }
       RememberObservedImage(image);
       EnterRecovering();
@@ -710,7 +731,7 @@ class CameraFrameSync
 
   void MaybeSendProbe(const SyncPolicy& policy)
   {
-    if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
+    if (IsLockingOrSynced())
     {
       return;
     }
@@ -728,14 +749,236 @@ class CameraFrameSync
       {
         return;
       }
-      probe_pending_ = false;
-      pending_probe_sent_rx_us_ = 0;
+      ClearPendingProbe();
     }
 
     SensorSyncCmd cmd{};
     sensor_sync_cmd_topic_.Publish(cmd);
     probe_pending_ = true;
     pending_probe_sent_rx_us_ = now_us;
+  }
+
+  static bool IsBetterTrackedMatch(uint64_t host_skew_error_us,
+                                   uint64_t best_host_skew_error_us,
+                                   uint64_t sensor_gap_error_us,
+                                   uint64_t best_sensor_gap_error_us)
+  {
+    return host_skew_error_us < best_host_skew_error_us ||
+           (host_skew_error_us == best_host_skew_error_us &&
+            sensor_gap_error_us < best_sensor_gap_error_us);
+  }
+
+  static bool IsBetterProbeMatch(uint64_t host_gap_error_us,
+                                 uint64_t best_host_gap_error_us,
+                                 uint64_t sensor_gap_error_us,
+                                 uint64_t best_sensor_gap_error_us,
+                                 int64_t abs_probe_skew_us,
+                                 int64_t best_abs_probe_skew_us)
+  {
+    return host_gap_error_us < best_host_gap_error_us ||
+           (host_gap_error_us == best_host_gap_error_us &&
+            sensor_gap_error_us < best_sensor_gap_error_us) ||
+           (host_gap_error_us == best_host_gap_error_us &&
+            sensor_gap_error_us == best_sensor_gap_error_us &&
+            abs_probe_skew_us < best_abs_probe_skew_us);
+  }
+
+  ImageDecision PublishMatchedImage(const TimedImageEvent& image,
+                                    const SyncMatch& match,
+                                    const SyncPolicy& policy)
+  {
+    // 先确定“同步帧是哪一条 IMU”，再只在 IMU 自己时间域里应用 offset 取最终样本。
+    const AssembledImu* final_imu = FindFinalImu(*match.sync_imu, policy.offset_us);
+    if (final_imu == nullptr)
+    {
+      return NeedMoreImuForOffset(*match.sync_imu, policy.offset_us) ? ImageDecision::WAIT
+                                                                     : ImageDecision::REJECT;
+    }
+
+    PublishSyncedImu(image.sample.sensor_timestamp_us, *final_imu);
+    relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
+    relation_.last_image_rx_time_us = image.rx_time_us;
+    relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
+    relation_.last_host_skew_us = match.host_skew_us;
+    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, policy.relock_confirm_frames);
+    return ImageDecision::ACCEPT;
+  }
+
+  SyncMatch BuildTrackedSyncMatch(const TimedImageEvent& image,
+                                  const AssembledImu& sync_imu,
+                                  uint64_t expected_sync_sensor_gap_us,
+                                  uint64_t sensor_gap_tolerance_us,
+                                  uint64_t host_skew_tolerance_us) const
+  {
+    if (sync_imu.sensor_timestamp_us <= relation_.last_sync_imu_sensor_timestamp_us)
+    {
+      return {};
+    }
+
+    const uint64_t sync_sensor_gap_us =
+        sync_imu.sensor_timestamp_us - relation_.last_sync_imu_sensor_timestamp_us;
+    const uint64_t sensor_gap_error_us =
+        CameraFrameSyncCore::AbsDiffUs(sync_sensor_gap_us, expected_sync_sensor_gap_us);
+    if (sensor_gap_error_us > sensor_gap_tolerance_us)
+    {
+      return {};
+    }
+
+    const int64_t host_skew_us =
+        static_cast<int64_t>(image.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
+    const uint64_t host_skew_error_us =
+        CameraFrameSyncCore::AbsDiffSigned(host_skew_us, relation_.last_host_skew_us);
+    if (host_skew_error_us > host_skew_tolerance_us)
+    {
+      return {};
+    }
+
+    return SyncMatch{
+        .sync_imu = &sync_imu,
+        .next_sync_sensor_period_us = sync_sensor_gap_us,
+        .host_skew_us = host_skew_us,
+    };
+  }
+
+  SyncMatch SelectTrackedSyncMatch(const TimedImageEvent& image,
+                                   uint64_t expected_sync_sensor_gap_us,
+                                   uint64_t sensor_gap_tolerance_us,
+                                   uint64_t host_skew_tolerance_us,
+                                   uint64_t search_window_us) const
+  {
+    const uint64_t expected_sync_sensor_timestamp_us =
+        relation_.last_sync_imu_sensor_timestamp_us + expected_sync_sensor_gap_us;
+
+    // 稳态跟踪优先走“预测下一帧在哪”，命中后可以避免每帧都扫描整段历史。
+    const AssembledImu* predicted_sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
+        imu_history_, expected_sync_sensor_timestamp_us, sensor_gap_tolerance_us);
+    if (predicted_sync_imu != nullptr)
+    {
+      const SyncMatch predicted_match = BuildTrackedSyncMatch(
+          image, *predicted_sync_imu, expected_sync_sensor_gap_us,
+          sensor_gap_tolerance_us, host_skew_tolerance_us);
+      if (predicted_match.Valid())
+      {
+        return predicted_match;
+      }
+    }
+
+    SyncMatch best_match{};
+    uint64_t best_host_skew_error_us = std::numeric_limits<uint64_t>::max();
+    uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
+
+    for (size_t i = imu_history_.Size(); i > 0; --i)
+    {
+      const AssembledImu& sync_imu = imu_history_[i - 1];
+      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, image.rx_time_us) >
+          search_window_us)
+      {
+        if (sync_imu.rx_time_us + search_window_us < image.rx_time_us)
+        {
+          break;
+        }
+        continue;
+      }
+
+      const SyncMatch match = BuildTrackedSyncMatch(
+          image, sync_imu, expected_sync_sensor_gap_us,
+          sensor_gap_tolerance_us, host_skew_tolerance_us);
+      if (!match.Valid())
+      {
+        continue;
+      }
+
+      const uint64_t host_skew_error_us =
+          CameraFrameSyncCore::AbsDiffSigned(match.host_skew_us, relation_.last_host_skew_us);
+      const uint64_t sensor_gap_error_us =
+          CameraFrameSyncCore::AbsDiffUs(match.next_sync_sensor_period_us,
+                                         expected_sync_sensor_gap_us);
+      if (IsBetterTrackedMatch(host_skew_error_us, best_host_skew_error_us,
+                               sensor_gap_error_us, best_sensor_gap_error_us))
+      {
+        best_match = match;
+        best_host_skew_error_us = host_skew_error_us;
+        best_sensor_gap_error_us = sensor_gap_error_us;
+      }
+    }
+
+    return best_match;
+  }
+
+  SyncMatch SelectProbeSyncMatch(const TimedImageEvent& probe,
+                                 uint64_t image_gap_rx_us,
+                                 uint64_t expected_probe_sensor_gap_us,
+                                 uint64_t sensor_gap_tolerance_us,
+                                 uint64_t search_window_us,
+                                 uint64_t host_gap_tolerance_us) const
+  {
+    // probe 期望看到的是 2T 图像 gap；这里在 IMU 历史里找一对满足同样双周期关系的同步帧。
+    SyncMatch best_match{};
+    uint64_t best_host_gap_error_us = std::numeric_limits<uint64_t>::max();
+    uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
+    int64_t best_abs_probe_skew_us = std::numeric_limits<int64_t>::max();
+
+    for (size_t i = imu_history_.Size(); i > 0; --i)
+    {
+      const AssembledImu& sync_imu = imu_history_[i - 1];
+      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, probe.rx_time_us) >
+          search_window_us)
+      {
+        if (sync_imu.rx_time_us + search_window_us < probe.rx_time_us)
+        {
+          break;
+        }
+        continue;
+      }
+      if (sync_imu.sensor_timestamp_us < expected_probe_sensor_gap_us)
+      {
+        continue;
+      }
+
+      const uint64_t prev_target_sensor_timestamp_us =
+          sync_imu.sensor_timestamp_us - expected_probe_sensor_gap_us;
+      const AssembledImu* prev_sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
+          imu_history_, prev_target_sensor_timestamp_us, sensor_gap_tolerance_us);
+      if (prev_sync_imu == nullptr || sync_imu.rx_time_us <= prev_sync_imu->rx_time_us)
+      {
+        continue;
+      }
+
+      const uint64_t host_gap_error_us = CameraFrameSyncCore::AbsDiffUs(
+          sync_imu.rx_time_us - prev_sync_imu->rx_time_us, image_gap_rx_us);
+      if (host_gap_error_us > host_gap_tolerance_us)
+      {
+        continue;
+      }
+
+      const uint64_t sync_sensor_gap_us =
+          sync_imu.sensor_timestamp_us - prev_sync_imu->sensor_timestamp_us;
+      const uint64_t sensor_gap_error_us =
+          CameraFrameSyncCore::AbsDiffUs(sync_sensor_gap_us, expected_probe_sensor_gap_us);
+      const int64_t probe_skew_us =
+          static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
+      const int64_t abs_probe_skew_us =
+          probe_skew_us >= 0 ? probe_skew_us : -probe_skew_us;
+
+      if (sync_sensor_gap_us < 2 ||
+          !IsBetterProbeMatch(host_gap_error_us, best_host_gap_error_us,
+                              sensor_gap_error_us, best_sensor_gap_error_us,
+                              abs_probe_skew_us, best_abs_probe_skew_us))
+      {
+        continue;
+      }
+
+      best_match = SyncMatch{
+          .sync_imu = &sync_imu,
+          .next_sync_sensor_period_us = sync_sensor_gap_us / 2ULL,
+          .host_skew_us = probe_skew_us,
+      };
+      best_host_gap_error_us = host_gap_error_us;
+      best_sensor_gap_error_us = sensor_gap_error_us;
+      best_abs_probe_skew_us = abs_probe_skew_us;
+    }
+
+    return best_match;
   }
 
   ImageDecision TryLockFromProbe(const TimedImageEvent& probe, uint64_t image_gap_rx_us,
@@ -763,93 +1006,15 @@ class CameraFrameSync
       return ImageDecision::WAIT;
     }
 
-    const AssembledImu* best_sync_imu = nullptr;
-    const AssembledImu* best_prev_sync_imu = nullptr;
-    uint64_t best_host_gap_error_us = std::numeric_limits<uint64_t>::max();
-    uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
-    int64_t best_probe_skew_us = std::numeric_limits<int64_t>::max();
-
-    for (size_t i = imu_history_.Size(); i > 0; --i)
-    {
-      const AssembledImu& sync_imu = imu_history_[i - 1];
-      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, probe.rx_time_us) >
-          search_window_us)
-      {
-        if (sync_imu.rx_time_us + search_window_us < probe.rx_time_us)
-        {
-          break;
-        }
-        continue;
-      }
-      if (sync_imu.sensor_timestamp_us < expected_probe_sensor_gap_us)
-      {
-        continue;
-      }
-
-      const uint64_t prev_target_sensor_timestamp_us =
-          sync_imu.sensor_timestamp_us - expected_probe_sensor_gap_us;
-      const AssembledImu* prev_sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
-          imu_history_, prev_target_sensor_timestamp_us, sensor_gap_tolerance_us);
-      if (prev_sync_imu == nullptr)
-      {
-        continue;
-      }
-      if (sync_imu.rx_time_us <= prev_sync_imu->rx_time_us)
-      {
-        continue;
-      }
-
-      const uint64_t host_gap_error_us = CameraFrameSyncCore::AbsDiffUs(
-          sync_imu.rx_time_us - prev_sync_imu->rx_time_us, image_gap_rx_us);
-      if (host_gap_error_us > host_gap_tolerance_us)
-      {
-        continue;
-      }
-      const uint64_t sensor_gap_error_us = CameraFrameSyncCore::AbsDiffUs(
-          sync_imu.sensor_timestamp_us - prev_sync_imu->sensor_timestamp_us,
-          expected_probe_sensor_gap_us);
-
-      const int64_t probe_skew_us =
-          static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
-      const int64_t abs_probe_skew_us =
-          probe_skew_us >= 0 ? probe_skew_us : -probe_skew_us;
-
-      if (host_gap_error_us < best_host_gap_error_us ||
-          (host_gap_error_us == best_host_gap_error_us &&
-           sensor_gap_error_us < best_sensor_gap_error_us) ||
-          (host_gap_error_us == best_host_gap_error_us &&
-           sensor_gap_error_us == best_sensor_gap_error_us &&
-           abs_probe_skew_us < best_probe_skew_us))
-      {
-        best_sync_imu = &sync_imu;
-        best_prev_sync_imu = prev_sync_imu;
-        best_host_gap_error_us = host_gap_error_us;
-        best_sensor_gap_error_us = sensor_gap_error_us;
-        best_probe_skew_us = abs_probe_skew_us;
-      }
-    }
-
-    if (best_sync_imu == nullptr || best_prev_sync_imu == nullptr)
+    const SyncMatch match = SelectProbeSyncMatch(
+        probe, image_gap_rx_us, expected_probe_sensor_gap_us,
+        sensor_gap_tolerance_us, search_window_us, host_gap_tolerance_us);
+    if (!match.Valid())
     {
       return ImageDecision::REJECT;
     }
 
-    const AssembledImu* final_imu = FindFinalImu(*best_sync_imu, policy.offset_us);
-    if (final_imu == nullptr)
-    {
-      return NeedMoreImuForOffset(*best_sync_imu, policy.offset_us) ? ImageDecision::WAIT
-                                                                    : ImageDecision::REJECT;
-    }
-
-    PublishSyncedImu(probe.sample.sensor_timestamp_us, *final_imu);
-    relation_.sync_imu_sensor_period_us =
-        (best_sync_imu->sensor_timestamp_us - best_prev_sync_imu->sensor_timestamp_us) / 2ULL;
-    relation_.last_image_rx_time_us = probe.rx_time_us;
-    relation_.last_sync_imu_sensor_timestamp_us = best_sync_imu->sensor_timestamp_us;
-    relation_.last_host_skew_us =
-        static_cast<int64_t>(probe.rx_time_us) - static_cast<int64_t>(best_sync_imu->rx_time_us);
-    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, policy.relock_confirm_frames);
-    return ImageDecision::ACCEPT;
+    return PublishMatchedImage(probe, match, policy);
   }
 
   ImageDecision TryProcessLockedImage(const TimedImageEvent& image, uint64_t image_gap_rx_us,
@@ -886,78 +1051,16 @@ class CameraFrameSync
       return ImageDecision::WAIT;
     }
 
-    const AssembledImu* best_sync_imu = nullptr;
-    uint64_t best_host_skew_error_us = std::numeric_limits<uint64_t>::max();
-    uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
-
-    for (size_t i = imu_history_.Size(); i > 0; --i)
-    {
-      const AssembledImu& sync_imu = imu_history_[i - 1];
-      if (CameraFrameSyncCore::AbsDiffUs(sync_imu.rx_time_us, image.rx_time_us) >
-          search_window_us)
-      {
-        if (sync_imu.rx_time_us + search_window_us < image.rx_time_us)
-        {
-          break;
-        }
-        continue;
-      }
-      if (sync_imu.sensor_timestamp_us <= relation_.last_sync_imu_sensor_timestamp_us)
-      {
-        continue;
-      }
-
-      const uint64_t sensor_gap_us =
-          sync_imu.sensor_timestamp_us - relation_.last_sync_imu_sensor_timestamp_us;
-      const uint64_t sensor_gap_error_us =
-          CameraFrameSyncCore::AbsDiffUs(sensor_gap_us, expected_sync_sensor_gap_us);
-      if (sensor_gap_error_us > sensor_gap_tolerance_us)
-      {
-        continue;
-      }
-
-      const int64_t host_skew_us =
-          static_cast<int64_t>(image.rx_time_us) - static_cast<int64_t>(sync_imu.rx_time_us);
-      const uint64_t host_skew_error_us =
-          CameraFrameSyncCore::AbsDiffSigned(host_skew_us, relation_.last_host_skew_us);
-      if (host_skew_error_us > host_skew_tolerance_us)
-      {
-        continue;
-      }
-
-      if (host_skew_error_us < best_host_skew_error_us ||
-          (host_skew_error_us == best_host_skew_error_us &&
-           sensor_gap_error_us < best_sensor_gap_error_us))
-      {
-        best_sync_imu = &sync_imu;
-        best_host_skew_error_us = host_skew_error_us;
-        best_sensor_gap_error_us = sensor_gap_error_us;
-      }
-    }
-
-    if (best_sync_imu == nullptr)
+    // 稳态下不再重做全局锁定，而是沿着上一帧的 host skew 和 sensor gap 继续跟踪。
+    const SyncMatch match = SelectTrackedSyncMatch(
+        image, expected_sync_sensor_gap_us, sensor_gap_tolerance_us,
+        host_skew_tolerance_us, search_window_us);
+    if (!match.Valid())
     {
       return ImageDecision::REJECT;
     }
 
-    const int64_t host_skew_us =
-        static_cast<int64_t>(image.rx_time_us) - static_cast<int64_t>(best_sync_imu->rx_time_us);
-
-    const AssembledImu* final_imu = FindFinalImu(*best_sync_imu, policy.offset_us);
-    if (final_imu == nullptr)
-    {
-      return NeedMoreImuForOffset(*best_sync_imu, policy.offset_us) ? ImageDecision::WAIT
-                                                                    : ImageDecision::REJECT;
-    }
-
-    PublishSyncedImu(image.sample.sensor_timestamp_us, *final_imu);
-    relation_.sync_imu_sensor_period_us =
-        best_sync_imu->sensor_timestamp_us - relation_.last_sync_imu_sensor_timestamp_us;
-    relation_.last_image_rx_time_us = image.rx_time_us;
-    relation_.last_sync_imu_sensor_timestamp_us = best_sync_imu->sensor_timestamp_us;
-    relation_.last_host_skew_us = host_skew_us;
-    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, policy.relock_confirm_frames);
-    return ImageDecision::ACCEPT;
+    return PublishMatchedImage(image, match, policy);
   }
 
   const AssembledImu* FindFinalImu(const AssembledImu& sync_imu, int32_t offset_us) const
@@ -1018,8 +1121,7 @@ class CameraFrameSync
     if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout || imu_timeout ||
         probe_timeout)
     {
-      probe_pending_ = false;
-      pending_probe_sent_rx_us_ = 0;
+      ClearPendingProbe();
       EnterRecovering();
     }
   }
