@@ -23,6 +23,8 @@ depends:
 // clang-format on
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <iterator>
@@ -33,6 +35,7 @@ depends:
 
 #include "CameraBase.hpp"
 #include "app_framework.hpp"
+#include "camera_frame_sync_sequence_logic.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
@@ -199,28 +202,18 @@ class CameraFrameSync
       : camera_(camera),
         image_topic_name_(camera.ImageTopicName()),
         imu_topic_name_(camera.ImuTopicName()),
-        gyro_topic_name_(std::string((camera.Name() != nullptr && camera.Name()[0] != '\0')
-                                         ? camera.Name()
-                                         : "camera") +
-                         "_gyro"),
-        accl_topic_name_(std::string((camera.Name() != nullptr && camera.Name()[0] != '\0')
-                                         ? camera.Name()
-                                         : "camera") +
-                         "_accl"),
-        quat_topic_name_(std::string((camera.Name() != nullptr && camera.Name()[0] != '\0')
-                                         ? camera.Name()
-                                         : "camera") +
-                         "_quat"),
-        image_event_topic_name_(
-            std::string((camera.Name() != nullptr && camera.Name()[0] != '\0')
-                            ? camera.Name()
-                            : "camera") +
-            "_image_event"),
-        sync_config_topic_name_(
-            std::string((camera.Name() != nullptr && camera.Name()[0] != '\0')
-                            ? camera.Name()
-                            : "camera") +
-            "_sync_config"),
+        camera_topic_base_name_([&camera]()
+                                {
+                                  const char* name = camera.Name();
+                                  return (name != nullptr && name[0] != '\0')
+                                             ? std::string(name)
+                                             : std::string("camera");
+                                }()),
+        gyro_topic_name_(camera_topic_base_name_ + "_gyro"),
+        accl_topic_name_(camera_topic_base_name_ + "_accl"),
+        quat_topic_name_(camera_topic_base_name_ + "_quat"),
+        image_event_topic_name_(camera_topic_base_name_ + "_image_event"),
+        sync_config_topic_name_(camera_topic_base_name_ + "_sync_config"),
         image_topic_(image_topic_name_, image_topic_config),
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_)),
         sync_config_topic_(LibXR::Topic::FindOrCreate<SyncConfig>(sync_config_topic_name_.c_str())),
@@ -283,13 +276,8 @@ class CameraFrameSync
   }
 
  private:
-  enum class SyncState : uint8_t
-  {
-    UNSYNCED = 0,
-    LOCKING = 1,
-    SYNCED = 2,
-    RECOVERING = 3,
-  };
+  using LockState = CameraFrameSyncSequenceLogic::LockState;
+  using CadenceState = CameraFrameSyncSequenceLogic::CadenceState;
 
   struct AssembledImu
   {
@@ -333,22 +321,6 @@ class CameraFrameSync
       config.relock_confirm_frames = 3;
     }
     return config;
-  }
-
-  static uint64_t AbsDiff(uint64_t lhs, uint64_t rhs)
-  {
-    return lhs >= rhs ? (lhs - rhs) : (rhs - lhs);
-  }
-
-  static uint64_t ApplyOffset(uint64_t base_us, int32_t offset_us)
-  {
-    if (offset_us >= 0)
-    {
-      return base_us + static_cast<uint64_t>(offset_us);
-    }
-
-    const uint64_t abs_offset = static_cast<uint64_t>(-static_cast<int64_t>(offset_us));
-    return base_us > abs_offset ? (base_us - abs_offset) : 0ULL;
   }
 
   SyncConfig SnapshotSyncConfig()
@@ -487,41 +459,20 @@ class CameraFrameSync
 
   void AssembleImuHistory()
   {
-    while (!pending_gyros_.empty())
+    while (CameraFrameSyncSequenceLogic::AssembleFrontGyro(
+        pending_gyros_, pending_accls_, pending_quats_, imu_history_,
+        cadence_state_.last_imu_period_us,
+        kHistoryLimit,
+        [](const GyroStamped& gyro, const AcclStamped& accl, const QuatStamped& quat)
+        {
+          return AssembledImu{
+              .timestamp_us = gyro.sensor_timestamp_us,
+              .rotation_wxyz = quat.rotation_wxyz,
+              .angular_velocity_xyz = gyro.angular_velocity_xyz,
+              .linear_acceleration_xyz = accl.linear_acceleration_xyz,
+          };
+        }))
     {
-      const GyroStamped& gyro = pending_gyros_.front();
-      auto accl_it = std::find_if(
-          pending_accls_.begin(), pending_accls_.end(),
-          [&](const AcclStamped& sample)
-          { return sample.sensor_timestamp_us >= gyro.sensor_timestamp_us; });
-      auto quat_it = std::find_if(
-          pending_quats_.begin(), pending_quats_.end(),
-          [&](const QuatStamped& sample)
-          { return sample.sensor_timestamp_us >= gyro.sensor_timestamp_us; });
-      if (accl_it == pending_accls_.end() || quat_it == pending_quats_.end())
-      {
-        break;
-      }
-
-      if (!imu_history_.empty() && gyro.sensor_timestamp_us > imu_history_.back().timestamp_us)
-      {
-        last_imu_period_us_ = gyro.sensor_timestamp_us - imu_history_.back().timestamp_us;
-      }
-
-      imu_history_.push_back(AssembledImu{
-          .timestamp_us = gyro.sensor_timestamp_us,
-          .rotation_wxyz = quat_it->rotation_wxyz,
-          .angular_velocity_xyz = gyro.angular_velocity_xyz,
-          .linear_acceleration_xyz = accl_it->linear_acceleration_xyz,
-      });
-      while (imu_history_.size() > kHistoryLimit)
-      {
-        imu_history_.pop_front();
-      }
-
-      pending_gyros_.pop_front();
-      pending_accls_.erase(pending_accls_.begin(), std::next(accl_it));
-      pending_quats_.erase(pending_quats_.begin(), std::next(quat_it));
     }
   }
 
@@ -530,14 +481,15 @@ class CameraFrameSync
     while (!pending_image_events_.empty())
     {
       const ImageEvent image_event = pending_image_events_.front();
-      if (NeedMoreImuFor(image_event))
+      const int32_t offset_us = SnapshotSyncConfig().offset_us;
+      if (NeedMoreImuFor(image_event, offset_us))
       {
         break;
       }
 
       pending_image_events_.pop_front();
 
-      const AssembledImu* imu = FindMatchedImu(image_event);
+      const AssembledImu* imu = FindMatchedImu(image_event, offset_us);
       if (imu == nullptr)
       {
         EnterRecovering();
@@ -554,85 +506,23 @@ class CameraFrameSync
     }
   }
 
-  bool NeedMoreImuFor(const ImageEvent& image_event) const
+  bool NeedMoreImuFor(const ImageEvent& image_event, int32_t offset_us) const
   {
-    if (imu_history_.empty())
-    {
-      return true;
-    }
-
-    return imu_history_.back().timestamp_us < TargetTimestampUs(image_event);
+    return CameraFrameSyncSequenceLogic::NeedMoreImuFor(
+        image_event, !imu_history_.empty(),
+        imu_history_.empty() ? 0ULL : imu_history_.back().timestamp_us,
+        offset_us);
   }
 
-  uint64_t TargetTimestampUs(const ImageEvent& image_event) const
+  const AssembledImu* FindMatchedImu(const ImageEvent& image_event, int32_t offset_us) const
   {
-    const SyncConfig config = const_cast<Self*>(this)->SnapshotSyncConfig();
-    return ApplyOffset(image_event.sensor_timestamp_us, config.offset_us);
-  }
-
-  const AssembledImu* FindMatchedImu(const ImageEvent& image_event) const
-  {
-    if (imu_history_.empty())
-    {
-      return nullptr;
-    }
-
-    const uint64_t target_us = TargetTimestampUs(image_event);
-    const uint64_t tolerance_us =
-        std::max<uint64_t>(1000ULL, last_imu_period_us_ != 0 ? last_imu_period_us_ * 2 : 10000ULL);
-
-    const AssembledImu* best = nullptr;
-    uint64_t best_error = std::numeric_limits<uint64_t>::max();
-    for (auto it = imu_history_.rbegin(); it != imu_history_.rend(); ++it)
-    {
-      const uint64_t error = AbsDiff(it->timestamp_us, target_us);
-      if (error < best_error)
-      {
-        best = &(*it);
-        best_error = error;
-      }
-      if (it->timestamp_us + tolerance_us < target_us)
-      {
-        break;
-      }
-    }
-
-    return (best != nullptr && best_error <= tolerance_us) ? best : nullptr;
+    return CameraFrameSyncSequenceLogic::FindMatchedImu(
+        image_event, imu_history_, offset_us, cadence_state_.last_imu_period_us);
   }
 
   bool CadenceAcceptable(const ImageEvent& image_event, const AssembledImu& imu) const
   {
-    if (last_image_timestamp_us_ == 0)
-    {
-      return true;
-    }
-
-    if (image_event.sensor_timestamp_us <= last_image_timestamp_us_ ||
-        imu.timestamp_us <= last_synced_imu_timestamp_us_)
-    {
-      return false;
-    }
-
-    const uint64_t image_dt = image_event.sensor_timestamp_us - last_image_timestamp_us_;
-    const uint64_t imu_dt = imu.timestamp_us - last_synced_imu_timestamp_us_;
-    const uint64_t image_tol =
-        std::max<uint64_t>(2000ULL, last_imu_period_us_ != 0 ? last_imu_period_us_ * 2 : 2000ULL);
-
-    if (last_image_period_us_ != 0 && AbsDiff(image_dt, last_image_period_us_) > image_tol)
-    {
-      return false;
-    }
-    if (last_image_sequence_ != std::numeric_limits<uint32_t>::max() &&
-        image_event.image_sequence != last_image_sequence_ + 1)
-    {
-      return false;
-    }
-    if (AbsDiff(imu_dt, image_dt) > image_tol)
-    {
-      return false;
-    }
-
-    return true;
+    return CameraFrameSyncSequenceLogic::CadenceAcceptable(image_event, imu, cadence_state_);
   }
 
   void PublishSyncedImu(const ImageEvent& image_event, const AssembledImu& imu)
@@ -649,58 +539,29 @@ class CameraFrameSync
 
   void OnLockSuccess(const ImageEvent& image_event, const AssembledImu& imu)
   {
-    if (last_image_timestamp_us_ != 0)
-    {
-      last_image_period_us_ = image_event.sensor_timestamp_us - last_image_timestamp_us_;
-    }
-
-    last_image_timestamp_us_ = image_event.sensor_timestamp_us;
-    last_synced_imu_timestamp_us_ = imu.timestamp_us;
-    last_image_sequence_ = image_event.image_sequence;
-
-    const SyncConfig config = SnapshotSyncConfig();
-    switch (state_)
-    {
-      case SyncState::UNSYNCED:
-      case SyncState::RECOVERING:
-        state_ = SyncState::LOCKING;
-        lock_confirm_count_ = 1;
-        break;
-      case SyncState::LOCKING:
-        lock_confirm_count_++;
-        if (lock_confirm_count_ >= config.relock_confirm_frames)
-        {
-          state_ = SyncState::SYNCED;
-        }
-        break;
-      case SyncState::SYNCED:
-        break;
-    }
+    CameraFrameSyncSequenceLogic::OnPublish(
+        image_event, imu, cadence_state_, lock_state_, SnapshotSyncConfig().relock_confirm_frames);
   }
 
   void EnterRecovering()
   {
-    if (state_ != SyncState::UNSYNCED)
-    {
-      state_ = SyncState::RECOVERING;
-      lock_confirm_count_ = 0;
-    }
+    CameraFrameSyncSequenceLogic::EnterRecovering(lock_state_, cadence_state_);
   }
 
   void HandleTimeouts()
   {
     const SyncConfig config = SnapshotSyncConfig();
     const uint32_t now_ms = LibXR::Thread::GetTime();
+    const uint32_t last_image_event_rx_ms =
+        last_image_event_rx_ms_.load(std::memory_order_relaxed);
     const uint32_t last_imu_rx_ms =
         std::max(last_gyro_rx_ms_.load(std::memory_order_relaxed),
                  std::max(last_accl_rx_ms_.load(std::memory_order_relaxed),
                           last_quat_rx_ms_.load(std::memory_order_relaxed)));
 
-    const bool image_timeout =
-        last_image_event_rx_ms_.load(std::memory_order_relaxed) != 0 &&
-        static_cast<uint32_t>(now_ms -
-                              last_image_event_rx_ms_.load(std::memory_order_relaxed)) >
-            config.image_timeout_ms;
+    const bool image_timeout = last_image_event_rx_ms != 0 &&
+                               static_cast<uint32_t>(now_ms - last_image_event_rx_ms) >
+                                   config.image_timeout_ms;
     const bool imu_timeout =
         last_imu_rx_ms != 0 &&
         static_cast<uint32_t>(now_ms - last_imu_rx_ms) > config.imu_timeout_ms;
@@ -716,6 +577,7 @@ class CameraFrameSync
   Base& camera_;
   const char* image_topic_name_;
   const char* imu_topic_name_;
+  std::string camera_topic_base_name_{};
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
   std::string quat_topic_name_{};
@@ -752,13 +614,8 @@ class CameraFrameSync
 
   LibXR::Mutex sync_config_mutex_{};
   SyncConfig sync_config_ = SanitizeSyncConfig(SyncConfig{});
-  SyncState state_{SyncState::UNSYNCED};
-  uint32_t lock_confirm_count_{0};
-  uint32_t last_image_sequence_{std::numeric_limits<uint32_t>::max()};
-  uint64_t last_image_timestamp_us_{0};
-  uint64_t last_synced_imu_timestamp_us_{0};
-  uint64_t last_imu_period_us_{0};
-  uint64_t last_image_period_us_{0};
+  LockState lock_state_{};
+  CadenceState cadence_state_{};
 
   std::atomic<uint32_t> last_gyro_rx_ms_{0};
   std::atomic<uint32_t> last_accl_rx_ms_{0};

@@ -59,7 +59,10 @@ jobs:
 
       - name: Pull CameraBase dependency
         run: |
-          git clone --depth=1 https://github.com/QDU-Robomaster/CameraBase ./Modules/CameraBase
+          git clone --depth=1 \
+            --branch feat/camerabase-raw-imu-sync-20260426 \
+            https://github.com/QDU-Robomaster/CameraBase \
+            ./Modules/CameraBase
 
       - name: Create FakeCamera module
         run: |

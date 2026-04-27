@@ -1,43 +1,69 @@
 # CameraFrameSync
 
-`CameraFrameSync` 是当前链路里负责共享图像传输和图像/IMU 同步订阅的桥接模块。
+`CameraFrameSync` 负责两件事：
 
-`CameraFrameSync<Info>` 也是 `CameraBase<Info>` 当前这套强类型图像 lease
-接口的具体实现者。
+1. 承接 `CameraBase<Info>` 的图像 lease，并把图像发布到 `LinuxSharedTopic`
+2. 订阅原始 `gyro / accl / quat / image_event`，在模块内部完成图像与 IMU 对齐，再发布同步后的 `imu`
 
-## 运行时职责
+`CameraFrameSync<Info>` 也是当前这套强类型图像 lease 接口的具体实现者。
 
-1. 从 `LinuxSharedTopic` 租一块可写 `ImageFrame` 槽位
-2. 把自己注册给 `CameraBase<Info>`，作为生产者侧图像 lease sink
-3. 当相机调用 `CommitImage()` 时，发布当前共享槽位
-4. 再租下一块可写槽位给生产者继续写
-5. 让下游订阅者等待图像和 IMU 时间戳对齐后再取出同步帧
+## 输入与输出
 
-## 输出话题
+输入：
+
+- 图像写入接口：
+  - `CameraBase<Info>::RegisterImageSink(...)`
+- 原始小话题：
+  - `<camera_name>_gyro`
+  - `<camera_name>_accl`
+  - `<camera_name>_quat`
+  - `<camera_name>_image_event`
+- 同步配置话题：
+  - `<camera_name>_sync_config`
+
+输出：
 
 - 图像共享话题：
-  - 与 `camera.ImageTopicName()` 同名
-- IMU 异步话题：
-  - 与 `camera.ImuTopicName()` 同名
+  - `camera.ImageTopicName()`
+- 同步后 IMU 话题：
+  - `camera.ImuTopicName()`
 
-## 同步载荷
+## 同步流程
 
-- `SyncedFrame.image`
-  - `CameraBase<Info>::ImageFrame` 的共享 lease
-- `SyncedFrame.imu`
-  - 拷贝后的 `CameraBase<Info>::ImuStamped`
+1. `gyro / accl / quat / image_event` 回调只负责入队
+2. 同步线程以 `image_event` 为触发点，先排空各 ingress 队列
+3. 以 `gyro` 为主时间轴，向后找最近的 `accl / quat`，组装出 IMU 历史
+4. 对每个 `image_event`，根据 `offset_us` 在 IMU 历史里找目标样本
+5. 若节拍、序号、超时或队列状态异常，则进入 `RECOVERING`
+
+这里的“原始 IMU 对齐”发生在模块内部；下游 `Subscriber` 等的是已经发布出来的同步后 `imu`。
+
+## `Subscriber` 语义
+
+`Subscriber::Wait()` 仍然是严格时间戳匹配：
+
+- 等到一帧图像
+- 再等待一条 `timestamp_us` 完全相同的同步后 `imu`
+- 只有两者对上，才返回 `SyncedFrame`
+
+也就是说，`Subscriber` 不负责“原始 IMU 重同步”；那一步已经在 `CameraFrameSync` 内部完成。
 
 ## 默认策略
 
-- `slot_num = 8`
-- `queue_num = 2`
-- 生产者路径是非阻塞的
-- 如果没有多余可写槽位，就复用当前可写槽位，并丢掉这次新帧
+- 图像共享话题：
+  - `slot_num = 8`
+  - `queue_num = 2`
+- ingress 队列长度：
+  - `imu = 1024`
+  - `image_event = 256`
+- 历史缓存长度：
+  - `pending/history = 2048`
+- 图像发布路径是非阻塞的：
+  - 如果拿不到新可写槽位，就继续复用当前槽位，并丢掉这次新图像
 
-## 模板参数
+## 模板参数与依赖
 
-- `Info`：编译期 `CameraTypes::CameraInfo`
-
-## 依赖
-
-- `qdu-future/CameraBase`
+- 模板参数：
+  - `Info`：编译期 `CameraTypes::CameraInfo`
+- 依赖：
+  - `qdu-future/CameraBase`
