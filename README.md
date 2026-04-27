@@ -77,7 +77,14 @@
 
 1. `gyro / accl / quat` 回调只负责入各自 ingress 队列
 2. `image_event` 回调作为唯一同步触发点，串行排空所有 ingress
-3. 以 `gyro` 为主时间轴，向后找第一条时间不早于它的 `accl / quat`，组装原始 IMU 历史
+3. 以 `gyro` 为主时间轴组装原始 IMU 历史
+   - 启动初期还没有稳定 raw IMU 周期时，先退回旧策略：
+     - 为 `accl / quat` 各取第一条时间不早于 `gyro` 的样本
+   - 一旦已经观察到稳定 raw IMU 周期：
+     - 在 `gyro` 的正负半个周期窗口内，为 `accl / quat` 各选离它最近的样本
+     - 如果前后样本距离完全相同，仍优先更晚样本
+   - 如果某一路已经越过半周期窗口仍找不到可配对样本：
+     - 当前 `gyro` 直接丢弃，避免整条组装链被卡死
 4. 持续观察 `gyro / accl / quat / image_event` 四路 `rx_time` 节拍
    - 任一路还没稳定，就继续停在 `OBSERVING`
    - 任一路在稳定后又失稳，就立刻清掉当前锁定关系
@@ -116,11 +123,23 @@
   - `slot_num = 8`
   - `queue_num = 2`
 - ingress 队列长度
-  - `imu = 1024`
-  - `image_event = 256`
+  - `imu_ingress_length = 128`
+  - `image_event_ingress_length = 32`
 - 历史缓存长度
-  - `pending/history = 2048`
-  - 内部使用定长 ring，满时覆盖最旧样本并触发恢复态
+  - `pending_limit = 256`
+  - `history_limit = 256`
+- `Subscriber` 内部等待队列长度
+  - `queue_length = 32`
+- 节拍稳定观察阈值
+  - `cadence_stable_gaps = 2`
+  - `raw_cadence_min_tolerance_us = 300`
+  - `image_cadence_min_tolerance_us = 1500`
+- 内部使用定长 ring / 无锁队列
+  - 满时覆盖最旧样本并置 `overflow` 标记
+  - 下一次 `image_event` 串行路径会把它当成硬故障处理：
+    - 清掉锁定关系
+    - 清掉 cadence 观察状态
+    - 回到 `OBSERVING`
 - 图像发布路径保持非阻塞
   - 如果拿不到新可写槽位，就继续复用当前槽位，并丢掉这次新图像
 
