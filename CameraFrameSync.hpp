@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 相机共享图像桥与原始 imu/image_event 同步器 / Shared image bridge and raw imu/image_event synchronizer
+module_description: 相机共享图像桥与原始 imu/image_event 同步器
 constructor_args:
   camera: @camera
 template_args:
@@ -27,7 +27,6 @@ depends:
 #include <atomic>
 #include <cstdint>
 #include <deque>
-#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -35,10 +34,9 @@ depends:
 
 #include "CameraBase.hpp"
 #include "app_framework.hpp"
-#include "camera_frame_sync_sequence_logic.hpp"
+#include "camera_frame_sync_core.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
-#include "logger.hpp"
 
 template <CameraTypes::CameraInfo CameraInfoV>
 class CameraFrameSync
@@ -199,21 +197,19 @@ class CameraFrameSync
   };
 
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
-      : camera_(camera),
-        image_topic_name_(camera.ImageTopicName()),
+      : image_topic_name_(camera.ImageTopicName()),
         imu_topic_name_(camera.ImuTopicName()),
-        camera_topic_base_name_([&camera]()
-                                {
-                                  const char* name = camera.Name();
-                                  return (name != nullptr && name[0] != '\0')
-                                             ? std::string(name)
-                                             : std::string("camera");
-                                }()),
-        gyro_topic_name_(camera_topic_base_name_ + "_gyro"),
-        accl_topic_name_(camera_topic_base_name_ + "_accl"),
-        quat_topic_name_(camera_topic_base_name_ + "_quat"),
-        image_event_topic_name_(camera_topic_base_name_ + "_image_event"),
-        sync_config_topic_name_(camera_topic_base_name_ + "_sync_config"),
+        topic_prefix_([&camera]()
+                      {
+                        const char* name = camera.Name();
+                        return (name != nullptr && name[0] != '\0') ? std::string(name)
+                                                                     : std::string("camera");
+                      }()),
+        gyro_topic_name_(topic_prefix_ + "_gyro"),
+        accl_topic_name_(topic_prefix_ + "_accl"),
+        quat_topic_name_(topic_prefix_ + "_quat"),
+        image_event_topic_name_(topic_prefix_ + "_image_event"),
+        sync_config_topic_name_(topic_prefix_ + "_sync_config"),
         image_topic_(image_topic_name_, image_topic_config),
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_)),
         sync_config_topic_(LibXR::Topic::FindOrCreate<SyncConfig>(sync_config_topic_name_.c_str())),
@@ -234,7 +230,7 @@ class CameraFrameSync
     {
       throw std::runtime_error("CameraFrameSync: initial image slot acquisition failed");
     }
-    if (!camera_.RegisterImageSink(this, current_image_.GetData(), CommitImageAdapter))
+    if (!camera.RegisterImageSink(this, current_image_.GetData(), CommitImageAdapter))
     {
       current_image_.Reset();
       throw std::runtime_error("CameraFrameSync: image sink registration failed");
@@ -244,14 +240,9 @@ class CameraFrameSync
     accl_topic_.RegisterCallback(accl_cb_);
     quat_topic_.RegisterCallback(quat_cb_);
     image_event_topic_.RegisterCallback(image_event_cb_);
-
-    running_.store(true, std::memory_order_release);
-    sync_thread_.Create(this, SyncThreadMain, "CameraFrameSync",
-                        static_cast<size_t>(1024 * 128),
-                        LibXR::Thread::Priority::REALTIME);
   }
 
-  ~CameraFrameSync() { running_.store(false, std::memory_order_release); }
+  ~CameraFrameSync() = default;
 
   const char* ImageTopicName() const { return image_topic_name_; }
 
@@ -276,8 +267,8 @@ class CameraFrameSync
   }
 
  private:
-  using LockState = CameraFrameSyncSequenceLogic::LockState;
-  using CadenceState = CameraFrameSyncSequenceLogic::CadenceState;
+  using SyncLockState = CameraFrameSyncCore::SyncLockState;
+  using SyncCadenceState = CameraFrameSyncCore::SyncCadenceState;
 
   struct AssembledImu
   {
@@ -291,7 +282,6 @@ class CameraFrameSync
   static constexpr size_t kImageEventIngressLength = 256;
   static constexpr size_t kPendingLimit = 2048;
   static constexpr size_t kHistoryLimit = 2048;
-  static constexpr uint32_t kPollMs = 2;
 
   static SyncConfig SanitizeSyncConfig(SyncConfig config)
   {
@@ -365,8 +355,8 @@ class CameraFrameSync
   static void OnGyroStatic(bool, Self* self, LibXR::RawData& data)
   {
     self->last_gyro_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
-    if (self->gyro_ingress_.Push(*reinterpret_cast<const GyroStamped*>(data.addr_)) !=
-        LibXR::ErrorCode::OK)
+    const auto& gyro = *reinterpret_cast<const GyroStamped*>(data.addr_);
+    if (self->gyro_ingress_.Push(gyro) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -375,8 +365,8 @@ class CameraFrameSync
   static void OnAcclStatic(bool, Self* self, LibXR::RawData& data)
   {
     self->last_accl_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
-    if (self->accl_ingress_.Push(*reinterpret_cast<const AcclStamped*>(data.addr_)) !=
-        LibXR::ErrorCode::OK)
+    const auto& accl = *reinterpret_cast<const AcclStamped*>(data.addr_);
+    if (self->accl_ingress_.Push(accl) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -385,8 +375,8 @@ class CameraFrameSync
   static void OnQuatStatic(bool, Self* self, LibXR::RawData& data)
   {
     self->last_quat_rx_ms_.store(LibXR::Thread::GetTime(), std::memory_order_relaxed);
-    if (self->quat_ingress_.Push(*reinterpret_cast<const QuatStamped*>(data.addr_)) !=
-        LibXR::ErrorCode::OK)
+    const auto& quat = *reinterpret_cast<const QuatStamped*>(data.addr_);
+    if (self->quat_ingress_.Push(quat) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -394,29 +384,30 @@ class CameraFrameSync
 
   static void OnImageEventStatic(bool, Self* self, LibXR::RawData& data)
   {
-    self->last_image_event_rx_ms_.store(LibXR::Thread::GetTime(),
-                                        std::memory_order_relaxed);
-    if (self->image_event_ingress_.Push(*reinterpret_cast<const ImageEvent*>(data.addr_)) !=
-        LibXR::ErrorCode::OK)
+    const uint32_t now_ms = LibXR::Thread::GetTime();
+    const uint32_t previous_image_event_rx_ms =
+        self->last_image_event_rx_ms_.exchange(now_ms, std::memory_order_relaxed);
+    const auto& image_event = *reinterpret_cast<const ImageEvent*>(data.addr_);
+    if (self->image_event_ingress_.Push(image_event) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
-      return;
     }
-    self->image_event_sem_.Post();
+    // 图像事件就是同步触发点：原始 imu 回调只入队，对齐逻辑只在这里串行执行。
+    self->ProcessPendingSyncWork(previous_image_event_rx_ms, now_ms);
   }
 
-  static void SyncThreadMain(Self* self)
+  void ProcessPendingSyncWork(uint32_t previous_image_event_rx_ms,
+                              uint32_t current_image_event_rx_ms)
   {
-    while (self->running_.load(std::memory_order_acquire))
-    {
-      (void)self->image_event_sem_.Wait(kPollMs);
-      self->DrainIngress();
-      self->ProcessImageEvents();
-      self->HandleTimeouts();
-    }
+    // 所有同步状态都只在图像事件触发路径里串行修改，不再引入额外线程。
+    LibXR::Mutex::LockGuard lock(sync_state_mutex_);
+    const SyncConfig config = SnapshotSyncConfig();
+    DrainIngressQueues();
+    HandleRecoveryTriggers(config, previous_image_event_rx_ms, current_image_event_rx_ms);
+    DrainPendingImageEvents(config);
   }
 
-  void DrainIngress()
+  void DrainIngressQueues()
   {
     GyroStamped gyro{};
     while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
@@ -452,6 +443,11 @@ class CameraFrameSync
     while (image_event_ingress_.Pop(image_event) == LibXR::ErrorCode::OK)
     {
       pending_image_events_.push_back(image_event);
+      while (pending_image_events_.size() > kPendingLimit)
+      {
+        pending_image_events_.pop_front();
+        overflowed_.store(true, std::memory_order_relaxed);
+      }
     }
 
     AssembleImuHistory();
@@ -459,7 +455,7 @@ class CameraFrameSync
 
   void AssembleImuHistory()
   {
-    while (CameraFrameSyncSequenceLogic::AssembleFrontGyro(
+    while (CameraFrameSyncCore::TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
         cadence_state_.last_imu_period_us,
         kHistoryLimit,
@@ -476,59 +472,45 @@ class CameraFrameSync
     }
   }
 
-  void ProcessImageEvents()
+  void DrainPendingImageEvents(const SyncConfig& config)
   {
     while (!pending_image_events_.empty())
     {
       const ImageEvent image_event = pending_image_events_.front();
-      const int32_t offset_us = SnapshotSyncConfig().offset_us;
-      if (NeedMoreImuFor(image_event, offset_us))
+      const bool has_imu_history = !imu_history_.empty();
+      const uint64_t newest_imu_timestamp_us =
+          has_imu_history ? imu_history_.back().timestamp_us : 0ULL;
+      if (CameraFrameSyncCore::NeedMoreImuForImage(
+              image_event, has_imu_history, newest_imu_timestamp_us, config.offset_us))
       {
         break;
       }
 
       pending_image_events_.pop_front();
 
-      const AssembledImu* imu = FindMatchedImu(image_event, offset_us);
+      const AssembledImu* imu = CameraFrameSyncCore::FindMatchedImu(
+          image_event, imu_history_, config.offset_us, cadence_state_.last_imu_period_us);
       if (imu == nullptr)
       {
-        EnterRecovering();
+        CameraFrameSyncCore::EnterRecovering(lock_state_, cadence_state_);
         continue;
       }
-      if (!CadenceAcceptable(image_event, *imu))
+      if (!CameraFrameSyncCore::IsCadenceStable(image_event, *imu, cadence_state_))
       {
-        EnterRecovering();
+        CameraFrameSyncCore::EnterRecovering(lock_state_, cadence_state_);
         continue;
       }
 
-      PublishSyncedImu(image_event, *imu);
-      OnLockSuccess(image_event, *imu);
+      PublishSyncedImu(image_event.sensor_timestamp_us, *imu);
+      CameraFrameSyncCore::AcceptMatch(
+          image_event, *imu, cadence_state_, lock_state_, config.relock_confirm_frames);
     }
   }
 
-  bool NeedMoreImuFor(const ImageEvent& image_event, int32_t offset_us) const
-  {
-    return CameraFrameSyncSequenceLogic::NeedMoreImuFor(
-        image_event, !imu_history_.empty(),
-        imu_history_.empty() ? 0ULL : imu_history_.back().timestamp_us,
-        offset_us);
-  }
-
-  const AssembledImu* FindMatchedImu(const ImageEvent& image_event, int32_t offset_us) const
-  {
-    return CameraFrameSyncSequenceLogic::FindMatchedImu(
-        image_event, imu_history_, offset_us, cadence_state_.last_imu_period_us);
-  }
-
-  bool CadenceAcceptable(const ImageEvent& image_event, const AssembledImu& imu) const
-  {
-    return CameraFrameSyncSequenceLogic::CadenceAcceptable(image_event, imu, cadence_state_);
-  }
-
-  void PublishSyncedImu(const ImageEvent& image_event, const AssembledImu& imu)
+  void PublishSyncedImu(uint64_t image_timestamp_us, const AssembledImu& imu)
   {
     ImuStamped synced{
-        .timestamp_us = image_event.sensor_timestamp_us,
+        .timestamp_us = image_timestamp_us,
         .rotation_wxyz = imu.rotation_wxyz,
         .translation_xyz = {0.0f, 0.0f, 0.0f},
         .angular_velocity_xyz = imu.angular_velocity_xyz,
@@ -537,47 +519,35 @@ class CameraFrameSync
     synced_imu_topic_.Publish(synced);
   }
 
-  void OnLockSuccess(const ImageEvent& image_event, const AssembledImu& imu)
+  void HandleRecoveryTriggers(const SyncConfig& config,
+                              uint32_t previous_image_event_rx_ms,
+                              uint32_t current_image_event_rx_ms)
   {
-    CameraFrameSyncSequenceLogic::OnPublish(
-        image_event, imu, cadence_state_, lock_state_, SnapshotSyncConfig().relock_confirm_frames);
-  }
-
-  void EnterRecovering()
-  {
-    CameraFrameSyncSequenceLogic::EnterRecovering(lock_state_, cadence_state_);
-  }
-
-  void HandleTimeouts()
-  {
-    const SyncConfig config = SnapshotSyncConfig();
-    const uint32_t now_ms = LibXR::Thread::GetTime();
-    const uint32_t last_image_event_rx_ms =
-        last_image_event_rx_ms_.load(std::memory_order_relaxed);
     const uint32_t last_imu_rx_ms =
         std::max(last_gyro_rx_ms_.load(std::memory_order_relaxed),
                  std::max(last_accl_rx_ms_.load(std::memory_order_relaxed),
                           last_quat_rx_ms_.load(std::memory_order_relaxed)));
 
-    const bool image_timeout = last_image_event_rx_ms != 0 &&
-                               static_cast<uint32_t>(now_ms - last_image_event_rx_ms) >
-                                   config.image_timeout_ms;
+    const bool image_timeout =
+        previous_image_event_rx_ms != 0 &&
+        static_cast<uint32_t>(current_image_event_rx_ms - previous_image_event_rx_ms) >
+            config.image_timeout_ms;
     const bool imu_timeout =
         last_imu_rx_ms != 0 &&
-        static_cast<uint32_t>(now_ms - last_imu_rx_ms) > config.imu_timeout_ms;
+        static_cast<uint32_t>(current_image_event_rx_ms - last_imu_rx_ms) >
+            config.imu_timeout_ms;
 
     if (overflowed_.exchange(false, std::memory_order_relaxed) || image_timeout ||
         imu_timeout)
     {
-      EnterRecovering();
+      CameraFrameSyncCore::EnterRecovering(lock_state_, cadence_state_);
     }
   }
 
  private:
-  Base& camera_;
   const char* image_topic_name_;
   const char* imu_topic_name_;
-  std::string camera_topic_base_name_{};
+  std::string topic_prefix_{};
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
   std::string quat_topic_name_{};
@@ -597,28 +567,28 @@ class CameraFrameSync
   LibXR::Topic::Callback quat_cb_{};
   LibXR::Topic::Callback image_event_cb_{};
 
+  // 话题回调只负责把原始样本塞进各自的 ingress。
   LibXR::LockFreeQueue<GyroStamped> gyro_ingress_{kImuIngressLength};
   LibXR::LockFreeQueue<AcclStamped> accl_ingress_{kImuIngressLength};
   LibXR::LockFreeQueue<QuatStamped> quat_ingress_{kImuIngressLength};
   LibXR::LockFreeQueue<ImageEvent> image_event_ingress_{kImageEventIngressLength};
-  LibXR::Semaphore image_event_sem_{0};
-  std::atomic<bool> running_{false};
   std::atomic<bool> overflowed_{false};
-  LibXR::Thread sync_thread_{};
 
+  // 下面这些状态只在 image_event 触发的串行路径里访问。
   std::deque<GyroStamped> pending_gyros_{};
   std::deque<AcclStamped> pending_accls_{};
   std::deque<QuatStamped> pending_quats_{};
   std::deque<ImageEvent> pending_image_events_{};
   std::deque<AssembledImu> imu_history_{};
+  LibXR::Mutex sync_state_mutex_{};
 
   LibXR::Mutex sync_config_mutex_{};
   SyncConfig sync_config_ = SanitizeSyncConfig(SyncConfig{});
-  LockState lock_state_{};
-  CadenceState cadence_state_{};
+  SyncLockState lock_state_{};
+  SyncCadenceState cadence_state_{};
 
+  std::atomic<uint32_t> last_image_event_rx_ms_{0};
   std::atomic<uint32_t> last_gyro_rx_ms_{0};
   std::atomic<uint32_t> last_accl_rx_ms_{0};
   std::atomic<uint32_t> last_quat_rx_ms_{0};
-  std::atomic<uint32_t> last_image_event_rx_ms_{0};
 };

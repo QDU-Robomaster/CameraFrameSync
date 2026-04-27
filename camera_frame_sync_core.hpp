@@ -5,12 +5,11 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
-#include <utility>
 
-namespace CameraFrameSyncSequenceLogic
+namespace CameraFrameSyncCore
 {
-
-// 这部分只保留“按时间序列同步”的纯逻辑，方便生产代码和独立序列测试共用。
+// 这里只保留“按时间序列对齐图像和 IMU”相关的纯逻辑。
+// 生产代码和独立序列测试共用这一份，避免两边各写一套。
 
 enum class SyncState : uint8_t
 {
@@ -20,13 +19,13 @@ enum class SyncState : uint8_t
   RECOVERING = 3,
 };
 
-struct LockState
+struct SyncLockState
 {
   SyncState state{SyncState::UNSYNCED};
   uint32_t lock_confirm_count{0};
 };
 
-struct CadenceState
+struct SyncCadenceState
 {
   uint32_t last_image_sequence{std::numeric_limits<uint32_t>::max()};
   uint64_t last_image_timestamp_us{0};
@@ -35,12 +34,12 @@ struct CadenceState
   uint64_t last_image_period_us{0};
 };
 
-inline uint64_t AbsDiff(uint64_t lhs, uint64_t rhs)
+inline uint64_t AbsDiffUs(uint64_t lhs, uint64_t rhs)
 {
   return lhs >= rhs ? (lhs - rhs) : (rhs - lhs);
 }
 
-inline uint64_t ApplyOffset(uint64_t base_us, int32_t offset_us)
+inline uint64_t ApplyOffsetUs(uint64_t base_us, int32_t offset_us)
 {
   if (offset_us >= 0)
   {
@@ -52,21 +51,21 @@ inline uint64_t ApplyOffset(uint64_t base_us, int32_t offset_us)
 }
 
 template <typename ImageEventLike>
-uint64_t TargetTimestampUs(const ImageEventLike& image_event, int32_t offset_us)
+uint64_t ImageEventTargetTimestampUs(const ImageEventLike& image_event, int32_t offset_us)
 {
-  return ApplyOffset(image_event.sensor_timestamp_us, offset_us);
+  return ApplyOffsetUs(image_event.sensor_timestamp_us, offset_us);
 }
 
 template <typename ImageEventLike>
-bool NeedMoreImuFor(const ImageEventLike& image_event, bool has_imu_history,
-                    uint64_t newest_imu_timestamp_us, int32_t offset_us)
+bool NeedMoreImuForImage(const ImageEventLike& image_event, bool has_imu_history,
+                         uint64_t newest_imu_timestamp_us, int32_t offset_us)
 {
   if (!has_imu_history)
   {
     return true;
   }
 
-  return newest_imu_timestamp_us < TargetTimestampUs(image_event, offset_us);
+  return newest_imu_timestamp_us < ImageEventTargetTimestampUs(image_event, offset_us);
 }
 
 inline uint64_t MatchToleranceUs(uint64_t last_imu_period_us)
@@ -91,14 +90,14 @@ const typename ImuHistoryContainer::value_type* FindMatchedImu(
     return nullptr;
   }
 
-  const uint64_t target_us = TargetTimestampUs(image_event, offset_us);
+  const uint64_t target_us = ImageEventTargetTimestampUs(image_event, offset_us);
   const uint64_t tolerance_us = MatchToleranceUs(last_imu_period_us);
 
   const typename ImuHistoryContainer::value_type* best = nullptr;
   uint64_t best_error = std::numeric_limits<uint64_t>::max();
   for (auto it = imu_history.rbegin(); it != imu_history.rend(); ++it)
   {
-    const uint64_t error = AbsDiff(it->timestamp_us, target_us);
+    const uint64_t error = AbsDiffUs(it->timestamp_us, target_us);
     if (error < best_error)
     {
       best = &(*it);
@@ -114,8 +113,8 @@ const typename ImuHistoryContainer::value_type* FindMatchedImu(
 }
 
 template <typename ImageEventLike, typename ImuLike>
-bool CadenceAcceptable(const ImageEventLike& image_event, const ImuLike& imu,
-                       const CadenceState& state)
+bool IsCadenceStable(const ImageEventLike& image_event, const ImuLike& imu,
+                     const SyncCadenceState& state)
 {
   if (state.last_image_timestamp_us == 0)
   {
@@ -133,7 +132,7 @@ bool CadenceAcceptable(const ImageEventLike& image_event, const ImuLike& imu,
   const uint64_t tolerance_us = CadenceToleranceUs(state.last_imu_period_us);
 
   if (state.last_image_period_us != 0 &&
-      AbsDiff(image_dt, state.last_image_period_us) > tolerance_us)
+      AbsDiffUs(image_dt, state.last_image_period_us) > tolerance_us)
   {
     return false;
   }
@@ -142,7 +141,7 @@ bool CadenceAcceptable(const ImageEventLike& image_event, const ImuLike& imu,
   {
     return false;
   }
-  if (AbsDiff(imu_dt, image_dt) > tolerance_us)
+  if (AbsDiffUs(imu_dt, image_dt) > tolerance_us)
   {
     return false;
   }
@@ -151,9 +150,9 @@ bool CadenceAcceptable(const ImageEventLike& image_event, const ImuLike& imu,
 }
 
 template <typename ImageEventLike, typename ImuLike>
-void OnPublish(const ImageEventLike& image_event, const ImuLike& imu,
-               CadenceState& cadence_state, LockState& lock_state,
-               uint32_t relock_confirm_frames)
+void AcceptMatch(const ImageEventLike& image_event, const ImuLike& imu,
+                 SyncCadenceState& cadence_state, SyncLockState& lock_state,
+                 uint32_t relock_confirm_frames)
 {
   if (cadence_state.last_image_timestamp_us != 0)
   {
@@ -184,7 +183,7 @@ void OnPublish(const ImageEventLike& image_event, const ImuLike& imu,
   }
 }
 
-inline void EnterRecovering(LockState& lock_state)
+inline void EnterRecovering(SyncLockState& lock_state)
 {
   if (lock_state.state != SyncState::UNSYNCED)
   {
@@ -193,29 +192,30 @@ inline void EnterRecovering(LockState& lock_state)
   }
 }
 
-inline void ResetCadenceBaseline(CadenceState& cadence_state)
+inline void ResetCadence(SyncCadenceState& cadence_state)
 {
   cadence_state.last_image_sequence = std::numeric_limits<uint32_t>::max();
   cadence_state.last_image_timestamp_us = 0;
   cadence_state.last_synced_imu_timestamp_us = 0;
-  // 保留最近 imu 周期，恢复后仍可沿用当前原始 imu 节拍估计容差。
   cadence_state.last_image_period_us = 0;
 }
 
-inline void EnterRecovering(LockState& lock_state, CadenceState& cadence_state)
+inline void EnterRecovering(SyncLockState& lock_state,
+                            SyncCadenceState& cadence_state)
 {
   EnterRecovering(lock_state);
-  ResetCadenceBaseline(cadence_state);
+  ResetCadence(cadence_state);
 }
 
 template <typename PendingGyroContainer, typename PendingAcclContainer,
           typename PendingQuatContainer, typename ImuHistoryContainer,
           typename MakeImuFn>
-bool AssembleFrontGyro(PendingGyroContainer& pending_gyros,
-                       PendingAcclContainer& pending_accls,
-                       PendingQuatContainer& pending_quats,
-                       ImuHistoryContainer& imu_history, uint64_t& last_imu_period_us,
-                       size_t history_limit, MakeImuFn&& make_imu)
+bool TryBuildFrontImu(PendingGyroContainer& pending_gyros,
+                      PendingAcclContainer& pending_accls,
+                      PendingQuatContainer& pending_quats,
+                      ImuHistoryContainer& imu_history,
+                      uint64_t& last_imu_period_us, size_t history_limit,
+                      MakeImuFn&& make_imu)
 {
   if (pending_gyros.empty())
   {
@@ -253,4 +253,4 @@ bool AssembleFrontGyro(PendingGyroContainer& pending_gyros,
   return true;
 }
 
-}  // namespace CameraFrameSyncSequenceLogic
+}  // namespace CameraFrameSyncCore

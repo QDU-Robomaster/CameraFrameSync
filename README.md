@@ -30,11 +30,11 @@
 
 ## 同步流程
 
-1. `gyro / accl / quat / image_event` 回调只负责入队
-2. 同步线程以 `image_event` 为触发点，先排空各 ingress 队列
+1. `gyro / accl / quat` 回调只负责入队
+2. `image_event` 回调作为同步触发点，串行排空各 ingress 队列
 3. 以 `gyro` 为主时间轴，向后找最近的 `accl / quat`，组装出 IMU 历史
 4. 对每个 `image_event`，根据 `offset_us` 在 IMU 历史里找目标样本
-5. 若节拍、序号、超时或队列状态异常，则进入 `RECOVERING`
+5. 若节拍、序号、图像事件间隔超时、IMU 到达超时或队列状态异常，则进入 `RECOVERING`
 
 这里的“原始 IMU 对齐”发生在模块内部；下游 `Subscriber` 等的是已经发布出来的同步后 `imu`。
 

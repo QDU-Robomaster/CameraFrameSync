@@ -2,17 +2,15 @@
 #include <deque>
 #include <exception>
 #include <iostream>
-#include <limits>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "../camera_frame_sync_sequence_logic.hpp"
+#include "../camera_frame_sync_core.hpp"
 
 namespace
 {
-using namespace CameraFrameSyncSequenceLogic;
+using namespace CameraFrameSyncCore;
 
 struct TestGyro
 {
@@ -62,7 +60,7 @@ class SequenceHarness
 
   void Drain()
   {
-    while (AssembleFrontGyro(
+    while (TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
         cadence_state_.last_imu_period_us, kHistoryLimit,
         [](const TestGyro& gyro, const TestAccl& accl, const TestQuat& quat)
@@ -82,21 +80,22 @@ class SequenceHarness
       const bool has_imu_history = !imu_history_.empty();
       const uint64_t newest_imu_ts =
           has_imu_history ? imu_history_.back().timestamp_us : 0ULL;
-      if (NeedMoreImuFor(image_event, has_imu_history, newest_imu_ts, offset_us_))
+      if (NeedMoreImuForImage(image_event, has_imu_history, newest_imu_ts, offset_us_))
       {
         break;
       }
 
       pending_image_events_.pop_front();
       const TestImu* imu =
-          FindMatchedImu(image_event, imu_history_, offset_us_, cadence_state_.last_imu_period_us);
+          FindMatchedImu(image_event, imu_history_, offset_us_,
+                         cadence_state_.last_imu_period_us);
       if (imu == nullptr)
       {
         no_match_timestamps_.push_back(image_event.sensor_timestamp_us);
         EnterRecovering(lock_state_, cadence_state_);
         continue;
       }
-      if (!CadenceAcceptable(image_event, *imu, cadence_state_))
+      if (!IsCadenceStable(image_event, *imu, cadence_state_))
       {
         cadence_reject_timestamps_.push_back(image_event.sensor_timestamp_us);
         EnterRecovering(lock_state_, cadence_state_);
@@ -105,7 +104,8 @@ class SequenceHarness
 
       published_images_.push_back(image_event.sensor_timestamp_us);
       published_imus_.push_back(*imu);
-      OnPublish(image_event, *imu, cadence_state_, lock_state_, relock_confirm_frames_);
+      AcceptMatch(image_event, *imu, cadence_state_, lock_state_,
+                  relock_confirm_frames_);
     }
   }
 
@@ -137,8 +137,8 @@ class SequenceHarness
 
   int32_t offset_us_{0};
   uint32_t relock_confirm_frames_{3};
-  LockState lock_state_{};
-  CadenceState cadence_state_{};
+  SyncLockState lock_state_{};
+  SyncCadenceState cadence_state_{};
   std::deque<TestGyro> pending_gyros_{};
   std::deque<TestAccl> pending_accls_{};
   std::deque<TestQuat> pending_quats_{};
