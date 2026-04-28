@@ -64,6 +64,12 @@ class CameraFrameSync
       .queue_num = 2,
   };
 
+  enum class SyncMode : uint8_t
+  {
+    RAW_PROBE = 0,  // 通过 sensor_sync_cmd 和节拍变化做显式重同步
+    LATEST_IMU = 1,  // 认为图像与 IMU 已大致同步，图像直接取当前最新 IMU
+  };
+
   struct SyncedFrame
   {
     ImageData image{};
@@ -255,6 +261,28 @@ class CameraFrameSync
     offset_us_.store(offset_us, std::memory_order_relaxed);
   }
 
+  SyncMode GetSyncMode() const
+  {
+    return sync_mode_.load(std::memory_order_relaxed);
+  }
+
+  void SetSyncMode(SyncMode mode)
+  {
+    if (GetSyncMode() == mode)
+    {
+      return;
+    }
+
+    LibXR::Mutex::LockGuard lock(sync_state_mutex_);
+    if (GetSyncMode() == mode)
+    {
+      return;
+    }
+
+    sync_mode_.store(mode, std::memory_order_relaxed);
+    ResetRuntimeState();
+  }
+
  private:
   using SyncLockState = CameraFrameSyncCore::SyncLockState;
   using SyncState = CameraFrameSyncCore::SyncState;
@@ -386,6 +414,28 @@ class CameraFrameSync
     ClearPendingProbe();
     ResetLockedRelation();
     ResetImageObservation();
+    SetObservingState();
+  }
+
+  void ResetRuntimeState()
+  {
+    gyro_ingress_.Reset();
+    accl_ingress_.Reset();
+    quat_ingress_.Reset();
+    image_event_ingress_.Reset();
+
+    pending_gyros_ = {};
+    pending_accls_ = {};
+    pending_quats_ = {};
+    pending_image_events_ = {};
+    imu_history_ = {};
+    relation_ = {};
+
+    overflowed_.store(false, std::memory_order_relaxed);
+    ClearPendingImage();
+    ClearPendingProbe();
+    ResetLockedRelation();
+    ResetCadenceObservation();
     SetObservingState();
   }
 
@@ -672,6 +722,35 @@ class CameraFrameSync
       }
 
       PendingImageState& image = pending_image_;
+      if (GetSyncMode() == SyncMode::LATEST_IMU)
+      {
+        // 兼容旧模式：不做 probe 锁定，直接把当前看到的最新 IMU 绑定给这张图像。
+        const uint64_t image_timestamp_us =
+            static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+        if (last_observed_image_.valid &&
+            image_timestamp_us <=
+                static_cast<uint64_t>(last_observed_image_.sample.sensor_timestamp_us))
+        {
+          ClearPendingImage();
+          ResetLockedRelation();
+          ResetImageObservation();
+          SetObservingState();
+          continue;
+        }
+
+        const ImageDecision decision = image.sync_candidate_valid
+                                           ? ResumePendingMatch(image)
+                                           : TryProcessLatestImuImage(image);
+        if (decision == ImageDecision::WAIT)
+        {
+          break;
+        }
+
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
+        continue;
+      }
+
       auto cadence_update = CameraFrameSyncCore::CadenceUpdate::NO_GAP;
       if (!image.cadence_observed)
       {
@@ -766,6 +845,11 @@ class CameraFrameSync
 
   void MaybeSendProbe()
   {
+    if (GetSyncMode() != SyncMode::RAW_PROBE)
+    {
+      return;
+    }
+
     if (IsSynced())
     {
       return;
@@ -785,6 +869,22 @@ class CameraFrameSync
     // 下位机只需要做一次 2T 探针，观察到节拍变化后就会自动恢复正常频率。
     sensor_sync_cmd_topic_.Publish(cmd);
     probe_pending_ = true;
+  }
+
+  ImageDecision TryProcessLatestImuImage(PendingImageState& image)
+  {
+    if (imu_history_.Empty())
+    {
+      return ImageDecision::WAIT;
+    }
+
+    const uint64_t sync_imu_period_us =
+        relation_.last_imu_sensor_period_us != 0 ? relation_.last_imu_sensor_period_us : 1ULL;
+    return PublishOrRememberMatch(
+        image, SyncMatch{
+                   .sync_imu = &imu_history_.Back(),
+                   .next_sync_sensor_period_us = sync_imu_period_us,
+               });
   }
 
   bool ImuHistoryReached(uint64_t target_timestamp_us) const
@@ -1110,6 +1210,7 @@ class CameraFrameSync
   LibXR::Mutex sync_state_mutex_{};
 
   std::atomic<int32_t> offset_us_{0};
+  std::atomic<SyncMode> sync_mode_{SyncMode::RAW_PROBE};
   SyncLockState lock_state_{};
   CadenceObservation cadence_{};
   SyncRelation relation_{};

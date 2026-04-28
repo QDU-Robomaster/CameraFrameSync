@@ -5,6 +5,16 @@
 1. 承接 `CameraBase<Info>` 的图像 lease，并把图像发布到 `LinuxSharedTopic`
 2. 订阅原始 `gyro / accl / quat / image_event`，在模块内部完成图像与 IMU 对齐，再发布同步后的 `imu`
 
+当前支持两种同步模式：
+
+- `RAW_PROBE`
+  - 当前默认模式
+  - 通过原始传感器节拍和一次性 `sensor_sync_cmd` 探针锁定图像与 IMU
+- `LATEST_IMU`
+  - 兼容之前“默认认为图像与 IMU 已同步”的用法
+  - 每张图像直接取当前最新的原始 IMU 作为同步 IMU
+  - 仍然会在 IMU 自己时间域里应用 `offset_us`
+
 ## 输入与输出
 
 输入：
@@ -31,11 +41,22 @@
 - `sensor_sync_cmd` 是固定名字，不跟随相机名变化
 - 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
+- 可通过 `SetSyncMode(...)` 在 `RAW_PROBE / LATEST_IMU` 之间切换
 - 运行时只保留一个调节点：
   - `offset_us`
   - 它表示在 IMU 自己的 `sensor_timestamp_us` 时间域里，对最终取样位置做常量平移
 
 ## 当前同步策略
+
+先说模式边界：
+
+- `RAW_PROBE`
+  - 使用下面整套 cadence / probe / 重锁逻辑
+- `LATEST_IMU`
+  - 不发 `sensor_sync_cmd`
+  - 不要求图像 cadence 锁定
+  - 每次处理图像时直接取当前 `imu_history` 里的最新 IMU
+  - 如果 `offset_us` 指向的最终 IMU 还没到，就把当前图像留在唯一的待处理槽位里等待
 
 这版实现只使用**传感器侧时间戳**：
 
@@ -84,6 +105,8 @@
 
 ## 图像侧状态机
 
+这一节主要描述 `RAW_PROBE` 模式。
+
 状态只有两种，再加一个 `probe_pending` 标记：
 
 - `OBSERVING`
@@ -103,6 +126,8 @@
 
 ## 锁定流程
 
+这一节只适用于 `RAW_PROBE`。
+
 1. 持续观察节拍
    - `image_event` cadence 稳定后记录正常图像基线周期 `T`
    - 原始 IMU 历史形成稳定周期后记录 `t`
@@ -120,6 +145,8 @@
 9. 后续普通图像进入稳态跟踪
 
 ## 稳态跟踪
+
+这一节只适用于 `RAW_PROBE`。
 
 锁定后不再全局扫描，而是沿着上一帧关系递推：
 
@@ -143,6 +170,17 @@
 - 同步后 `imu.timestamp_us` 也使用这张图像的传感器侧时间戳
 
 ## 等待、拒绝与恢复
+
+`LATEST_IMU` 模式下不会走 probe 锁定，也不会按 `T / 2T` 图像 gap 做接受判定。
+它只保留两类行为：
+
+- `WAIT`
+  - 当前图像选中的“最新 IMU”还缺少 `offset_us` 对应的最终样本
+- `DROP`
+  - 图像时间戳回退/乱序
+  - 或者已经覆盖 `offset_us` 目标，但仍找不到合法最终 IMU
+
+`RAW_PROBE` 模式则继续使用下面这套完整重锁语义：
 
 这版实现不再用主机到达时间做 timeout，而是全都按**序列语义**处理：
 

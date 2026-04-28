@@ -64,6 +64,12 @@ struct TestImu
   uint64_t quat_timestamp_us{};
 };
 
+enum class SyncMode : uint8_t
+{
+  RAW_PROBE = 0,
+  LATEST_IMU = 1,
+};
+
 class SequenceHarness
 {
  public:
@@ -71,6 +77,17 @@ class SequenceHarness
   using Ring = FixedRingBuffer<T, Capacity>;
 
   void SetOffsetUs(int32_t offset_us) { offset_us_ = offset_us; }
+
+  void SetSyncMode(SyncMode mode)
+  {
+    if (sync_mode_ == mode)
+    {
+      return;
+    }
+
+    sync_mode_ = mode;
+    ResetRuntimeState();
+  }
 
   void PushGyro(uint64_t sensor_timestamp_us)
   {
@@ -236,6 +253,26 @@ class SequenceHarness
     SetObservingState();
   }
 
+  void ResetRuntimeState()
+  {
+    gyro_ingress_ = {};
+    accl_ingress_ = {};
+    quat_ingress_ = {};
+    image_ingress_ = {};
+    pending_gyros_ = {};
+    pending_accls_ = {};
+    pending_quats_ = {};
+    pending_images_ = {};
+    imu_history_ = {};
+    relation_ = {};
+    overflowed_ = false;
+    ClearPendingImage();
+    ClearPendingProbe();
+    ResetLockedRelation();
+    ResetCadenceObservation();
+    SetObservingState();
+  }
+
   bool CadenceReady() const
   {
     return cadence_.gyro.stable && cadence_.image.stable;
@@ -364,6 +401,11 @@ class SequenceHarness
 
   void MaybeSendProbe()
   {
+    if (sync_mode_ != SyncMode::RAW_PROBE)
+    {
+      return;
+    }
+
     if (IsSynced())
     {
       return;
@@ -377,6 +419,22 @@ class SequenceHarness
 
     probe_pending_ = true;
     probe_sent_count_++;
+  }
+
+  ImageDecision TryProcessLatestImuImage(PendingImageState& image)
+  {
+    if (imu_history_.Empty())
+    {
+      return ImageDecision::WAIT;
+    }
+
+    const uint64_t sync_imu_period_us =
+        relation_.last_imu_sensor_period_us != 0 ? relation_.last_imu_sensor_period_us : 1ULL;
+    return PublishOrRememberMatch(
+        image, SyncMatch{
+                   .sync_imu = &imu_history_.Back(),
+                   .next_sync_sensor_period_us = sync_imu_period_us,
+               });
   }
 
   void DrainIngressQueues()
@@ -478,6 +536,32 @@ class SequenceHarness
       }
 
       PendingImageState& image = pending_image_;
+      if (sync_mode_ == SyncMode::LATEST_IMU)
+      {
+        const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
+        if (last_observed_image_.valid &&
+            image_timestamp_us <= last_observed_image_.sample.sensor_timestamp_us)
+        {
+          ClearPendingImage();
+          ResetLockedRelation();
+          ResetImageObservation();
+          SetObservingState();
+          continue;
+        }
+
+        const ImageDecision decision = image.sync_candidate_valid
+                                           ? ResumePendingMatch(image)
+                                           : TryProcessLatestImuImage(image);
+        if (decision == ImageDecision::WAIT)
+        {
+          break;
+        }
+
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
+        continue;
+      }
+
       auto cadence_update = CadenceUpdate::NO_GAP;
       if (!image.cadence_observed)
       {
@@ -820,6 +904,7 @@ class SequenceHarness
   Ring<TestImu, queue_limit> imu_history_{};
 
   int32_t offset_us_{0};
+  SyncMode sync_mode_{SyncMode::RAW_PROBE};
   bool overflowed_{false};
   bool probe_pending_{false};
   uint32_t probe_sent_count_{0};
@@ -1080,6 +1165,47 @@ void TestStableLockAndTrack()
                     "零 offset 时最终 imu 应等于同步 imu");
 }
 
+void TestLatestImuModePublishesWithoutProbe()
+{
+  SequenceHarness harness;
+  harness.SetSyncMode(SyncMode::LATEST_IMU);
+  StreamDriver driver(harness);
+
+  driver.EmitNextImage(1);
+  driver.EmitNextImage(1);
+  driver.EmitNextImage(1);
+
+  ExpectEqual(harness.ProbeSentCount(), 0U, "latest-imu 模式不应发送 probe");
+  ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "latest-imu 模式发布后应视作已同步");
+  ExpectVectorEqual(harness.PublishedImageTags(), std::vector<uint32_t>({1, 2, 3}),
+                    "latest-imu 模式应从第一张图开始直接发布");
+  ExpectVectorEqual(harness.PublishedSyncImuTimestamps(),
+                    std::vector<uint64_t>({12000ULL, 22000ULL, 32000ULL}),
+                    "latest-imu 模式应直接取图像触发时刻最新的 imu");
+}
+
+void TestLatestImuModeWaitsForOffsetTargetImu()
+{
+  SequenceHarness harness;
+  harness.SetSyncMode(SyncMode::LATEST_IMU);
+  harness.SetOffsetUs(4000);
+  StreamDriver driver(harness);
+
+  driver.EmitNextImage(0);
+  Expect(harness.PublishedImageTags().empty(),
+         "latest-imu 模式在 offset 目标 imu 未到时应先等待");
+
+  driver.EmitNextImage(1);
+  Expect(!harness.PublishedImageTags().empty(),
+         "补到 offset 目标 imu 后 latest-imu 模式应发布等待图像");
+  ExpectEqual(harness.PublishedImageTags().front(), 1U,
+              "latest-imu 模式应优先补发等待中的旧图像");
+  ExpectEqual(harness.PublishedSyncImuTimestamps().front(), 10000ULL,
+              "等待场景里同步 imu 应固定为图像进入时看到的最新 imu");
+  ExpectEqual(harness.PublishedFinalImuTimestamps().front(), 14000ULL,
+              "正 offset 后应取更晚的最终 imu");
+}
+
 void TestPositiveOffsetSelectsLaterImu()
 {
   SequenceHarness harness;
@@ -1279,6 +1405,22 @@ void TestCompositeRecoverySequence()
   ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "复合场景最后应重新同步");
 }
 
+void TestSwitchFromLatestImuModeBackToRawProbe()
+{
+  SequenceHarness harness;
+  harness.SetSyncMode(SyncMode::LATEST_IMU);
+  StreamDriver driver(harness);
+
+  driver.EmitNextImage(1);
+  driver.EmitNextImage(1);
+  ExpectEqual(harness.ProbeSentCount(), 0U, "latest-imu 阶段不应发送 probe");
+
+  harness.SetSyncMode(SyncMode::RAW_PROBE);
+  EmitStableWarmup(driver, 6, 1);
+  ExpectEqual(harness.ProbeSentCount(), 1U, "切回 raw-probe 后应重新发送 probe");
+  ExpectEqual(harness.CurrentState(), SyncState::SYNCED, "切回 raw-probe 后应能重新锁定");
+}
+
 using TestFn = void (*)();
 
 struct NamedTest
@@ -1293,14 +1435,18 @@ int main()
 {
   const std::vector<NamedTest> tests = {
       {"正常/稳定序列锁定并连续跟踪", TestStableLockAndTrack},
+      {"正常/latest-imu模式直接发布", TestLatestImuModePublishesWithoutProbe},
+      {"正常/latest-imu模式等待offset目标imu", TestLatestImuModeWaitsForOffsetTargetImu},
       {"正常/正offset选择更晚imu", TestPositiveOffsetSelectsLaterImu},
       {"正常/负offset选择更早imu", TestNegativeOffsetSelectsEarlierImu},
       {"正常/probe缺offset目标imu时等待", TestProbeWaitsForOffsetTargetImu},
       {"正常/稳态缺offset目标imu时等待", TestTrackedImageWaitsForExpectedImu},
       {"错误/probe图像周期错误后重置并重发", TestBadProbeGapResetsAndRearms},
       {"错误/稳态图像周期错误后重置并重锁", TestBadTrackedGapResetsAndRelocks},
+      {"错误/raw cadence断裂后重置并重锁", TestRawCadenceBreakResetsAndRelocks},
       {"正确/原始imu半周期最近匹配", TestNearestRawImuChannelSelection},
       {"复合/等待恢复与重锁串联", TestCompositeRecoverySequence},
+      {"复合/latest-imu切回raw-probe后重锁", TestSwitchFromLatestImuModeBackToRawProbe},
   };
 
   try
