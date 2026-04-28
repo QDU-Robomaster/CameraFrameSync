@@ -225,8 +225,9 @@ reset 后会：
 - 历史缓存长度
   - `pending_limit = 256`
   - `history_limit = 256`
-- `Subscriber` 内部等待队列长度
-  - `queue_length = 32`
+- `Subscriber` 消费语义
+  - 图像仍由共享图像话题阻塞等待
+  - 同步后 IMU 使用单槽 `SyncSubscriber` 等待，不再维护额外队列
 - 节拍稳定观察阈值
   - `cadence_stable_gaps = 2`
   - `raw_cadence_min_tolerance_us = 300`

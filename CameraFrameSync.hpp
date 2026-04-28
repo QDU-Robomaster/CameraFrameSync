@@ -87,8 +87,10 @@ class CameraFrameSync
     }
 
     Subscriber(std::string_view image_topic_name, std::string_view imu_topic_name)
-        : image_sub_(image_topic_name.data()),
-          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name.data())),
+        : image_topic_name_(image_topic_name),
+          imu_topic_name_(imu_topic_name),
+          image_sub_(image_topic_name_.c_str()),
+          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name_.c_str())),
                    latest_imu_)
     {
     }
@@ -192,6 +194,8 @@ class CameraFrameSync
     }
 
    private:
+    std::string image_topic_name_{};
+    std::string imu_topic_name_{};
     typename ImageTopic::Subscriber image_sub_;
     ImuStamped latest_imu_{};
     LibXR::Topic::SyncSubscriber<ImuStamped> imu_sub_;
@@ -213,8 +217,8 @@ class CameraFrameSync
         gyro_topic_name_(sensor_name_ + "_gyro"),
         accl_topic_name_(sensor_name_ + "_accl"),
         quat_topic_name_(sensor_name_ + "_quat"),
-        image_topic_(image_topic_name_.data(), image_topic_config),
-        synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_.data())),
+        image_topic_(image_topic_name_.c_str(), image_topic_config),
+        synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_.c_str())),
         sensor_sync_cmd_topic_(
             LibXR::Topic::FindOrCreate<SensorSyncCmd>(sensor_sync_cmd_topic_name)),
         gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
@@ -250,9 +254,9 @@ class CameraFrameSync
 
   ~CameraFrameSync() = default;
 
-  const char* ImageTopicName() const { return image_topic_name_.data(); }
+  const char* ImageTopicName() const { return image_topic_name_.c_str(); }
 
-  const char* ImuTopicName() const { return imu_topic_name_.data(); }
+  const char* ImuTopicName() const { return imu_topic_name_.c_str(); }
 
   void SetOffsetUs(int32_t offset_us)
   {
@@ -1176,8 +1180,8 @@ class CameraFrameSync
   }
 
  private:
-  std::string_view image_topic_name_;
-  std::string_view imu_topic_name_;
+  std::string image_topic_name_;
+  std::string imu_topic_name_;
   std::string sensor_name_{};
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
