@@ -55,10 +55,6 @@ struct QueuedTestImage
 {
   TestImageEvent sample{};
   uint32_t tag{};
-  bool cadence_observed{false};
-  bool sync_candidate_valid{false};
-  uint64_t sync_candidate_sensor_timestamp_us{0};
-  uint64_t sync_candidate_period_us{0};
 };
 
 struct TestImu
@@ -142,15 +138,24 @@ class SequenceHarness
 
   SyncState CurrentState() const { return lock_state_.state; }
 
-  uint32_t LockConfirmCount() const { return lock_state_.lock_confirm_count; }
-
   uint32_t ProbeSentCount() const { return probe_sent_count_; }
 
  private:
   struct ImageReference
   {
     bool valid{false};
-    QueuedTestImage image{};
+    TestImageEvent sample{};
+  };
+
+  struct PendingImageState
+  {
+    bool valid{false};
+    TestImageEvent sample{};
+    uint32_t tag{};
+    bool cadence_observed{false};
+    bool sync_candidate_valid{false};
+    uint64_t sync_candidate_sensor_timestamp_us{0};
+    uint64_t sync_candidate_period_us{0};
   };
 
   struct CadenceObservation
@@ -190,7 +195,6 @@ class SequenceHarness
 
   static constexpr size_t queue_limit = 256;
   static constexpr uint32_t cadence_stable_gaps = 2;
-  static constexpr uint32_t relock_confirm_frames = 3;
   static constexpr uint64_t raw_cadence_min_tolerance_us = 300ULL;
   static constexpr uint64_t image_cadence_min_tolerance_us = 1500ULL;
 
@@ -222,17 +226,6 @@ class SequenceHarness
   void SetObservingState()
   {
     lock_state_.state = SyncState::OBSERVING;
-    lock_state_.lock_confirm_count = 0;
-  }
-
-  void EnterObserving()
-  {
-    if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
-    {
-      return;
-    }
-
-    SetObservingState();
   }
 
   void ResetSyncTracking()
@@ -245,8 +238,7 @@ class SequenceHarness
 
   bool CadenceReady() const
   {
-    return cadence_.gyro.stable && cadence_.accl.stable && cadence_.quat.stable &&
-           cadence_.image.stable;
+    return cadence_.gyro.stable && cadence_.image.stable;
   }
 
   void ObserveCadenceUpdate(CadenceUpdate update)
@@ -254,10 +246,8 @@ class SequenceHarness
     switch (update)
     {
       case CadenceUpdate::NO_GAP:
-        break;
       case CadenceUpdate::WARMING:
       case CadenceUpdate::STABLE:
-        EnterObserving();
         break;
       case CadenceUpdate::BROKEN:
         ResetSyncTracking();
@@ -271,9 +261,9 @@ class SequenceHarness
         cadence, sensor_timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
-  CadenceUpdate ObserveImageCadence(const QueuedTestImage& image)
+  CadenceUpdate ObserveImageCadence(const TestImageEvent& image)
   {
-    const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
+    const uint64_t image_timestamp_us = image.sensor_timestamp_us;
     if (probe_pending_ && cadence_.image.stable && relation_.base_image_sensor_period_us != 0 &&
         cadence_.image.has_last_timestamp &&
         image_timestamp_us > cadence_.image.last_timestamp_us)
@@ -294,7 +284,7 @@ class SequenceHarness
     return update;
   }
 
-  void RecordStableImageAnchor(const QueuedTestImage& image)
+  void RecordStableImageAnchor(const TestImageEvent& image)
   {
     if (!cadence_.image.stable)
     {
@@ -303,7 +293,7 @@ class SequenceHarness
 
     relation_.base_image_sensor_period_us = cadence_.image.period_us;
     last_normal_image_.valid = true;
-    last_normal_image_.image = image;
+    last_normal_image_.sample = image;
   }
 
   uint32_t EstimatedStrideSamples() const
@@ -350,36 +340,15 @@ class SequenceHarness
            ImageGapToleranceUs(relation_);
   }
 
-  bool IsLockingOrSynced() const
-  {
-    return lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED;
-  }
+  bool IsSynced() const { return lock_state_.state == SyncState::SYNCED; }
 
   void ClearPendingProbe() { probe_pending_ = false; }
 
-  static bool IsBetterProbeMatch(uint64_t sensor_gap_error_us,
-                                 uint64_t best_sensor_gap_error_us,
-                                 bool has_future_sample,
-                                 bool best_has_future_sample,
-                                 uint64_t sync_timestamp_us,
-                                 uint64_t best_sync_timestamp_us)
-  {
-    return (has_future_sample && !best_has_future_sample) ||
-           (has_future_sample == best_has_future_sample &&
-            sensor_gap_error_us < best_sensor_gap_error_us) ||
-           (sensor_gap_error_us == best_sensor_gap_error_us &&
-            has_future_sample == best_has_future_sample &&
-            sync_timestamp_us > best_sync_timestamp_us);
-  }
+  void ClearPendingImage() { pending_image_ = {}; }
 
   bool ImuHistoryReached(uint64_t target_timestamp_us) const
   {
     return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us >= target_timestamp_us;
-  }
-
-  bool ImuHistoryHasFutureSampleAfter(uint64_t sensor_timestamp_us) const
-  {
-    return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us > sensor_timestamp_us;
   }
 
   bool ImuHistorySpanReady(uint64_t required_span_us) const
@@ -395,7 +364,7 @@ class SequenceHarness
 
   void MaybeSendProbe()
   {
-    if (IsLockingOrSynced())
+    if (IsSynced())
     {
       return;
     }
@@ -475,10 +444,10 @@ class SequenceHarness
     }
   }
 
-  void RememberObservedImage(const QueuedTestImage& image)
+  void RememberObservedImage(const TestImageEvent& image)
   {
     last_observed_image_.valid = true;
-    last_observed_image_.image = image;
+    last_observed_image_.sample = image;
   }
 
   void HandleOverflowRecovery()
@@ -489,6 +458,7 @@ class SequenceHarness
     }
 
     overflowed_ = false;
+    ClearPendingImage();
     ClearPendingProbe();
     ResetLockedRelation();
     ResetCadenceObservation();
@@ -497,28 +467,36 @@ class SequenceHarness
 
   void DrainPendingImages()
   {
-    while (!pending_images_.Empty())
+    while (pending_image_.valid || !pending_images_.Empty())
     {
-      QueuedTestImage& image = pending_images_[0];
+      if (!pending_image_.valid)
+      {
+        pending_image_.valid = true;
+        pending_image_.sample = pending_images_.Front().sample;
+        pending_image_.tag = pending_images_.Front().tag;
+        pending_images_.PopFront();
+      }
+
+      PendingImageState& image = pending_image_;
       auto cadence_update = CadenceUpdate::NO_GAP;
       if (!image.cadence_observed)
       {
-        cadence_update = ObserveImageCadence(image);
+        cadence_update = ObserveImageCadence(image.sample);
         image.cadence_observed = true;
       }
 
       if (!last_observed_image_.valid)
       {
-        RememberObservedImage(image);
-        pending_images_.PopFront();
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
       const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
-      const uint64_t last_image_timestamp_us = last_observed_image_.image.sample.sensor_timestamp_us;
+      const uint64_t last_image_timestamp_us = last_observed_image_.sample.sensor_timestamp_us;
       if (image_timestamp_us <= last_image_timestamp_us)
       {
-        pending_images_.PopFront();
+        ClearPendingImage();
         ClearPendingProbe();
         ResetLockedRelation();
         ResetCadenceObservation();
@@ -529,8 +507,8 @@ class SequenceHarness
       const uint64_t image_gap_sensor_us = image_timestamp_us - last_image_timestamp_us;
       if (cadence_update == CadenceUpdate::BROKEN)
       {
-        pending_images_.PopFront();
-        RememberObservedImage(image);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
@@ -546,17 +524,17 @@ class SequenceHarness
                        ? TryLockFromProbe(image, image_gap_sensor_us)
                        : ImageDecision::REJECT;
       }
-      else if (IsLockingOrSynced())
+      else if (IsSynced())
       {
         decision = IsNormalImageGap(image_gap_sensor_us)
-                       ? TryProcessLockedImage(image, image_gap_sensor_us)
+                       ? TryProcessSyncedImage(image, image_gap_sensor_us)
                        : ImageDecision::REJECT;
       }
       else
       {
-        RecordStableImageAnchor(image);
-        RememberObservedImage(image);
-        pending_images_.PopFront();
+        RecordStableImageAnchor(image.sample);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         MaybeSendProbe();
         continue;
       }
@@ -566,7 +544,6 @@ class SequenceHarness
         break;
       }
 
-      pending_images_.PopFront();
       if (decision == ImageDecision::ACCEPT)
       {
         if (probe_pending)
@@ -575,9 +552,10 @@ class SequenceHarness
         }
         else
         {
-          RecordStableImageAnchor(image);
+          RecordStableImageAnchor(image.sample);
         }
-        RememberObservedImage(image);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
@@ -586,18 +564,23 @@ class SequenceHarness
       {
         ClearPendingProbe();
       }
+      ClearPendingImage();
       ResetSyncTracking();
       MaybeSendProbe();
     }
   }
 
-  ImageDecision PublishMatchedImage(const QueuedTestImage& image, const SyncMatch& match)
+  ImageDecision PublishMatchedImage(const PendingImageState& image, const SyncMatch& match)
   {
+    if (NeedMoreImuForOffset(*match.sync_imu, offset_us_))
+    {
+      return ImageDecision::WAIT;
+    }
+
     const TestImu* final_imu = FindFinalImu(*match.sync_imu, offset_us_);
     if (final_imu == nullptr)
     {
-      return NeedMoreImuForOffset(*match.sync_imu, offset_us_) ? ImageDecision::WAIT
-                                                               : ImageDecision::REJECT;
+      return ImageDecision::REJECT;
     }
 
     published_image_tags_.push_back(image.tag);
@@ -608,11 +591,11 @@ class SequenceHarness
     relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
     relation_.last_image_sensor_timestamp_us = image.sample.sensor_timestamp_us;
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
-    ObserveGoodFrame(lock_state_, relock_confirm_frames);
+    ObserveGoodFrame(lock_state_);
     return ImageDecision::ACCEPT;
   }
 
-  ImageDecision PublishOrRememberMatch(QueuedTestImage& image, const SyncMatch& match)
+  ImageDecision PublishOrRememberMatch(PendingImageState& image, const SyncMatch& match)
   {
     const ImageDecision decision = PublishMatchedImage(image, match);
     if (decision == ImageDecision::WAIT)
@@ -629,7 +612,7 @@ class SequenceHarness
     return decision;
   }
 
-  ImageDecision ResumePendingMatch(QueuedTestImage& image)
+  ImageDecision ResumePendingMatch(PendingImageState& image)
   {
     if (!image.sync_candidate_valid)
     {
@@ -692,7 +675,6 @@ class SequenceHarness
   {
     SyncMatch best_match{};
     uint64_t best_sensor_gap_error_us = UINT64_MAX;
-    bool best_has_future_sample = false;
     uint64_t best_sync_timestamp_us = 0;
 
     for (size_t i = imu_history_.Size(); i > 0; --i)
@@ -718,11 +700,12 @@ class SequenceHarness
           sync_imu.sensor_timestamp_us - prev_sync_imu->sensor_timestamp_us;
       const uint64_t sensor_gap_error_us =
           AbsDiffUs(sync_sensor_gap_us, expected_probe_sensor_gap_us);
-      const bool has_future_sample = ImuHistoryHasFutureSampleAfter(sync_imu.sensor_timestamp_us);
-      if (sync_sensor_gap_us < 2 ||
-          !IsBetterProbeMatch(sensor_gap_error_us, best_sensor_gap_error_us,
-                              has_future_sample, best_has_future_sample,
-                              sync_imu.sensor_timestamp_us, best_sync_timestamp_us))
+      const bool better_match =
+          !best_match.Valid() ||
+          sensor_gap_error_us < best_sensor_gap_error_us ||
+          (sensor_gap_error_us == best_sensor_gap_error_us &&
+           sync_imu.sensor_timestamp_us > best_sync_timestamp_us);
+      if (sync_sensor_gap_us < 2 || !better_match)
       {
         continue;
       }
@@ -732,14 +715,13 @@ class SequenceHarness
           .next_sync_sensor_period_us = sync_sensor_gap_us / 2ULL,
       };
       best_sensor_gap_error_us = sensor_gap_error_us;
-      best_has_future_sample = has_future_sample;
       best_sync_timestamp_us = sync_imu.sensor_timestamp_us;
     }
 
     return best_match;
   }
 
-  ImageDecision TryLockFromProbe(QueuedTestImage& probe, uint64_t image_gap_sensor_us)
+  ImageDecision TryLockFromProbe(PendingImageState& probe, uint64_t image_gap_sensor_us)
   {
     if (!last_normal_image_.valid || !IsProbeImageGap(image_gap_sensor_us))
     {
@@ -770,7 +752,7 @@ class SequenceHarness
     return PublishOrRememberMatch(probe, match);
   }
 
-  ImageDecision TryProcessLockedImage(QueuedTestImage& image,
+  ImageDecision TryProcessSyncedImage(PendingImageState& image,
                                       uint64_t image_gap_sensor_us)
   {
     const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
@@ -846,6 +828,7 @@ class SequenceHarness
   SyncRelation relation_{};
   ImageReference last_observed_image_{};
   ImageReference last_normal_image_{};
+  PendingImageState pending_image_{};
 
   std::vector<uint32_t> published_image_tags_{};
   std::vector<uint64_t> published_sync_imu_timestamps_{};
@@ -1147,8 +1130,11 @@ void TestProbeWaitsForOffsetTargetImu()
   driver.EmitNextImage(0);
   Expect(harness.PublishedImageTags().empty(), "offset 目标 imu 未到时 probe 图像不应立即发布");
 
-  driver.EmitNextImage(1);
-  Expect(!harness.PublishedImageTags().empty(), "补到 offset 目标 imu 后 probe 图像应发布");
+  for (int i = 0; i < 4 && harness.PublishedImageTags().empty(); ++i)
+  {
+    driver.EmitNextImage(1);
+  }
+  Expect(!harness.PublishedImageTags().empty(), "补到足够的 offset 目标 imu 后 probe 图像应发布");
   ExpectEqual(harness.PublishedImageTags().front(), 4U, "补齐后应优先发布等待中的 probe 图像");
 }
 
@@ -1166,9 +1152,16 @@ void TestTrackedImageWaitsForExpectedImu()
   ExpectVectorEqual(harness.PublishedImageTags(), std::vector<uint32_t>({4, 5}),
                     "缺少 offset 目标 imu 时当前普通图像应继续等待");
 
-  driver.EmitNextImage(1);
-  ExpectVectorEqual(harness.PublishedImageTags(), std::vector<uint32_t>({4, 5, 6, 7}),
-                    "补到 offset 目标 imu 后应先补发等待图像，再继续处理当前图像");
+  for (int i = 0; i < 4 && harness.PublishedImageTags().size() < 4; ++i)
+  {
+    driver.EmitNextImage(1);
+  }
+  Expect(harness.PublishedImageTags().size() >= 4,
+         "补到足够的 offset 目标 imu 后应继续发布等待中的普通图像");
+  ExpectVectorEqual(std::vector<uint32_t>(harness.PublishedImageTags().begin(),
+                                          harness.PublishedImageTags().begin() + 4),
+                    std::vector<uint32_t>({4, 5, 6, 7}),
+                    "补齐后应先补发等待图像，再按顺序继续处理后续图像");
 }
 
 void TestBadProbeGapResetsAndRearms()

@@ -279,12 +279,6 @@ class CameraFrameSync
   struct QueuedImageEvent
   {
     ImageEvent sample{};
-    // 图像可能因为等待更多 IMU 而在队列里重试；同一事件只能记一次 cadence。
-    bool cadence_observed{false};
-    // 一旦为这张图像选出同步 IMU，就在等待 offset 目标期间固定住它。
-    bool sync_candidate_valid{false};
-    uint64_t sync_candidate_sensor_timestamp_us{0};
-    uint64_t sync_candidate_period_us{0};
   };
 
   struct AssembledImu
@@ -298,7 +292,17 @@ class CameraFrameSync
   struct ImageReference
   {
     bool valid{false};
-    QueuedImageEvent image{};
+    ImageEvent sample{};
+  };
+
+  struct PendingImageState
+  {
+    bool valid{false};
+    ImageEvent sample{};
+    bool cadence_observed{false};
+    bool sync_candidate_valid{false};
+    uint64_t sync_candidate_sensor_timestamp_us{0};
+    uint64_t sync_candidate_period_us{0};
   };
 
   struct CadenceObservation
@@ -343,7 +347,6 @@ class CameraFrameSync
   static constexpr size_t image_event_ingress_length = 32;
   static constexpr size_t pending_limit = 256;
   static constexpr size_t history_limit = 256;
-  static constexpr uint32_t relock_confirm_frames = 3;
   static constexpr uint32_t cadence_stable_gaps = 2;
   static constexpr uint64_t raw_cadence_min_tolerance_us = 300ULL;
   static constexpr uint64_t image_cadence_min_tolerance_us = 1500ULL;
@@ -376,17 +379,6 @@ class CameraFrameSync
   void SetObservingState()
   {
     lock_state_.state = SyncState::OBSERVING;
-    lock_state_.lock_confirm_count = 0;
-  }
-
-  void EnterObserving()
-  {
-    if (lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED)
-    {
-      return;
-    }
-
-    SetObservingState();
   }
 
   void ResetSyncTracking()
@@ -399,8 +391,7 @@ class CameraFrameSync
 
   bool CadenceReady() const
   {
-    return cadence_.gyro.stable && cadence_.accl.stable && cadence_.quat.stable &&
-           cadence_.image.stable;
+    return cadence_.gyro.stable && cadence_.image.stable;
   }
 
   void ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate update)
@@ -408,10 +399,8 @@ class CameraFrameSync
     switch (update)
     {
       case CameraFrameSyncCore::CadenceUpdate::NO_GAP:
-        break;
       case CameraFrameSyncCore::CadenceUpdate::WARMING:
       case CameraFrameSyncCore::CadenceUpdate::STABLE:
-        EnterObserving();
         break;
       case CameraFrameSyncCore::CadenceUpdate::BROKEN:
         ResetSyncTracking();
@@ -425,9 +414,9 @@ class CameraFrameSync
         cadence, timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
-  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const QueuedImageEvent& image)
+  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const ImageEvent& image)
   {
-    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sensor_timestamp_us);
     // probe 的 2T 图像 gap 是主动扰动，不算图像流失稳，但要推进图像侧基线。
     if (probe_pending_ && cadence_.image.stable && relation_.base_image_sensor_period_us != 0 &&
         cadence_.image.has_last_timestamp &&
@@ -451,7 +440,7 @@ class CameraFrameSync
     return update;
   }
 
-  void RecordStableImageAnchor(const QueuedImageEvent& image)
+  void RecordStableImageAnchor(const ImageEvent& image)
   {
     if (!cadence_.image.stable)
     {
@@ -460,7 +449,7 @@ class CameraFrameSync
 
     relation_.base_image_sensor_period_us = cadence_.image.period_us;
     last_normal_image_.valid = true;
-    last_normal_image_.image = image;
+    last_normal_image_.sample = image;
   }
 
   uint32_t EstimatedStrideSamples() const
@@ -509,15 +498,14 @@ class CameraFrameSync
            ImageGapToleranceUs(relation_);
   }
 
-  bool IsLockingOrSynced() const
-  {
-    return lock_state_.state == SyncState::LOCKING || lock_state_.state == SyncState::SYNCED;
-  }
+  bool IsSynced() const { return lock_state_.state == SyncState::SYNCED; }
 
   void ClearPendingProbe()
   {
     probe_pending_ = false;
   }
+
+  void ClearPendingImage() { pending_image_ = {}; }
 
   bool AcquireInitialWritableImage()
   {
@@ -666,36 +654,43 @@ class CameraFrameSync
     }
   }
 
-  void RememberObservedImage(const QueuedImageEvent& image)
+  void RememberObservedImage(const ImageEvent& image)
   {
     last_observed_image_.valid = true;
-    last_observed_image_.image = image;
+    last_observed_image_.sample = image;
   }
 
   void DrainPendingImageEvents()
   {
-    while (!pending_image_events_.Empty())
+    while (pending_image_.valid || !pending_image_events_.Empty())
     {
-      QueuedImageEvent& image = pending_image_events_[0];
+      if (!pending_image_.valid)
+      {
+        pending_image_.valid = true;
+        pending_image_.sample = pending_image_events_.Front().sample;
+        pending_image_events_.PopFront();
+      }
+
+      PendingImageState& image = pending_image_;
       auto cadence_update = CameraFrameSyncCore::CadenceUpdate::NO_GAP;
       if (!image.cadence_observed)
       {
-        cadence_update = ObserveImageCadence(image);
+        cadence_update = ObserveImageCadence(image.sample);
         image.cadence_observed = true;
       }
       if (!last_observed_image_.valid)
       {
-        RememberObservedImage(image);
-        pending_image_events_.PopFront();
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
       const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
       const uint64_t last_image_timestamp_us =
-          static_cast<uint64_t>(last_observed_image_.image.sample.sensor_timestamp_us);
+          static_cast<uint64_t>(last_observed_image_.sample.sensor_timestamp_us);
       if (image_timestamp_us <= last_image_timestamp_us)
       {
-        pending_image_events_.PopFront();
+        ClearPendingImage();
         ClearPendingProbe();
         ResetLockedRelation();
         ResetCadenceObservation();
@@ -706,8 +701,8 @@ class CameraFrameSync
       const uint64_t image_gap_sensor_us = image_timestamp_us - last_image_timestamp_us;
       if (cadence_update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
       {
-        pending_image_events_.PopFront();
-        RememberObservedImage(image);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
@@ -724,17 +719,17 @@ class CameraFrameSync
                        ? TryLockFromProbe(image, image_gap_sensor_us)
                        : ImageDecision::REJECT;
       }
-      else if (IsLockingOrSynced())
+      else if (IsSynced())
       {
         decision = IsNormalImageGap(image_gap_sensor_us)
-                       ? TryProcessLockedImage(image, image_gap_sensor_us)
+                       ? TryProcessSyncedImage(image, image_gap_sensor_us)
                        : ImageDecision::REJECT;
       }
       else
       {
-        RecordStableImageAnchor(image);
-        RememberObservedImage(image);
-        pending_image_events_.PopFront();
+        RecordStableImageAnchor(image.sample);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         MaybeSendProbe();
         continue;
       }
@@ -744,7 +739,6 @@ class CameraFrameSync
         break;
       }
 
-      pending_image_events_.PopFront();
       if (decision == ImageDecision::ACCEPT)
       {
         if (probe_pending)
@@ -753,9 +747,10 @@ class CameraFrameSync
         }
         else
         {
-          RecordStableImageAnchor(image);
+          RecordStableImageAnchor(image.sample);
         }
-        RememberObservedImage(image);
+        RememberObservedImage(image.sample);
+        ClearPendingImage();
         continue;
       }
 
@@ -763,6 +758,7 @@ class CameraFrameSync
       {
         ClearPendingProbe();
       }
+      ClearPendingImage();
       ResetSyncTracking();
       MaybeSendProbe();
     }
@@ -770,7 +766,7 @@ class CameraFrameSync
 
   void MaybeSendProbe()
   {
-    if (IsLockingOrSynced())
+    if (IsSynced())
     {
       return;
     }
@@ -791,29 +787,9 @@ class CameraFrameSync
     probe_pending_ = true;
   }
 
-  static bool IsBetterProbeMatch(uint64_t sensor_gap_error_us,
-                                 uint64_t best_sensor_gap_error_us,
-                                 bool has_future_sample,
-                                 bool best_has_future_sample,
-                                 uint64_t sync_timestamp_us,
-                                 uint64_t best_sync_timestamp_us)
-  {
-    return (has_future_sample && !best_has_future_sample) ||
-           (has_future_sample == best_has_future_sample &&
-            sensor_gap_error_us < best_sensor_gap_error_us) ||
-           (sensor_gap_error_us == best_sensor_gap_error_us &&
-            has_future_sample == best_has_future_sample &&
-            sync_timestamp_us > best_sync_timestamp_us);
-  }
-
   bool ImuHistoryReached(uint64_t target_timestamp_us) const
   {
     return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us >= target_timestamp_us;
-  }
-
-  bool ImuHistoryHasFutureSampleAfter(uint64_t sensor_timestamp_us) const
-  {
-    return !imu_history_.Empty() && imu_history_.Back().sensor_timestamp_us > sensor_timestamp_us;
   }
 
   bool ImuHistorySpanReady(uint64_t required_span_us) const
@@ -827,30 +803,33 @@ class CameraFrameSync
            required_span_us;
   }
 
-  ImageDecision PublishMatchedImage(const QueuedImageEvent& image,
+  ImageDecision PublishMatchedImage(const ImageEvent& image,
                                     const SyncMatch& match)
   {
     // 先确定“同步帧是哪一条 IMU”，再只在 IMU 自己时间域里应用 offset 取最终样本。
     const int32_t offset_us = offset_us_.load(std::memory_order_relaxed);
+    if (NeedMoreImuForOffset(*match.sync_imu, offset_us))
+    {
+      return ImageDecision::WAIT;
+    }
+
     const AssembledImu* final_imu = FindFinalImu(*match.sync_imu, offset_us);
     if (final_imu == nullptr)
     {
-      return NeedMoreImuForOffset(*match.sync_imu, offset_us) ? ImageDecision::WAIT
-                                                              : ImageDecision::REJECT;
+      return ImageDecision::REJECT;
     }
 
-    PublishSyncedImu(image.sample.sensor_timestamp_us, *final_imu);
+    PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
     relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
-    relation_.last_image_sensor_timestamp_us =
-        static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+    relation_.last_image_sensor_timestamp_us = static_cast<uint64_t>(image.sensor_timestamp_us);
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
-    CameraFrameSyncCore::ObserveGoodFrame(lock_state_, relock_confirm_frames);
+    CameraFrameSyncCore::ObserveGoodFrame(lock_state_);
     return ImageDecision::ACCEPT;
   }
 
-  ImageDecision PublishOrRememberMatch(QueuedImageEvent& image, const SyncMatch& match)
+  ImageDecision PublishOrRememberMatch(PendingImageState& image, const SyncMatch& match)
   {
-    const ImageDecision decision = PublishMatchedImage(image, match);
+    const ImageDecision decision = PublishMatchedImage(image.sample, match);
     if (decision == ImageDecision::WAIT)
     {
       image.sync_candidate_valid = true;
@@ -865,7 +844,7 @@ class CameraFrameSync
     return decision;
   }
 
-  ImageDecision ResumePendingMatch(QueuedImageEvent& image)
+  ImageDecision ResumePendingMatch(PendingImageState& image)
   {
     if (!image.sync_candidate_valid)
     {
@@ -929,7 +908,6 @@ class CameraFrameSync
   {
     SyncMatch best_match{};
     uint64_t best_sensor_gap_error_us = std::numeric_limits<uint64_t>::max();
-    bool best_has_future_sample = false;
     uint64_t best_sync_timestamp_us = 0;
 
     for (size_t i = imu_history_.Size(); i > 0; --i)
@@ -954,11 +932,12 @@ class CameraFrameSync
           sync_imu.sensor_timestamp_us - prev_sync_imu->sensor_timestamp_us;
       const uint64_t sensor_gap_error_us =
           CameraFrameSyncCore::AbsDiffUs(sync_sensor_gap_us, expected_probe_sensor_gap_us);
-      const bool has_future_sample = ImuHistoryHasFutureSampleAfter(sync_imu.sensor_timestamp_us);
-      if (sync_sensor_gap_us < 2 ||
-          !IsBetterProbeMatch(sensor_gap_error_us, best_sensor_gap_error_us,
-                              has_future_sample, best_has_future_sample,
-                              sync_imu.sensor_timestamp_us, best_sync_timestamp_us))
+      const bool better_match =
+          !best_match.Valid() ||
+          sensor_gap_error_us < best_sensor_gap_error_us ||
+          (sensor_gap_error_us == best_sensor_gap_error_us &&
+           sync_imu.sensor_timestamp_us > best_sync_timestamp_us);
+      if (sync_sensor_gap_us < 2 || !better_match)
       {
         continue;
       }
@@ -968,14 +947,13 @@ class CameraFrameSync
           .next_sync_sensor_period_us = sync_sensor_gap_us / 2ULL,
       };
       best_sensor_gap_error_us = sensor_gap_error_us;
-      best_has_future_sample = has_future_sample;
       best_sync_timestamp_us = sync_imu.sensor_timestamp_us;
     }
 
     return best_match;
   }
 
-  ImageDecision TryLockFromProbe(QueuedImageEvent& probe, uint64_t image_gap_sensor_us)
+  ImageDecision TryLockFromProbe(PendingImageState& probe, uint64_t image_gap_sensor_us)
   {
     if (!last_normal_image_.valid || !IsProbeImageGap(image_gap_sensor_us))
     {
@@ -1007,7 +985,7 @@ class CameraFrameSync
     return PublishOrRememberMatch(probe, match);
   }
 
-  ImageDecision TryProcessLockedImage(QueuedImageEvent& image, uint64_t image_gap_sensor_us)
+  ImageDecision TryProcessSyncedImage(PendingImageState& image, uint64_t image_gap_sensor_us)
   {
     const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
     if (relation_.last_image_sensor_timestamp_us == 0 ||
@@ -1086,6 +1064,7 @@ class CameraFrameSync
   {
     if (overflowed_.exchange(false, std::memory_order_relaxed))
     {
+      ClearPendingImage();
       ClearPendingProbe();
       ResetLockedRelation();
       ResetCadenceObservation();
@@ -1136,5 +1115,6 @@ class CameraFrameSync
   SyncRelation relation_{};
   ImageReference last_observed_image_{};
   ImageReference last_normal_image_{};
+  PendingImageState pending_image_{};
   bool probe_pending_{false};
 };

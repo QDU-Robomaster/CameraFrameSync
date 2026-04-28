@@ -89,14 +89,12 @@ class FixedRingBuffer
 enum class SyncState : uint8_t
 {
   OBSERVING = 0,
-  LOCKING = 1,
-  SYNCED = 2,
+  SYNCED = 1,
 };
 
 struct SyncLockState
 {
   SyncState state{SyncState::OBSERVING};
-  uint32_t lock_confirm_count{0};
 };
 
 enum class CadenceUpdate : uint8_t
@@ -253,24 +251,9 @@ const typename ImuHistoryContainer::ValueType* FindBySensorTimestamp(
   return (best != nullptr && best_error <= tolerance_us) ? best : nullptr;
 }
 
-inline void ObserveGoodFrame(SyncLockState& lock_state, uint32_t relock_confirm_frames)
+inline void ObserveGoodFrame(SyncLockState& lock_state)
 {
-  switch (lock_state.state)
-  {
-    case SyncState::OBSERVING:
-      lock_state.state = SyncState::LOCKING;
-      lock_state.lock_confirm_count = 1;
-      break;
-    case SyncState::LOCKING:
-      lock_state.lock_confirm_count++;
-      if (lock_state.lock_confirm_count >= relock_confirm_frames)
-      {
-        lock_state.state = SyncState::SYNCED;
-      }
-      break;
-    case SyncState::SYNCED:
-      break;
-  }
+  lock_state.state = SyncState::SYNCED;
 }
 
 enum class ChannelSampleSearchResult : uint8_t
