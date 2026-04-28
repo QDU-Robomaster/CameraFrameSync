@@ -194,7 +194,7 @@
 - `RESET`
   - 任一路 cadence 失稳
   - ingress / history 溢出
-  - 图像事件回退或乱序
+  - 图像时间戳回退或乱序
 
 reset 后会：
 
