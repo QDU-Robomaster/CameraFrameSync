@@ -25,6 +25,7 @@ depends:
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -88,8 +89,8 @@ class CameraFrameSync
 
     Subscriber(std::string_view image_topic_name, std::string_view imu_topic_name)
         : image_sub_(image_topic_name.data()),
-          imu_queue_(queue_length),
-          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name.data())), imu_queue_)
+          imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(imu_topic_name.data())),
+                   latest_imu_)
     {
     }
 
@@ -101,12 +102,8 @@ class CameraFrameSync
 
       while (true)
       {
+        // deadline 恰好耗尽时仍传 0 给底层 Wait，允许消费已经就绪的数据。
         const uint32_t wait_ms = RemainingMs(deadline_ms, timeout_ms);
-        if (timeout_ms != UINT32_MAX && wait_ms == 0)
-        {
-          return LibXR::ErrorCode::TIMEOUT;
-        }
-
         ImageData image_data;
         const auto wait_ans = image_sub_.Wait(image_data, wait_ms);
         if (wait_ans != LibXR::ErrorCode::OK)
@@ -122,44 +119,23 @@ class CameraFrameSync
         }
 
         const uint64_t image_timestamp_us = image->timestamp_us;
-        while (true)
+        const auto imu_wait_ans = WaitForMatchingImu(image_timestamp_us, deadline_ms,
+                                                     timeout_ms, out.imu);
+        if (imu_wait_ans == LibXR::ErrorCode::OK)
         {
-          DrainImuQueue();
-          while (!pending_imus_.Empty() &&
-                 pending_imus_.Front().timestamp_us < image_timestamp_us)
-          {
-            pending_imus_.PopFront();
-          }
-
-          if (!pending_imus_.Empty() &&
-              pending_imus_.Front().timestamp_us == image_timestamp_us)
-          {
-            out.image = std::move(image_data);
-            out.imu = pending_imus_.Front();
-            pending_imus_.PopFront();
-            return LibXR::ErrorCode::OK;
-          }
-
-          if (!pending_imus_.Empty() &&
-              pending_imus_.Front().timestamp_us > image_timestamp_us)
-          {
-            image_data.Reset();
-            break;
-          }
-
-          if (timeout_ms != UINT32_MAX && RemainingMs(deadline_ms, timeout_ms) == 0)
-          {
-            return LibXR::ErrorCode::TIMEOUT;
-          }
-
-          LibXR::Thread::Sleep(1);
+          out.image = std::move(image_data);
+          return LibXR::ErrorCode::OK;
         }
+        if (imu_wait_ans == LibXR::ErrorCode::EMPTY)
+        {
+          image_data.Reset();
+          continue;
+        }
+        return imu_wait_ans;
       }
     }
 
    private:
-    static constexpr size_t queue_length = 32;
-
     static uint64_t MakeDeadline(uint32_t timeout_ms)
     {
       if (timeout_ms == UINT32_MAX)
@@ -184,20 +160,43 @@ class CameraFrameSync
       return static_cast<uint32_t>(deadline_ms - now_ms);
     }
 
-    void DrainImuQueue()
+    LibXR::ErrorCode WaitForMatchingImu(uint64_t image_timestamp_us,
+                                        uint64_t deadline_ms,
+                                        uint32_t timeout_ms,
+                                        ImuStamped& matched_imu)
     {
-      ImuStamped imu{};
-      while (imu_queue_.Pop(imu) == LibXR::ErrorCode::OK)
+      while (true)
       {
-        pending_imus_.PushBackDropOldest(imu);
+        if (latest_imu_valid_)
+        {
+          if (latest_imu_.timestamp_us == image_timestamp_us)
+          {
+            matched_imu = latest_imu_;
+            latest_imu_valid_ = false;
+            return LibXR::ErrorCode::OK;
+          }
+          if (latest_imu_.timestamp_us > image_timestamp_us)
+          {
+            return LibXR::ErrorCode::EMPTY;
+          }
+        }
+
+        // 同样保留 Wait(0) 的非阻塞消费语义，避免 image/imu 到达顺序边界丢帧。
+        const uint32_t wait_ms = RemainingMs(deadline_ms, timeout_ms);
+        const auto wait_ans = imu_sub_.Wait(wait_ms);
+        if (wait_ans != LibXR::ErrorCode::OK)
+        {
+          return wait_ans;
+        }
+        latest_imu_valid_ = true;
       }
     }
 
    private:
     typename ImageTopic::Subscriber image_sub_;
-    LibXR::LockFreeQueue<ImuStamped> imu_queue_;
-    LibXR::Topic::QueuedSubscriber imu_sub_;
-    CameraFrameSyncCore::FixedRingBuffer<ImuStamped, queue_length> pending_imus_{};
+    ImuStamped latest_imu_{};
+    LibXR::Topic::SyncSubscriber<ImuStamped> imu_sub_;
+    bool latest_imu_valid_{false};
   };
 
   CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
@@ -231,7 +230,11 @@ class CameraFrameSync
   {
     if (!image_topic_.Valid())
     {
-      throw std::runtime_error("CameraFrameSync: image topic creation failed");
+      char message[96] = {};
+      std::snprintf(message, sizeof(message),
+                    "CameraFrameSync: image topic creation failed (err=%d)",
+                    static_cast<int>(image_topic_.GetError()));
+      throw std::runtime_error(message);
     }
     if (!AcquireInitialWritableImage())
     {
