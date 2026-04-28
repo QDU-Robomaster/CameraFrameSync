@@ -45,15 +45,14 @@ struct QueuedTestQuat
   TestQuat sample{};
 };
 
-struct TestImageEvent
+struct TestImageSample
 {
   uint64_t sensor_timestamp_us{};
-  uint32_t sensor_step_index{};
 };
 
 struct QueuedTestImage
 {
-  TestImageEvent sample{};
+  TestImageSample sample{};
   uint32_t tag{};
 };
 
@@ -113,9 +112,9 @@ class SequenceHarness
     }
   }
 
-  void PushImage(uint64_t sensor_timestamp_us, uint32_t sensor_step_index, uint32_t tag)
+  void PushImage(uint64_t sensor_timestamp_us, uint32_t tag)
   {
-    if (image_ingress_.PushBackDropOldest({{sensor_timestamp_us, sensor_step_index}, tag}))
+    if (image_ingress_.PushBackDropOldest({{sensor_timestamp_us}, tag}))
     {
       overflowed_ = true;
     }
@@ -161,13 +160,13 @@ class SequenceHarness
   struct ImageReference
   {
     bool valid{false};
-    TestImageEvent sample{};
+    TestImageSample sample{};
   };
 
   struct PendingImageState
   {
     bool valid{false};
-    TestImageEvent sample{};
+    TestImageSample sample{};
     uint32_t tag{};
     bool cadence_observed{false};
     bool sync_candidate_valid{false};
@@ -298,7 +297,7 @@ class SequenceHarness
         cadence, sensor_timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
-  CadenceUpdate ObserveImageCadence(const TestImageEvent& image)
+  CadenceUpdate ObserveImageCadence(const TestImageSample& image)
   {
     const uint64_t image_timestamp_us = image.sensor_timestamp_us;
     if (probe_pending_ && cadence_.image.stable && relation_.base_image_sensor_period_us != 0 &&
@@ -321,7 +320,7 @@ class SequenceHarness
     return update;
   }
 
-  void RecordStableImageAnchor(const TestImageEvent& image)
+  void RecordStableImageAnchor(const TestImageSample& image)
   {
     if (!cadence_.image.stable)
     {
@@ -502,7 +501,7 @@ class SequenceHarness
     }
   }
 
-  void RememberObservedImage(const TestImageEvent& image)
+  void RememberObservedImage(const TestImageSample& image)
   {
     last_observed_image_.valid = true;
     last_observed_image_.sample = image;
@@ -948,7 +947,7 @@ class StreamDriver
 
     PushImuUpTo(current_image_timestamp_us);
     PushExtraImu(imu_after_count);
-    harness_.PushImage(current_image_timestamp_us, current_image_step, current_image_tag);
+    harness_.PushImage(current_image_timestamp_us, current_image_tag);
     harness_.Drain();
     UpdateProbeArm();
     last_image_timestamp_us_ = current_image_timestamp_us;

@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 相机共享图像桥与原始 imu/image_event 同步器
+module_description: 相机共享图像桥与原始 imu 同步器
 constructor_args:
   camera: @camera
 template_args:
@@ -51,7 +51,6 @@ class CameraFrameSync
   using GyroStamped = typename Base::GyroStamped;
   using AcclStamped = typename Base::AcclStamped;
   using QuatStamped = typename Base::QuatStamped;
-  using ImageEvent = typename Base::ImageEvent;
   using SensorSyncCmd = typename Base::SensorSyncCmd;
   using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;
   using ImageData = typename ImageTopic::Data;
@@ -181,7 +180,7 @@ class CameraFrameSync
           }
         }
 
-        // 同样保留 Wait(0) 的非阻塞消费语义，避免 image/imu 到达顺序边界丢帧。
+        // 同样保留 Wait(0) 的非阻塞消费语义，避免 image/imu 发布顺序边界丢帧。
         const uint32_t wait_ms = RemainingMs(deadline_ms, timeout_ms);
         const auto wait_ans = imu_sub_.Wait(wait_ms);
         if (wait_ans != LibXR::ErrorCode::OK)
@@ -214,7 +213,6 @@ class CameraFrameSync
         gyro_topic_name_(sensor_name_ + "_gyro"),
         accl_topic_name_(sensor_name_ + "_accl"),
         quat_topic_name_(sensor_name_ + "_quat"),
-        image_event_topic_name_(sensor_name_ + "_image_event"),
         image_topic_(image_topic_name_.data(), image_topic_config),
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_.data())),
         sensor_sync_cmd_topic_(
@@ -222,11 +220,9 @@ class CameraFrameSync
         gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
         accl_topic_(LibXR::Topic::FindOrCreate<AcclStamped>(accl_topic_name_.c_str())),
         quat_topic_(LibXR::Topic::FindOrCreate<QuatStamped>(quat_topic_name_.c_str())),
-        image_event_topic_(LibXR::Topic::FindOrCreate<ImageEvent>(image_event_topic_name_.c_str())),
         gyro_cb_(LibXR::Topic::Callback::Create(OnGyroStatic, this)),
         accl_cb_(LibXR::Topic::Callback::Create(OnAcclStatic, this)),
-        quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this)),
-        image_event_cb_(LibXR::Topic::Callback::Create(OnImageEventStatic, this))
+        quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this))
   {
     if (!image_topic_.Valid())
     {
@@ -250,7 +246,6 @@ class CameraFrameSync
     gyro_topic_.RegisterCallback(gyro_cb_);
     accl_topic_.RegisterCallback(accl_cb_);
     quat_topic_.RegisterCallback(quat_cb_);
-    image_event_topic_.RegisterCallback(image_event_cb_);
   }
 
   ~CameraFrameSync() = default;
@@ -307,9 +302,14 @@ class CameraFrameSync
     QuatStamped sample{};
   };
 
-  struct QueuedImageEvent
+  struct ImageSample
   {
-    ImageEvent sample{};
+    uint64_t sensor_timestamp_us{};
+  };
+
+  struct QueuedImage
+  {
+    ImageSample sample{};
   };
 
   struct AssembledImu
@@ -323,13 +323,13 @@ class CameraFrameSync
   struct ImageReference
   {
     bool valid{false};
-    ImageEvent sample{};
+    ImageSample sample{};
   };
 
   struct PendingImageState
   {
     bool valid{false};
-    ImageEvent sample{};
+    ImageSample sample{};
     bool cadence_observed{false};
     bool sync_candidate_valid{false};
     uint64_t sync_candidate_sensor_timestamp_us{0};
@@ -375,7 +375,7 @@ class CameraFrameSync
 
   // 这里按“100Hz 图像基线 + 1kHz IMU + 100ms 级搜索窗口”留余量，不再保留 1k/2k 级大队列。
   static constexpr size_t imu_ingress_length = 128;
-  static constexpr size_t image_event_ingress_length = 32;
+  static constexpr size_t image_ingress_length = 32;
   static constexpr size_t pending_limit = 256;
   static constexpr size_t history_limit = 256;
   static constexpr uint32_t cadence_stable_gaps = 2;
@@ -425,12 +425,12 @@ class CameraFrameSync
     gyro_ingress_.Reset();
     accl_ingress_.Reset();
     quat_ingress_.Reset();
-    image_event_ingress_.Reset();
+    image_ingress_.Reset();
 
     pending_gyros_ = {};
     pending_accls_ = {};
     pending_quats_ = {};
-    pending_image_events_ = {};
+    pending_images_ = {};
     imu_history_ = {};
     relation_ = {};
 
@@ -467,9 +467,9 @@ class CameraFrameSync
         cadence, timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
   }
 
-  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const ImageEvent& image)
+  CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const ImageSample& image)
   {
-    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sensor_timestamp_us);
+    const uint64_t image_timestamp_us = image.sensor_timestamp_us;
     // probe 的 2T 图像 gap 是主动扰动，不算图像流失稳，但要推进图像侧基线。
     if (probe_pending_ && cadence_.image.stable && relation_.base_image_sensor_period_us != 0 &&
         cadence_.image.has_last_timestamp &&
@@ -493,7 +493,7 @@ class CameraFrameSync
     return update;
   }
 
-  void RecordStableImageAnchor(const ImageEvent& image)
+  void RecordStableImageAnchor(const ImageSample& image)
   {
     if (!cadence_.image.stable)
     {
@@ -574,6 +574,17 @@ class CameraFrameSync
     next_image = self->CommitImageAndLeaseNext();
   }
 
+  void PushCommittedImageTimestamp(uint64_t sensor_timestamp_us)
+  {
+    const QueuedImage image{
+        .sample = ImageSample{.sensor_timestamp_us = sensor_timestamp_us},
+    };
+    if (image_ingress_.Push(image) != LibXR::ErrorCode::OK)
+    {
+      overflowed_.store(true, std::memory_order_relaxed);
+    }
+  }
+
   ImageFrame* CommitImageAndLeaseNext()
   {
     ImageFrame* current_image = current_image_.GetData();
@@ -582,14 +593,18 @@ class CameraFrameSync
       return nullptr;
     }
 
+    PushCommittedImageTimestamp(current_image->timestamp_us);
+
     ImageData next_image;
     if (image_topic_.CreateData(next_image) != LibXR::ErrorCode::OK)
     {
+      ProcessPendingSyncWork();
       return current_image;
     }
 
     (void)image_topic_.Publish(current_image_);
     current_image_ = std::move(next_image);
+    ProcessPendingSyncWork();
     return current_image_.GetData();
   }
 
@@ -620,26 +635,13 @@ class CameraFrameSync
     }
   }
 
-  static void OnImageEventStatic(bool, Self* self, LibXR::RawData& data)
-  {
-    const auto& image_event = *reinterpret_cast<const ImageEvent*>(data.addr_);
-    if (self->image_event_ingress_.Push(QueuedImageEvent{.sample = image_event}) !=
-        LibXR::ErrorCode::OK)
-    {
-      self->overflowed_.store(true, std::memory_order_relaxed);
-    }
-
-    // 图像事件就是同步触发点：原始回调只入队，所有对齐状态都在这里串行推进。
-    self->ProcessPendingSyncWork();
-  }
-
   void ProcessPendingSyncWork()
   {
     LibXR::Mutex::LockGuard lock(sync_state_mutex_);
     DrainIngressQueues();
     HandleOverflowRecovery();
     MaybeSendProbe();
-    DrainPendingImageEvents();
+    DrainPendingImages();
   }
 
   void DrainIngressQueues()
@@ -677,10 +679,10 @@ class CameraFrameSync
       }
     }
 
-    QueuedImageEvent image_event{};
-    while (image_event_ingress_.Pop(image_event) == LibXR::ErrorCode::OK)
+    QueuedImage image{};
+    while (image_ingress_.Pop(image) == LibXR::ErrorCode::OK)
     {
-      if (pending_image_events_.PushBackDropOldest(image_event))
+      if (pending_images_.PushBackDropOldest(image))
       {
         overflowed_.store(true, std::memory_order_relaxed);
       }
@@ -707,32 +709,30 @@ class CameraFrameSync
     }
   }
 
-  void RememberObservedImage(const ImageEvent& image)
+  void RememberObservedImage(const ImageSample& image)
   {
     last_observed_image_.valid = true;
     last_observed_image_.sample = image;
   }
 
-  void DrainPendingImageEvents()
+  void DrainPendingImages()
   {
-    while (pending_image_.valid || !pending_image_events_.Empty())
+    while (pending_image_.valid || !pending_images_.Empty())
     {
       if (!pending_image_.valid)
       {
         pending_image_.valid = true;
-        pending_image_.sample = pending_image_events_.Front().sample;
-        pending_image_events_.PopFront();
+        pending_image_.sample = pending_images_.Front().sample;
+        pending_images_.PopFront();
       }
 
       PendingImageState& image = pending_image_;
       if (GetSyncMode() == SyncMode::LATEST_IMU)
       {
         // 兼容旧模式：不做 probe 锁定，直接把当前看到的最新 IMU 绑定给这张图像。
-        const uint64_t image_timestamp_us =
-            static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+        const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
         if (last_observed_image_.valid &&
-            image_timestamp_us <=
-                static_cast<uint64_t>(last_observed_image_.sample.sensor_timestamp_us))
+            image_timestamp_us <= last_observed_image_.sample.sensor_timestamp_us)
         {
           ClearPendingImage();
           ResetLockedRelation();
@@ -767,9 +767,9 @@ class CameraFrameSync
         continue;
       }
 
-      const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+      const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
       const uint64_t last_image_timestamp_us =
-          static_cast<uint64_t>(last_observed_image_.sample.sensor_timestamp_us);
+          last_observed_image_.sample.sensor_timestamp_us;
       if (image_timestamp_us <= last_image_timestamp_us)
       {
         ClearPendingImage();
@@ -906,7 +906,7 @@ class CameraFrameSync
            required_span_us;
   }
 
-  ImageDecision PublishMatchedImage(const ImageEvent& image,
+  ImageDecision PublishMatchedImage(const ImageSample& image,
                                     const SyncMatch& match)
   {
     // 先确定“同步帧是哪一条 IMU”，再只在 IMU 自己时间域里应用 offset 取最终样本。
@@ -924,7 +924,7 @@ class CameraFrameSync
 
     PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
     relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
-    relation_.last_image_sensor_timestamp_us = static_cast<uint64_t>(image.sensor_timestamp_us);
+    relation_.last_image_sensor_timestamp_us = image.sensor_timestamp_us;
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
     CameraFrameSyncCore::ObserveGoodFrame(lock_state_);
     return ImageDecision::ACCEPT;
@@ -1090,7 +1090,7 @@ class CameraFrameSync
 
   ImageDecision TryProcessSyncedImage(PendingImageState& image, uint64_t image_gap_sensor_us)
   {
-    const uint64_t image_timestamp_us = static_cast<uint64_t>(image.sample.sensor_timestamp_us);
+    const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
     if (relation_.last_image_sensor_timestamp_us == 0 ||
         relation_.last_sync_imu_sensor_timestamp_us == 0)
     {
@@ -1182,7 +1182,6 @@ class CameraFrameSync
   std::string gyro_topic_name_{};
   std::string accl_topic_name_{};
   std::string quat_topic_name_{};
-  std::string image_event_topic_name_{};
 
   ImageTopic image_topic_;
   ImageData current_image_{};
@@ -1191,24 +1190,22 @@ class CameraFrameSync
   LibXR::Topic gyro_topic_;
   LibXR::Topic accl_topic_;
   LibXR::Topic quat_topic_;
-  LibXR::Topic image_event_topic_;
   LibXR::Topic::Callback gyro_cb_{};
   LibXR::Topic::Callback accl_cb_{};
   LibXR::Topic::Callback quat_cb_{};
-  LibXR::Topic::Callback image_event_cb_{};
 
   // 每个回调各自入自己的 SPMC ingress，避免把多个 producer 压到同一个队列里。
   LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedImageEvent> image_event_ingress_{image_event_ingress_length};
+  LibXR::LockFreeQueue<QueuedImage> image_ingress_{image_ingress_length};
   std::atomic<bool> overflowed_{false};
 
-  // 下面这些状态只在 image_event 触发的串行路径里访问。
+  // 下面这些状态只在图像提交回调触发的串行路径里访问。
   FixedRingBuffer<QueuedGyro, pending_limit> pending_gyros_{};
   FixedRingBuffer<QueuedAccl, pending_limit> pending_accls_{};
   FixedRingBuffer<QueuedQuat, pending_limit> pending_quats_{};
-  FixedRingBuffer<QueuedImageEvent, pending_limit> pending_image_events_{};
+  FixedRingBuffer<QueuedImage, pending_limit> pending_images_{};
   FixedRingBuffer<AssembledImu, history_limit> imu_history_{};
   LibXR::Mutex sync_state_mutex_{};
 

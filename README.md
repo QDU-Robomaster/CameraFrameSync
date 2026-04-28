@@ -3,7 +3,7 @@
 `CameraFrameSync` 负责两件事：
 
 1. 承接 `CameraBase<Info>` 的图像 lease，并把图像发布到 `LinuxSharedTopic`
-2. 订阅原始 `gyro / accl / quat / image_event`，在模块内部完成图像与 IMU 对齐，再发布同步后的 `imu`
+2. 订阅原始 `gyro / accl / quat`，用图像提交时的 `ImageFrame::timestamp_us` 完成图像与 IMU 对齐，再发布同步后的 `imu`
 
 当前支持两种同步模式：
 
@@ -25,7 +25,6 @@
   - `<camera.Name()>_gyro`
   - `<camera.Name()>_accl`
   - `<camera.Name()>_quat`
-  - `<camera.Name()>_image_event`
 - 一次性同步探针命令
   - `sensor_sync_cmd`
 
@@ -39,7 +38,7 @@
 其中：
 
 - `sensor_sync_cmd` 是固定名字，不跟随相机名变化
-- 原始 `gyro / accl / quat / image_event` 前缀直接取 `camera.Name()`
+- 原始 `gyro / accl / quat` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
 - 可通过 `SetSyncMode(...)` 在 `RAW_PROBE / LATEST_IMU` 之间切换
 - 运行时只保留一个调节点：
@@ -61,7 +60,7 @@
 这版实现只使用**传感器侧时间戳**：
 
 - 原始 `gyro / accl / quat` 使用 `sensor_timestamp_us`
-- `image_event` 使用相机侧 `sensor_timestamp_us`
+- 图像使用 `ImageFrame::timestamp_us`
 - 同步主逻辑里已经**没有**主机到达时间戳
 
 约束也很明确：
@@ -77,11 +76,11 @@
 ## 数据流
 
 1. `gyro / accl / quat` 回调只入各自无锁 ingress 队列
-2. `image_event` 回调是唯一同步触发点
-3. 每次处理 `image_event` 时：
+2. 图像 sink commit 回调记录 `ImageFrame::timestamp_us`，它是唯一同步触发点
+3. 每次处理图像提交时：
    - 先排空四路 ingress
    - 再按 `gyro` 主时间轴组装原始 IMU 历史
-   - 最后串行处理待同步图像事件
+   - 最后串行处理待同步图像时间戳
    - 当前如果有一张图像还在等 offset 目标 IMU，就继续重试这一张，不会改成处理后面的图像
 
 ## 原始 IMU 组装
@@ -111,7 +110,7 @@
 
 - `OBSERVING`
   - 持续观察节拍并维护原始 IMU 历史
-  - `image_event` 和 `gyro` 节拍稳定后，才允许发一次 `sensor_sync_cmd`
+  - 图像提交和 `gyro` 节拍稳定后，才允许发一次 `sensor_sync_cmd`
 - `SYNCED`
   - 已经进入稳态跟踪
 
@@ -129,7 +128,7 @@
 这一节只适用于 `RAW_PROBE`。
 
 1. 持续观察节拍
-   - `image_event` cadence 稳定后记录正常图像基线周期 `T`
+   - 图像提交 cadence 稳定后记录正常图像基线周期 `T`
    - 原始 IMU 历史形成稳定周期后记录 `t`
 2. 根据 `T / t` 估算图像对应的 IMU 整数步长 `N`
 3. 自动发出一次 `sensor_sync_cmd`
@@ -222,7 +221,7 @@ reset 后会：
   - `queue_num = 2`
 - ingress 队列长度
   - `imu_ingress_length = 128`
-  - `image_event_ingress_length = 32`
+  - `image_ingress_length = 32`
 - 历史缓存长度
   - `pending_limit = 256`
   - `history_limit = 256`
