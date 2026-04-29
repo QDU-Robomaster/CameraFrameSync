@@ -5,6 +5,9 @@
 module_description: 相机共享图像桥与原始 imu 同步器
 constructor_args:
   camera: @camera
+  runtime:
+    mode: CameraFrameSync<Info>::SyncMode::RAW_PROBE
+    offset_us: 0
 template_args:
   - Info:
       width: 1280
@@ -69,6 +72,12 @@ class CameraFrameSync
   {
     RAW_PROBE = 0,  // 通过 sensor_sync_cmd 和节拍变化做显式重同步
     LATEST_IMU = 1,  // 认为图像与 IMU 已大致同步，图像直接取当前最新 IMU
+  };
+
+  struct RuntimeParam
+  {
+    SyncMode mode = SyncMode::RAW_PROBE;
+    int32_t offset_us = 0;
   };
 
   struct SyncedFrame
@@ -203,7 +212,14 @@ class CameraFrameSync
     bool latest_imu_valid_{false};
   };
 
-  CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera)
+  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+                  Base& camera)
+      : CameraFrameSync(hw, app, camera, RuntimeParam{})
+  {
+  }
+
+  CameraFrameSync(LibXR::HardwareContainer&, LibXR::ApplicationManager&, Base& camera,
+                  RuntimeParam runtime)
       : image_topic_name_(camera.ImageTopicNameView()),
         imu_topic_name_(camera.ImuTopicNameView()),
         sensor_name_([&camera]()
@@ -227,7 +243,9 @@ class CameraFrameSync
         quat_topic_(LibXR::Topic::FindOrCreate<QuatStamped>(quat_topic_name_.c_str())),
         gyro_cb_(LibXR::Topic::Callback::Create(OnGyroStatic, this)),
         accl_cb_(LibXR::Topic::Callback::Create(OnAcclStatic, this)),
-        quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this))
+        quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this)),
+        offset_us_(runtime.offset_us),
+        sync_mode_(runtime.mode)
   {
     if (!image_topic_.Valid())
     {

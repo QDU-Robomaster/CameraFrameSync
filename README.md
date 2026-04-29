@@ -40,10 +40,28 @@
 - `sensor_sync_cmd` 是固定名字，不跟随相机名变化
 - 原始 `gyro / accl / quat` 前缀直接取 `camera.Name()`
 - `camera.Name()` 必须非空；模块内部不再做隐式回退
-- 可通过 `SetSyncMode(...)` 在 `RAW_PROBE / LATEST_IMU` 之间切换
+- 可通过 YAML 构造参数或 `SetSyncMode(...)` 在 `RAW_PROBE / LATEST_IMU` 之间切换
 - 运行时只保留一个调节点：
   - `offset_us`
   - 它表示在 IMU 自己的 `sensor_timestamp_us` 时间域里，对最终取样位置做常量平移
+
+## YAML 配置
+
+`CameraFrameSync` 默认保持实机路径的 `RAW_PROBE`：
+
+```yaml
+constructor_args:
+  camera: '@camera'
+```
+
+需要文件回放或已经对齐的数据源时，在 YAML 里直接传 `RuntimeParam`：
+
+```yaml
+constructor_args:
+  camera: '@camera'
+  runtime:
+    expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::LATEST_IMU, .offset_us = 0}"
+```
 
 ## 当前同步策略
 
