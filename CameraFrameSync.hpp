@@ -38,6 +38,7 @@ depends:
 #include "camera_frame_sync_core.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
+#include "logger.hpp"
 
 template <CameraTypes::CameraInfo CameraInfoV>
 class CameraFrameSync
@@ -250,6 +251,12 @@ class CameraFrameSync
     gyro_topic_.RegisterCallback(gyro_cb_);
     accl_topic_.RegisterCallback(accl_cb_);
     quat_topic_.RegisterCallback(quat_cb_);
+
+    XR_LOG_INFO(
+        "CameraFrameSync: enabled sensor=%s image=%s imu=%s raw=%s/%s/%s mode=%s",
+        sensor_name_.c_str(), image_topic_name_.c_str(), imu_topic_name_.c_str(),
+        gyro_topic_name_.c_str(), accl_topic_name_.c_str(), quat_topic_name_.c_str(),
+        SyncModeName(GetSyncMode()));
   }
 
   ~CameraFrameSync() = default;
@@ -270,18 +277,22 @@ class CameraFrameSync
 
   void SetSyncMode(SyncMode mode)
   {
-    if (GetSyncMode() == mode)
+    const SyncMode old_mode = GetSyncMode();
+    if (old_mode == mode)
     {
       return;
     }
 
     LibXR::Mutex::LockGuard lock(sync_state_mutex_);
-    if (GetSyncMode() == mode)
+    const SyncMode locked_old_mode = GetSyncMode();
+    if (locked_old_mode == mode)
     {
       return;
     }
 
     sync_mode_.store(mode, std::memory_order_relaxed);
+    XR_LOG_INFO("CameraFrameSync: mode %s -> %s, runtime state reset",
+                SyncModeName(locked_old_mode), SyncModeName(mode));
     ResetRuntimeState();
   }
 
@@ -290,6 +301,18 @@ class CameraFrameSync
   using SyncState = CameraFrameSyncCore::SyncState;
   template <typename T, size_t Capacity>
   using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
+
+  static const char* SyncModeName(SyncMode mode)
+  {
+    switch (mode)
+    {
+      case SyncMode::RAW_PROBE:
+        return "RAW_PROBE";
+      case SyncMode::LATEST_IMU:
+        return "LATEST_IMU";
+    }
+    return "UNKNOWN";
+  }
 
   struct QueuedGyro
   {
@@ -411,17 +434,28 @@ class CameraFrameSync
     ResetImageObservation();
   }
 
-  void SetObservingState()
+  void SetObservingState(const char* reason, const char* detail = "")
   {
+    const SyncState old_state = lock_state_.state;
     lock_state_.state = SyncState::OBSERVING;
+    if (old_state != SyncState::OBSERVING)
+    {
+      XR_LOG_WARN(
+          "CameraFrameSync: state SYNCED -> OBSERVING reason=%s detail=%s mode=%s "
+          "image_period_us=%u imu_period_us=%u sync_period_us=%u",
+          reason, detail, SyncModeName(GetSyncMode()),
+          static_cast<unsigned>(relation_.base_image_sensor_period_us),
+          static_cast<unsigned>(relation_.last_imu_sensor_period_us),
+          static_cast<unsigned>(relation_.sync_imu_sensor_period_us));
+    }
   }
 
-  void ResetSyncTracking()
+  void ResetSyncTracking(const char* reason, const char* detail = "")
   {
     ClearPendingProbe();
     ResetLockedRelation();
     ResetImageObservation();
-    SetObservingState();
+    SetObservingState(reason, detail);
   }
 
   void ResetRuntimeState()
@@ -443,7 +477,7 @@ class CameraFrameSync
     ClearPendingProbe();
     ResetLockedRelation();
     ResetCadenceObservation();
-    SetObservingState();
+    SetObservingState("runtime-reset");
   }
 
   bool CadenceReady() const
@@ -451,7 +485,7 @@ class CameraFrameSync
     return cadence_.gyro.stable && cadence_.image.stable;
   }
 
-  void ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate update)
+  void ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate update, const char* channel)
   {
     switch (update)
     {
@@ -460,15 +494,18 @@ class CameraFrameSync
       case CameraFrameSyncCore::CadenceUpdate::STABLE:
         break;
       case CameraFrameSyncCore::CadenceUpdate::BROKEN:
-        ResetSyncTracking();
+        ResetSyncTracking("cadence-broken", channel);
         break;
     }
   }
 
-  void ObserveSampleCadence(CameraFrameSyncCore::CadenceState& cadence, uint64_t timestamp_us)
+  void ObserveSampleCadence(CameraFrameSyncCore::CadenceState& cadence, uint64_t timestamp_us,
+                            const char* channel)
   {
     ObserveCadenceUpdate(CameraFrameSyncCore::ObserveCadence(
-        cadence, timestamp_us, cadence_stable_gaps, raw_cadence_min_tolerance_us));
+                             cadence, timestamp_us, cadence_stable_gaps,
+                             raw_cadence_min_tolerance_us),
+                         channel);
   }
 
   CameraFrameSyncCore::CadenceUpdate ObserveImageCadence(const ImageSample& image)
@@ -485,7 +522,7 @@ class CameraFrameSync
           ImageGapToleranceUs(relation_))
       {
         cadence_.image.last_timestamp_us = image_timestamp_us;
-        ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate::STABLE);
+        ObserveCadenceUpdate(CameraFrameSyncCore::CadenceUpdate::STABLE, "image");
         return CameraFrameSyncCore::CadenceUpdate::STABLE;
       }
     }
@@ -493,7 +530,7 @@ class CameraFrameSync
     const auto update = CameraFrameSyncCore::ObserveCadence(
         cadence_.image, image_timestamp_us, cadence_stable_gaps,
         image_cadence_min_tolerance_us);
-    ObserveCadenceUpdate(update);
+    ObserveCadenceUpdate(update, "image");
     return update;
   }
 
@@ -654,7 +691,7 @@ class CameraFrameSync
     while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
     {
       ObserveSampleCadence(cadence_.gyro,
-                           static_cast<uint64_t>(gyro.sample.sensor_timestamp_us));
+                           static_cast<uint64_t>(gyro.sample.sensor_timestamp_us), "gyro");
       if (pending_gyros_.PushBackDropOldest(gyro))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -665,7 +702,7 @@ class CameraFrameSync
     while (accl_ingress_.Pop(accl) == LibXR::ErrorCode::OK)
     {
       ObserveSampleCadence(cadence_.accl,
-                           static_cast<uint64_t>(accl.sample.sensor_timestamp_us));
+                           static_cast<uint64_t>(accl.sample.sensor_timestamp_us), "accl");
       if (pending_accls_.PushBackDropOldest(accl))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -676,7 +713,7 @@ class CameraFrameSync
     while (quat_ingress_.Pop(quat) == LibXR::ErrorCode::OK)
     {
       ObserveSampleCadence(cadence_.quat,
-                           static_cast<uint64_t>(quat.sample.sensor_timestamp_us));
+                           static_cast<uint64_t>(quat.sample.sensor_timestamp_us), "quat");
       if (pending_quats_.PushBackDropOldest(quat))
       {
         overflowed_.store(true, std::memory_order_relaxed);
@@ -741,7 +778,7 @@ class CameraFrameSync
           ClearPendingImage();
           ResetLockedRelation();
           ResetImageObservation();
-          SetObservingState();
+          SetObservingState("image-out-of-order", "LATEST_IMU");
           continue;
         }
 
@@ -780,7 +817,7 @@ class CameraFrameSync
         ClearPendingProbe();
         ResetLockedRelation();
         ResetCadenceObservation();
-        SetObservingState();
+        SetObservingState("image-out-of-order", "RAW_PROBE");
         continue;
       }
 
@@ -845,7 +882,7 @@ class CameraFrameSync
         ClearPendingProbe();
       }
       ClearPendingImage();
-      ResetSyncTracking();
+      ResetSyncTracking("image-rejected", probe_pending ? "probe" : "synced");
       MaybeSendProbe();
     }
   }
@@ -862,8 +899,9 @@ class CameraFrameSync
       return;
     }
 
+    const uint64_t expected_sync_period_us = EstimatedSyncImuSensorPeriodUs();
     if (!CadenceReady() || relation_.base_image_sensor_period_us == 0 ||
-        EstimatedSyncImuSensorPeriodUs() == 0 || !last_normal_image_.valid)
+        expected_sync_period_us == 0 || !last_normal_image_.valid)
     {
       return;
     }
@@ -876,6 +914,12 @@ class CameraFrameSync
     // 下位机只需要做一次 2T 探针，观察到节拍变化后就会自动恢复正常频率。
     sensor_sync_cmd_topic_.Publish(cmd);
     probe_pending_ = true;
+    XR_LOG_INFO(
+        "CameraFrameSync: sensor_sync_cmd sent image_period_us=%u imu_period_us=%u "
+        "expected_sync_period_us=%u",
+        static_cast<unsigned>(relation_.base_image_sensor_period_us),
+        static_cast<unsigned>(relation_.last_imu_sensor_period_us),
+        static_cast<unsigned>(expected_sync_period_us));
   }
 
   ImageDecision TryProcessLatestImuImage(PendingImageState& image)
@@ -930,7 +974,20 @@ class CameraFrameSync
     relation_.sync_imu_sensor_period_us = match.next_sync_sensor_period_us;
     relation_.last_image_sensor_timestamp_us = image.sensor_timestamp_us;
     relation_.last_sync_imu_sensor_timestamp_us = match.sync_imu->sensor_timestamp_us;
+    const SyncState old_state = lock_state_.state;
     CameraFrameSyncCore::ObserveGoodFrame(lock_state_);
+    if (old_state != lock_state_.state)
+    {
+      XR_LOG_PASS(
+          "CameraFrameSync: state OBSERVING -> SYNCED mode=%s "
+          "image_period_us=%u imu_period_us=%u "
+          "sync_period_us=%u stride=%u offset_us=%d",
+          SyncModeName(GetSyncMode()),
+          static_cast<unsigned>(relation_.base_image_sensor_period_us),
+          static_cast<unsigned>(relation_.last_imu_sensor_period_us),
+          static_cast<unsigned>(relation_.sync_imu_sensor_period_us),
+          static_cast<unsigned>(EstimatedStrideSamples()), static_cast<int>(offset_us));
+    }
     return ImageDecision::ACCEPT;
   }
 
@@ -1171,11 +1228,12 @@ class CameraFrameSync
   {
     if (overflowed_.exchange(false, std::memory_order_relaxed))
     {
+      XR_LOG_WARN("CameraFrameSync: queue overflow, runtime state reset");
       ClearPendingImage();
       ClearPendingProbe();
       ResetLockedRelation();
       ResetCadenceObservation();
-      SetObservingState();
+      SetObservingState("queue-overflow");
     }
   }
 

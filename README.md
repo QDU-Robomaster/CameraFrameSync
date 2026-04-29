@@ -204,6 +204,23 @@ reset 后会：
 - 清掉图像基线
 - 立刻回到 `OBSERVING`
 
+## 运行日志
+
+模块只在低频状态边界打日志，不在 IMU 回调或每帧稳态路径刷屏。
+
+会打日志的情况：
+
+- 模块启用，记录图像话题、同步 IMU 话题、原始 IMU 话题和当前模式
+- `SetSyncMode(...)` 切换模式并清空运行状态
+- `RAW_PROBE` 发出一次 `sensor_sync_cmd`
+- 状态从 `OBSERVING` 进入 `SYNCED`
+- 状态从 `SYNCED` 回到 `OBSERVING`，并记录 reset 原因
+- ingress / history 溢出触发同步状态清空
+
+正常稳态下不应该持续出现 `SYNCED -> OBSERVING`。如果出现，优先看日志里的
+`reason` 和 `detail` 字段，例如 `cadence-broken / gyro`、`image-rejected / synced`
+或 `queue-overflow`。
+
 ## `Subscriber` 语义
 
 `Subscriber::Wait()` 仍然保持严格匹配：
