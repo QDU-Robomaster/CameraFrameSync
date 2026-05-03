@@ -106,7 +106,6 @@ class CameraFrameSync
         "camera_sync_command";  ///< CameraSync 命令 topic。
     std::string_view sync_result_topic_name =
         "camera_sync_result";           ///< CameraSync 回执 topic。
-    std::string_view raw_imu_topic_prefix = {};  ///< 原始 IMU topic 前缀，空值沿用相机名。
     uint32_t sync_probe_div = 3;         ///< MCU 临时分频系数。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
   };
@@ -207,9 +206,7 @@ class CameraFrameSync
           host_domain_name(runtime.host_topic_domain_name),
           sync_command_name(runtime.sync_command_topic_name),
           sync_result_name(runtime.sync_result_topic_name),
-          raw_imu_prefix(runtime.raw_imu_topic_prefix.empty()
-                             ? camera.NameView()
-                             : runtime.raw_imu_topic_prefix),
+          raw_imu_prefix(camera.NameView()),
           gyro_name(raw_imu_prefix + "_gyro"),
           accl_name(raw_imu_prefix + "_accl"),
           quat_name(raw_imu_prefix + "_quat"),
@@ -285,21 +282,6 @@ class CameraFrameSync
   {
     uint64_t sensor_timestamp_us{};
     QuatSample rotation_wxyz{};
-  };
-
-  struct QueuedGyro
-  {
-    GyroSample sample{};
-  };
-
-  struct QueuedAccl
-  {
-    AcclSample sample{};
-  };
-
-  struct QueuedQuat
-  {
-    QuatReading sample{};
   };
 
   struct ImageSample
@@ -412,14 +394,14 @@ class CameraFrameSync
 
   ImageData current_image_{};
 
-  LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<GyroSample> gyro_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<AcclSample> accl_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<QuatReading> quat_ingress_{imu_ingress_length};
   std::atomic<bool> overflowed_{false};
 
-  DropOldestQueue<QueuedGyro> pending_gyros_{pending_limit};
-  DropOldestQueue<QueuedAccl> pending_accls_{pending_limit};
-  DropOldestQueue<QueuedQuat> pending_quats_{pending_limit};
+  DropOldestQueue<GyroSample> pending_gyros_{pending_limit};
+  DropOldestQueue<AcclSample> pending_accls_{pending_limit};
+  DropOldestQueue<QuatReading> pending_quats_{pending_limit};
   DropOldestQueue<ImageSample> image_events_{image_event_limit};
   SampleHistory<AssembledImu, history_limit> imu_history_{};
 
