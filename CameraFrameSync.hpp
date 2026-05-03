@@ -43,6 +43,12 @@ depends:
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
 
+/**
+ * @brief 图像共享发布与相机/IMU 同步模块。
+ *
+ * 图像由 `CameraBase` sink 提交，原始 gyro/accl/quat 由普通 Topic 回调进入
+ * ingress 队列。同步处理只在图像提交路径串行运行，不启用额外同步线程。
+ */
 template <CameraTypes::CameraInfo CameraInfoV>
 class CameraFrameSync
 {
@@ -69,24 +75,37 @@ class CameraFrameSync
 
   enum class SyncMode : uint8_t
   {
-    RAW_PROBE = 0,  // 通过 sensor_sync_cmd 和节拍变化做显式重同步
-    LATEST_IMU = 1,  // 认为图像与 IMU 已大致同步，图像直接取当前最新 IMU
+    RAW_PROBE = 0,  ///< 通过 sensor_sync_cmd 和节拍变化做显式重同步。
+    LATEST_IMU = 1,  ///< 数据源已经同步时，图像直接绑定当前最新 IMU。
   };
 
+  /**
+   * @brief 运行时同步参数。
+   *
+   * `offset_us` 只在 IMU 传感器时间域内生效，用于从同步基准样本平移到
+   * 最终发布样本；它不是相机时间戳和 IMU 时间戳之间的绝对偏移。
+   */
   struct RuntimeParam
   {
-    SyncMode mode = SyncMode::RAW_PROBE;
-    int32_t offset_us = 0;
+    SyncMode mode = SyncMode::RAW_PROBE;  ///< 默认走实机显式探针同步。
+    int32_t offset_us = 0;  ///< IMU 域内最终取样偏移，单位微秒。
   };
 
+  /// 下游消费到的一张共享图像和同 timestamp 的同步 IMU。
   struct SyncedFrame
   {
-    ImageData image{};
-    ImuStamped imu{};
+    ImageData image{};  ///< 共享图像 lease，生命周期由 ImageData 持有。
+    ImuStamped imu{};  ///< 与图像 timestamp 完全匹配的同步后 IMU。
 
     const ImageFrame* GetImageFrame() const { return image.GetData(); }
   };
 
+  /**
+   * @brief 下游阻塞式消费者。
+   *
+   * 先等待一张共享图像，再等待 timestamp 完全相同的同步 IMU。这里不参与原始
+   * IMU 重同步，也不缓存多帧图像。
+   */
   class Subscriber
   {
    public:
@@ -282,6 +301,7 @@ class CameraFrameSync
 
   const char* ImuTopicName() const { return imu_topic_name_.c_str(); }
 
+  /// 更新 IMU 域内最终取样偏移；不会清空当前锁定关系。
   void SetOffsetUs(int32_t offset_us)
   {
     offset_us_.store(offset_us, std::memory_order_relaxed);
@@ -292,6 +312,7 @@ class CameraFrameSync
     return sync_mode_.load(std::memory_order_relaxed);
   }
 
+  /// 切换同步模式并清空运行时状态。
   void SetSyncMode(SyncMode mode)
   {
     const SyncMode old_mode = GetSyncMode();
@@ -817,7 +838,7 @@ class CameraFrameSync
       PendingImageState& image = pending_image_;
       if (GetSyncMode() == SyncMode::LATEST_IMU)
       {
-        // 兼容旧模式：不做 probe 锁定，直接把当前看到的最新 IMU 绑定给这张图像。
+        // 兼容已同步数据源：不做 probe 锁定，直接把当前最新 IMU 绑定给这张图像。
         const uint64_t image_timestamp_us = image.sample.sensor_timestamp_us;
         if (last_observed_image_.valid &&
             image_timestamp_us <= last_observed_image_.sample.sensor_timestamp_us)
@@ -1303,7 +1324,7 @@ class CameraFrameSync
   LibXR::Topic::Callback accl_cb_{};
   LibXR::Topic::Callback quat_cb_{};
 
-  // 每个回调各自入自己的 SPMC ingress，避免把多个 producer 压到同一个队列里。
+  // 每路回调各自进入独立 SPMC ingress，避免多路发布端抢同一个队列。
   LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};

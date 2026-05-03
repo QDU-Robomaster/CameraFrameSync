@@ -11,6 +11,7 @@ namespace CameraFrameSyncCore
 // 这里只保留同步器和序列测试共享的“纯时序工具”。
 // 具体状态机仍放在 CameraFrameSync 里，避免 helper 继续膨胀成另一套框架。
 
+/// 固定容量环形缓存；满时由调用者选择是否丢弃旧数据。
 template <typename T, size_t Capacity>
 class FixedRingBuffer
 {
@@ -105,6 +106,7 @@ enum class CadenceUpdate : uint8_t
   BROKEN = 3,
 };
 
+/// 单路传感器或图像流的周期观察状态。
 struct CadenceState
 {
   bool has_last_timestamp{false};
@@ -135,6 +137,7 @@ inline uint64_t ApplyOffsetUs(uint64_t base_us, int32_t offset_us)
   return base_us > abs_offset ? (base_us - abs_offset) : 0ULL;
 }
 
+/// 根据相机周期和 IMU 周期估算一帧图像跨过多少个 IMU 样本。
 inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_period_us)
 {
   if (image_period_us == 0 || imu_period_us == 0)
@@ -147,12 +150,14 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
   return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
 }
 
+/// 图像侧周期容差；下限覆盖 Webots/实机触发抖动，比例项覆盖低帧率。
 inline uint64_t ImageGapToleranceUs(uint64_t image_period_us)
 {
   const uint64_t upper = image_period_us != 0 ? (image_period_us / 3U) : 3000ULL;
   return std::max<uint64_t>(1500ULL, upper);
 }
 
+/// offset 最终样本搜索容差，只在 IMU 时间域内使用。
 inline uint64_t OffsetSearchToleranceUs(uint64_t imu_sensor_period_us, uint32_t stride_samples)
 {
   const uint64_t base =
@@ -162,6 +167,7 @@ inline uint64_t OffsetSearchToleranceUs(uint64_t imu_sensor_period_us, uint32_t 
   return std::max<uint64_t>(4000ULL, base);
 }
 
+/// 同步 IMU 间隔容差，用于 probe 锁定和稳态递推。
 inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
                                          uint64_t imu_sensor_period_us)
 {
@@ -171,6 +177,7 @@ inline uint64_t SyncSensorGapToleranceUs(uint64_t sync_sensor_gap_us,
   return std::max<uint64_t>(4000ULL, base);
 }
 
+/// 更新单路 cadence；一旦稳定后失稳，会返回 BROKEN 触发上层重锁。
 inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us,
                                     uint32_t required_stable_gaps,
                                     uint64_t min_tolerance_us)
@@ -256,6 +263,7 @@ inline void ObserveGoodFrame(SyncLockState& lock_state)
   lock_state.state = SyncState::SYNCED;
 }
 
+/// 单路样本查找结果。
 enum class ChannelSampleSearchResult : uint8_t
 {
   WAIT = 0,
@@ -263,6 +271,7 @@ enum class ChannelSampleSearchResult : uint8_t
   MISSED = 2,
 };
 
+/// 为 gyro 主时间轴选择同一 IMU 周期内最近的 accl/quat 样本。
 template <typename PendingSampleContainer>
 ChannelSampleSearchResult SelectNearestChannelSampleIndex(
     const PendingSampleContainer& pending_samples, uint64_t anchor_sensor_timestamp_us,
@@ -344,6 +353,7 @@ ChannelSampleSearchResult SelectNearestChannelSampleIndex(
   return ChannelSampleSearchResult::WAIT;
 }
 
+/// 尝试用队首 gyro 组装一条完整 IMU；accl/quat 必须落在合法窗口内。
 template <typename PendingGyroContainer, typename PendingAcclContainer,
           typename PendingQuatContainer, typename ImuHistoryContainer,
           typename MakeImuFn>
