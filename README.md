@@ -3,7 +3,7 @@
 `CameraFrameSync` 是相机帧和 IMU 的同步桥：
 
 - 从 `CameraBase<Info>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
-- 按配置的前缀订阅原始 `gyro / accl / quat`
+- 按相机名订阅原始 `gyro / accl / quat`
 - 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
 
 模块不创建线程。原始 IMU 只在 Topic 回调里入队；`CameraSync` 回执只记录当前 probe 的命中结果。状态机只在图像提交时推进。
@@ -13,9 +13,9 @@
 输入：
 
 - 图像：`CameraBase<Info>::RegisterImageSink(...)`
-- 原始陀螺：`<raw_imu_topic_prefix>_gyro`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
-- 原始加速度：`<raw_imu_topic_prefix>_accl`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
-- 原始姿态：`<raw_imu_topic_prefix>_quat`，payload 为 `LibXR::Quaternion<float>`
+- 原始陀螺：`<camera_name>_gyro`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
+- 原始加速度：`<camera_name>_accl`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
+- 原始姿态：`<camera_name>_quat`，payload 为 `LibXR::Quaternion<float>`
 - 同步回执：`camera_sync_result`，payload 为 `CameraSync::SyncEvent`
 
 输出：
@@ -24,7 +24,7 @@
 - 同步 IMU topic：`camera.ImuTopicName()`
 - 同步命令：`camera_sync_command`，payload 为 `CameraSync::SyncCommand`
 
-实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。`raw_imu_topic_prefix` 为空时沿用 `camera.Name()`，实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，应显式配成 `gimbal`。
+实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。原始 IMU topic 由 `camera.Name()` 派生；实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，相机运行配置里的 `camera_name` 应设为 `gimbal`，图像 topic 和同步后 IMU topic 仍可单独配置。
 
 ## 时间戳契约
 
@@ -127,7 +127,7 @@ Webots / 实机可显式配置同步 topic：
 
 ```yaml
 runtime:
-  expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::RAW_PROBE, .offset_us = 0, .host_topic_domain_name = \"host\", .sync_command_topic_name = \"camera_sync_command\", .sync_result_topic_name = \"camera_sync_result\", .raw_imu_topic_prefix = \"gimbal\", .sync_probe_div = 3, .sync_active_level = 1}"
+  expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::RAW_PROBE, .offset_us = 0, .host_topic_domain_name = \"host\", .sync_command_topic_name = \"camera_sync_command\", .sync_result_topic_name = \"camera_sync_result\", .sync_probe_div = 3, .sync_active_level = 1}"
 ```
 
 ## 日志
