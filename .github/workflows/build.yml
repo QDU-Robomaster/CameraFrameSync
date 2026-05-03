@@ -31,7 +31,7 @@ jobs:
 
           int main() {
               LibXR::PlatformInit();
-              LibXR::STDIO::Printf<"This is XRobot Module Template Test\n">();
+              LibXR::STDIO::Printf<"CameraFrameSync module CI\n">();
               LibXR::HardwareContainer hw;
               XRobotMain(hw);
               return 0;
@@ -175,9 +175,9 @@ jobs:
           EOF
           cat User/xrobot.yaml
 
-      - name: Generate main again
+      - name: Generate main
         run: |
-          xrobot_setup
+          xrobot_gen_main --config User/xrobot.yaml --output User/xrobot_main.hpp
 
       - name: Build
         run: |
@@ -185,6 +185,12 @@ jobs:
           cd build
           cmake ..
           make
+
+      - name: Run sequence tests
+        run: |
+          cmake -S Modules/${XR_MODULE_NAME}/tests -B build_sequence
+          cmake --build build_sequence
+          ./build_sequence/camera_frame_sync_sequence_test
 
       - name: Create Tag via GitHub API
         if: ${{ success() && github.event_name != 'pull_request' }}

@@ -35,12 +35,6 @@ struct Imu
   uint64_t quat_timestamp_us{};
 };
 
-struct SyncAck
-{
-  uint32_t seq{};
-  uint64_t imu_sensor_timestamp_us{};
-};
-
 enum class SyncMode : uint8_t
 {
   RAW_PROBE = 0,
@@ -78,13 +72,22 @@ class SequenceHarness
 
   void PushSyncAck(uint32_t seq, uint64_t timestamp_us)
   {
-    acks_.PushBackDropOldest({seq, timestamp_us});
+    if (active_probe_seq_ == 0 || seq != active_probe_seq_)
+    {
+      return;
+    }
+    if (probe_ack_seq_ == seq)
+    {
+      return;
+    }
+
+    probe_ack_timestamp_us_ = timestamp_us;
+    probe_ack_seq_ = seq;
   }
 
   void Drain()
   {
     AssembleImuHistory();
-    ConsumeAcks();
     ProcessImages();
   }
 
@@ -144,7 +147,6 @@ class SequenceHarness
     accls_.Clear();
     quats_.Clear();
     images_.Clear();
-    acks_.Clear();
     history_.Clear();
     history_timestamps_.clear();
     pending_image_ = {};
@@ -154,8 +156,7 @@ class SequenceHarness
     state_ = SyncState::OBSERVING;
     last_image_valid_ = false;
     last_image_timestamp_us_ = 0;
-    probe_ack_valid_ = false;
-    probe_ack_timestamp_us_ = 0;
+    ClearPendingProbe();
     last_probe_seq_ = 0;
     probe_sent_count_ = 0;
   }
@@ -165,6 +166,13 @@ class SequenceHarness
     state_ = SyncState::OBSERVING;
     relation_.sync_period_us = 0;
     relation_.last_sync_imu_timestamp_us = 0;
+    ClearPendingProbe();
+  }
+
+  void ClearPendingProbe()
+  {
+    active_probe_seq_ = 0;
+    probe_ack_seq_ = 0;
     probe_ack_valid_ = false;
     probe_ack_timestamp_us_ = 0;
   }
@@ -231,20 +239,6 @@ class SequenceHarness
       relation_.imu_period_us = imu_cadence_.period_us;
     }
     return true;
-  }
-
-  void ConsumeAcks()
-  {
-    while (!acks_.Empty())
-    {
-      const SyncAck ack = acks_.Front();
-      acks_.PopFront();
-      if (state_ == SyncState::PROBE_SENT && ack.seq == last_probe_seq_)
-      {
-        probe_ack_valid_ = true;
-        probe_ack_timestamp_us_ = ack.imu_sensor_timestamp_us;
-      }
-    }
   }
 
   void ProcessImages()
@@ -390,11 +384,17 @@ class SequenceHarness
     last_probe_seq_ = next_seq_++;
     probe_sent_count_++;
     probe_ack_valid_ = false;
+    probe_ack_seq_ = 0;
     probe_ack_timestamp_us_ = 0;
+    active_probe_seq_ = last_probe_seq_;
   }
 
   Decision TryProbeImage(PendingImage& image)
   {
+    if (!probe_ack_valid_ && probe_ack_seq_ == last_probe_seq_)
+    {
+      probe_ack_valid_ = true;
+    }
     if (!probe_ack_valid_)
     {
       return Decision::WAIT;
@@ -481,6 +481,7 @@ class SequenceHarness
     relation_.sync_period_us = match.sync_period_us;
     relation_.last_sync_imu_timestamp_us = match.sync_imu->sensor_timestamp_us;
     state_ = SyncState::SYNCED;
+    ClearPendingProbe();
     RememberImage(image.event.sensor_timestamp_us);
     return Decision::DONE;
   }
@@ -522,7 +523,6 @@ class SequenceHarness
   Ring<Raw3, limit> accls_{};
   Ring<Raw4, limit> quats_{};
   Ring<ImageEvent, limit> images_{};
-  Ring<SyncAck, limit> acks_{};
   Ring<Imu, limit> history_{};
 
   SyncMode mode_{SyncMode::RAW_PROBE};
@@ -538,6 +538,8 @@ class SequenceHarness
   uint32_t next_seq_{1};
   uint32_t last_probe_seq_{0};
   uint32_t probe_sent_count_{0};
+  uint32_t active_probe_seq_{0};
+  uint32_t probe_ack_seq_{0};
   bool probe_ack_valid_{false};
   uint64_t probe_ack_timestamp_us_{0};
 

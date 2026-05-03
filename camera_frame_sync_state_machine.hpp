@@ -173,13 +173,18 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   cmd.div = sync_probe_div_;
   cmd.active_level = sync_active_level_;
   cmd.seq = next_sync_seq_++;
-  sync_command_topic_.Publish(cmd);
 
   state_ = SyncState::PROBE_SENT;
   pending_probe_seq_ = cmd.seq;
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;
   relation_.sync_period_us = sync_period_us;
+  // 先启用当前 probe 再发布命令，避免同步回环里的早到回执丢失。
+  probe_ack_timestamp_us_.store(0);
+  probe_ack_seq_.store(0);
+  active_probe_seq_.store(cmd.seq);
+
+  sync_command_topic_.Publish(cmd);
 
   XR_LOG_INFO(
       "CameraFrameSync: sync command sent seq=%u div=%u active=%u image_period_us=%u imu_period_us=%u sync_period_us=%u",
@@ -196,6 +201,11 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
     typename CameraFrameSync<CameraInfoV>::PendingImage& image)
 {
   const uint64_t sync_period_us = EstimatedSyncPeriodUs();
+  if (!pending_probe_ack_valid_ && probe_ack_seq_.load() == pending_probe_seq_)
+  {
+    pending_probe_ack_valid_ = true;
+    pending_probe_imu_timestamp_us_ = probe_ack_timestamp_us_.load();
+  }
   if (sync_period_us == 0 || !pending_probe_ack_valid_)
   {
     return ImageDecision::WAIT;
@@ -431,6 +441,9 @@ void CameraFrameSync<CameraInfoV>::ResetImageObservation()
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ClearPendingProbe()
 {
+  active_probe_seq_.store(0);
+  probe_ack_seq_.store(0);
+  probe_ack_timestamp_us_.store(0);
   pending_probe_seq_ = 0;
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;

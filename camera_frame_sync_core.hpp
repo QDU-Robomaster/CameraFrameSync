@@ -9,6 +9,11 @@
 namespace CameraFrameSyncCore
 {
 
+/**
+ * @brief 固定容量环形缓存，满时写入新值并丢弃最旧值。
+ *
+ * 该类型不做线程同步，只用于 CameraFrameSync 状态机线程内的短历史缓存。
+ */
 template <typename T, size_t Capacity>
 class FixedRingBuffer
 {
@@ -17,20 +22,50 @@ class FixedRingBuffer
 
   static_assert(Capacity > 0, "FixedRingBuffer requires non-zero capacity");
 
+  /**
+   * @brief 是否为空。
+   */
   bool Empty() const { return size_ == 0; }
+
+  /**
+   * @brief 当前元素数量。
+   */
   size_t Size() const { return size_; }
+
+  /**
+   * @brief 返回最旧元素。
+   */
   const T& Front() const { return storage_[head_]; }
+
+  /**
+   * @brief 返回最新元素。
+   */
   const T& Back() const { return storage_[PhysicalIndex(size_ - 1)]; }
 
+  /**
+   * @brief 按从旧到新的逻辑下标访问元素。
+   */
   T& operator[](size_t index) { return storage_[PhysicalIndex(index)]; }
+
+  /**
+   * @brief 按从旧到新的逻辑下标访问元素。
+   */
   const T& operator[](size_t index) const { return storage_[PhysicalIndex(index)]; }
 
+  /**
+   * @brief 清空缓存。
+   */
   void Clear()
   {
     head_ = 0;
     size_ = 0;
   }
 
+  /**
+   * @brief 追加元素，容量满时丢弃最旧元素。
+   *
+   * @return true 表示发生了丢弃。
+   */
   bool PushBackDropOldest(const T& value)
   {
     if (size_ < Capacity)
@@ -45,6 +80,9 @@ class FixedRingBuffer
     return true;
   }
 
+  /**
+   * @brief 丢弃最旧元素。
+   */
   void PopFront()
   {
     if (size_ == 0)
@@ -70,35 +108,50 @@ class FixedRingBuffer
   size_t size_{0};
 };
 
+/**
+ * @brief RAW_PROBE 同步状态。
+ */
 enum class SyncState : uint8_t
 {
-  OBSERVING = 0,
-  PROBE_SENT = 1,
-  SYNCED = 2,
+  OBSERVING = 0,   ///< 正在观察稳定图像周期和 IMU 周期。
+  PROBE_SENT = 1,  ///< 已发送同步探针，等待 probe 图像和回执。
+  SYNCED = 2,      ///< 已锁定同步关系。
 };
 
+/**
+ * @brief 周期观察结果。
+ */
 enum class CadenceUpdate : uint8_t
 {
-  NO_GAP = 0,
-  WARMING = 1,
-  STABLE = 2,
-  BROKEN = 3,
+  NO_GAP = 0,  ///< 第一条样本，还没有周期信息。
+  WARMING = 1,  ///< 周期尚未稳定。
+  STABLE = 2,  ///< 周期稳定。
+  BROKEN = 3,  ///< 已稳定周期被新样本打破。
 };
 
+/**
+ * @brief 单路传感器或图像发布周期的观察状态。
+ */
 struct CadenceState
 {
-  bool has_last_timestamp{false};
-  bool stable{false};
-  uint64_t last_timestamp_us{0};
-  uint64_t period_us{0};
-  uint32_t stable_count{0};
+  bool has_last_timestamp{false};  ///< 是否已经收到上一条时间戳。
+  bool stable{false};              ///< 当前周期是否稳定。
+  uint64_t last_timestamp_us{0};   ///< 最近一次时间戳。
+  uint64_t period_us{0};           ///< 当前估计周期。
+  uint32_t stable_count{0};        ///< 连续满足容差的 gap 数量。
 };
 
+/**
+ * @brief 计算两个微秒时间差的绝对值。
+ */
 inline uint64_t AbsDiffUs(uint64_t lhs, uint64_t rhs)
 {
   return lhs >= rhs ? lhs - rhs : rhs - lhs;
 }
 
+/**
+ * @brief 在同一个时间轴内施加有符号 offset。
+ */
 inline uint64_t ApplyOffsetUs(uint64_t base_us, int32_t offset_us)
 {
   if (offset_us >= 0)
@@ -110,6 +163,9 @@ inline uint64_t ApplyOffsetUs(uint64_t base_us, int32_t offset_us)
   return base_us > abs_offset ? base_us - abs_offset : 0ULL;
 }
 
+/**
+ * @brief 根据图像周期和 IMU 周期估计每帧图像跨过的 IMU 样本数。
+ */
 inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_period_us)
 {
   if (image_period_us == 0 || imu_period_us == 0)
@@ -121,6 +177,9 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
   return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
 }
 
+/**
+ * @brief CameraSync 临时分频后，Host 应观察到的 probe 图像间隔。
+ */
 inline uint64_t ProbeImageGapUs(uint64_t image_period_us, uint32_t div)
 {
   if (image_period_us == 0 || div == 0)
@@ -138,12 +197,18 @@ inline uint64_t ProbeImageGapUs(uint64_t image_period_us, uint32_t div)
   return (image_period_us * multiplier) / 2ULL;
 }
 
+/**
+ * @brief 图像周期抖动容差。
+ */
 inline uint64_t ImageGapToleranceUs(uint64_t image_period_us)
 {
   const uint64_t ratio = image_period_us != 0 ? image_period_us / 4ULL : 0ULL;
   return std::max<uint64_t>(1500ULL, ratio);
 }
 
+/**
+ * @brief IMU 时间戳匹配容差。
+ */
 inline uint64_t ImuTimestampToleranceUs(uint64_t imu_period_us)
 {
   if (imu_period_us == 0)
@@ -153,6 +218,9 @@ inline uint64_t ImuTimestampToleranceUs(uint64_t imu_period_us)
   return std::max<uint64_t>(100ULL, imu_period_us / 2ULL);
 }
 
+/**
+ * @brief 观察一条新时间戳并更新周期稳定性。
+ */
 inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us,
                                     uint32_t required_stable_gaps,
                                     uint64_t min_tolerance_us)
@@ -206,6 +274,11 @@ inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us
   return was_stable ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
 }
 
+/**
+ * @brief 在 IMU 历史中查找 sensor timestamp 最接近期望值的样本。
+ *
+ * @return 找到且误差不超过 tolerance_us 时返回样本指针，否则返回 nullptr。
+ */
 template <typename ImuHistoryContainer>
 const typename ImuHistoryContainer::ValueType* FindBySensorTimestamp(
     const ImuHistoryContainer& imu_history, uint64_t expected_timestamp_us,

@@ -283,13 +283,18 @@ void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const CameraSync::SyncEvent& event)
 {
-  const QueuedSyncAck ack{.seq = event.seq,
-                          .imu_sensor_timestamp_us =
-                              static_cast<uint64_t>(timestamp)};
-  if (self->sync_ack_ingress_.Push(ack) != LibXR::ErrorCode::OK)
+  const uint32_t active_seq = self->active_probe_seq_.load();
+  if (active_seq == 0 || event.seq != active_seq)
   {
-    self->overflowed_.store(true, std::memory_order_relaxed);
+    return;
   }
+  if (self->probe_ack_seq_.load() == event.seq)
+  {
+    return;
+  }
+
+  self->probe_ack_timestamp_us_.store(static_cast<uint64_t>(timestamp));
+  self->probe_ack_seq_.store(event.seq);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -341,16 +346,6 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     if (pending_quats_.PushBackDropOldest(quat))
     {
       overflowed_.store(true, std::memory_order_relaxed);
-    }
-  }
-
-  QueuedSyncAck ack{};
-  while (sync_ack_ingress_.Pop(ack) == LibXR::ErrorCode::OK)
-  {
-    if (state_ == SyncState::PROBE_SENT && ack.seq == pending_probe_seq_)
-    {
-      pending_probe_ack_valid_ = true;
-      pending_probe_imu_timestamp_us_ = ack.imu_sensor_timestamp_us;
     }
   }
 

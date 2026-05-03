@@ -54,7 +54,8 @@ depends:
 /**
  * @brief 图像共享发布与 IMU 同步模块。
  *
- * 原始 gyro/accl/quat 回调只入队；所有同步状态机都在图像提交时串行推进。
+ * 原始 gyro/accl/quat 回调只入队；同步回执只记录当前 probe 的命中结果。
+ * 完整同步状态机仍然在图像提交时串行推进。
  * RAW_PROBE 模式使用 MCU 侧 CameraSync 的回执 timestamp 锁定 IMU 时间轴。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -83,35 +84,80 @@ class CameraFrameSync
       .queue_num = 2,
   };
 
+  /**
+   * @brief 图像与 IMU 的同步模式。
+   */
   enum class SyncMode : uint8_t
   {
     RAW_PROBE = 0,   ///< 通过 CameraSync command/result 显式锁定。
     LATEST_IMU = 1,  ///< 数据源已同步时，图像直接绑定最新完整 IMU。
   };
 
+  /**
+   * @brief 运行时配置。
+   *
+   * Topic 名称只决定 Host 侧订阅/发布边界；图像和 IMU 的同步关系只由各自
+   * sensor timestamp、CameraSync 回执和 offset_us 决定。
+   */
   struct RuntimeParam
   {
-    SyncMode mode = SyncMode::RAW_PROBE;
-    int32_t offset_us = 0;
-    std::string_view host_topic_domain_name = "host";
-    std::string_view sync_command_topic_name = "camera_sync_command";
-    std::string_view sync_result_topic_name = "camera_sync_result";
-    uint32_t sync_probe_div = 3;
-    uint32_t sync_active_level = 1;
+    SyncMode mode = SyncMode::RAW_PROBE;  ///< 同步模式。
+    int32_t offset_us = 0;                ///< IMU 时间域内的最终采样偏移。
+    std::string_view host_topic_domain_name = "host";  ///< Host topic domain。
+    std::string_view sync_command_topic_name =
+        "camera_sync_command";  ///< CameraSync 命令 topic。
+    std::string_view sync_result_topic_name =
+        "camera_sync_result";           ///< CameraSync 回执 topic。
+    uint32_t sync_probe_div = 3;         ///< MCU 临时分频系数。
+    uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
   };
 
+  /**
+   * @brief 使用默认 RAW_PROBE 配置创建同步桥。
+   */
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera);
 
+  /**
+   * @brief 创建同步桥并绑定相机图像槽位。
+   *
+   * 构造函数会注册 CameraBase 图像 sink、订阅原始 IMU topic，并创建图像共享
+   * topic。模块本身不创建线程；图像提交回调是同步状态机的推进点。
+   */
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera, RuntimeParam runtime);
 
+  /**
+   * @brief 返回共享图像 topic 名称。
+   */
   const char* ImageTopicName() const;
+
+  /**
+   * @brief 返回同步后 IMU topic 名称。
+   */
   const char* ImuTopicName() const;
+
+  /**
+   * @brief 返回 Host 侧 topic domain 名称。
+   */
   const char* HostTopicDomainName() const;
 
+  /**
+   * @brief 获取当前同步模式。
+   */
   SyncMode GetSyncMode() const;
+
+  /**
+   * @brief 设置 IMU 时间域内的最终采样偏移。
+   *
+   * offset 不参与相机时间和 IMU 时间的绝对值比较，只在已经找到同步 IMU 后，
+   * 沿 IMU 时间轴选择最终发布的姿态样本。
+   */
   void SetOffsetUs(int32_t offset_us);
+
+  /**
+   * @brief 切换同步模式并重置运行时状态。
+   */
   void SetSyncMode(SyncMode mode);
 
  private:
@@ -150,12 +196,6 @@ class CameraFrameSync
   struct QueuedQuat
   {
     QuatReading sample{};
-  };
-
-  struct QueuedSyncAck
-  {
-    uint32_t seq{};
-    uint64_t imu_sensor_timestamp_us{};
   };
 
   struct ImageSample
@@ -203,7 +243,6 @@ class CameraFrameSync
   };
 
   static constexpr size_t imu_ingress_length = 128;
-  static constexpr size_t sync_ack_ingress_length = 16;
   static constexpr size_t pending_limit = 128;
   static constexpr size_t image_event_limit = 32;
   static constexpr size_t history_limit = 128;
@@ -292,7 +331,6 @@ class CameraFrameSync
   LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedSyncAck> sync_ack_ingress_{sync_ack_ingress_length};
   std::atomic<bool> overflowed_{false};
 
   FixedRingBuffer<QueuedGyro, pending_limit> pending_gyros_{};
@@ -307,6 +345,10 @@ class CameraFrameSync
   uint32_t sync_probe_div_{3};
   uint32_t sync_active_level_{1};
   uint32_t next_sync_seq_{1};
+  // 回执回调不入队，只接受当前 probe 的一次反馈。
+  std::atomic<uint32_t> active_probe_seq_{0};
+  std::atomic<uint32_t> probe_ack_seq_{0};
+  std::atomic<uint64_t> probe_ack_timestamp_us_{0};
 
   SyncState state_{SyncState::OBSERVING};
   CameraFrameSyncCore::CadenceState image_cadence_{};

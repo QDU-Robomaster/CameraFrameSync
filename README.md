@@ -6,7 +6,7 @@
 - 订阅同一相机前缀下的原始 `gyro / accl / quat`
 - 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
 
-模块不创建线程。原始 IMU 和 `CameraSync` 回执都只在 Topic 回调里入队，状态机只在图像提交时推进。
+模块不创建线程。原始 IMU 只在 Topic 回调里入队；`CameraSync` 回执只记录当前 probe 的命中结果。状态机只在图像提交时推进。
 
 ## Topic
 
@@ -40,7 +40,7 @@
 
 IMU 组装以 gyro 为主轴：
 
-1. 三路回调分别把样本放进固定长度队列
+1. gyro/accl/quat 三路回调分别把样本放进固定长度队列
 2. 图像提交时，把队列推进到能确定为止
 3. 取 gyro 队首时间戳
 4. 丢掉所有早于该 gyro 的 accl / quat
@@ -95,6 +95,15 @@ IMU 组装以 gyro 为主轴：
 4. 发布时 `ImuStamped.timestamp_us` 写图像时间戳，IMU 内容来自 `final_imu_ts`
 
 等待期间不会重新选择同步点 IMU。
+
+## 消费者接口
+
+后续模块通过 `CameraFrameSync::Subscriber` 消费同步结果：
+
+- `Wait(out, timeout_ms)` 是阻塞接口，`UINT32_MAX` 表示无限等待
+- 成功返回时，`out.image` 持有共享图像槽位，`out.imu` 是 timestamp 完全相同的同步 IMU
+- 如果某张图像已经被 IMU 时间轴越过，Subscriber 会释放这张图并继续等下一张
+- 回调里不做 Detector/Tracker 工作，重计算应放在消费者线程里
 
 ## 配置
 
