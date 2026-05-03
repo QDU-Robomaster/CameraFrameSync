@@ -52,9 +52,8 @@ class CameraFrameSync
   using CameraInfo = typename Base::CameraInfo;
   using ImageFrame = typename Base::ImageFrame;
   using ImuStamped = typename Base::ImuStamped;
-  using GyroStamped = typename Base::GyroStamped;
-  using AcclStamped = typename Base::AcclStamped;
-  using QuatStamped = typename Base::QuatStamped;
+  using ImuVector = std::array<float, 3>;
+  using QuatSample = std::array<float, 4>;
   using SensorSyncCmd = typename Base::SensorSyncCmd;
   using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;
   using ImageData = typename ImageTopic::Data;
@@ -238,9 +237,9 @@ class CameraFrameSync
         synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(imu_topic_name_.c_str())),
         sensor_sync_cmd_topic_(
             LibXR::Topic::FindOrCreate<SensorSyncCmd>(sensor_sync_cmd_topic_name)),
-        gyro_topic_(LibXR::Topic::FindOrCreate<GyroStamped>(gyro_topic_name_.c_str())),
-        accl_topic_(LibXR::Topic::FindOrCreate<AcclStamped>(accl_topic_name_.c_str())),
-        quat_topic_(LibXR::Topic::FindOrCreate<QuatStamped>(quat_topic_name_.c_str())),
+        gyro_topic_(LibXR::Topic::FindOrCreate<ImuVector>(gyro_topic_name_.c_str())),
+        accl_topic_(LibXR::Topic::FindOrCreate<ImuVector>(accl_topic_name_.c_str())),
+        quat_topic_(LibXR::Topic::FindOrCreate<QuatSample>(quat_topic_name_.c_str())),
         gyro_cb_(LibXR::Topic::Callback::Create(OnGyroStatic, this)),
         accl_cb_(LibXR::Topic::Callback::Create(OnAcclStatic, this)),
         quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this)),
@@ -332,19 +331,37 @@ class CameraFrameSync
     return "UNKNOWN";
   }
 
+  struct GyroSample
+  {
+    uint64_t sensor_timestamp_us{};
+    ImuVector angular_velocity_xyz{};
+  };
+
+  struct AcclSample
+  {
+    uint64_t sensor_timestamp_us{};
+    ImuVector linear_acceleration_xyz{};
+  };
+
+  struct QuatReading
+  {
+    uint64_t sensor_timestamp_us{};
+    QuatSample rotation_wxyz{};
+  };
+
   struct QueuedGyro
   {
-    GyroStamped sample{};
+    GyroSample sample{};
   };
 
   struct QueuedAccl
   {
-    AcclStamped sample{};
+    AcclSample sample{};
   };
 
   struct QueuedQuat
   {
-    QuatStamped sample{};
+    QuatReading sample{};
   };
 
   struct ImageSample
@@ -667,27 +684,39 @@ class CameraFrameSync
     return current_image_.GetData();
   }
 
-  static void OnGyroStatic(bool, Self* self, LibXR::RawData& data)
+  static void OnGyroStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
+                           const ImuVector& data)
   {
-    const auto& gyro = *reinterpret_cast<const GyroStamped*>(data.addr_);
+    const GyroSample gyro{
+        .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+        .angular_velocity_xyz = data,
+    };
     if (self->gyro_ingress_.Push(QueuedGyro{.sample = gyro}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
   }
 
-  static void OnAcclStatic(bool, Self* self, LibXR::RawData& data)
+  static void OnAcclStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
+                           const ImuVector& data)
   {
-    const auto& accl = *reinterpret_cast<const AcclStamped*>(data.addr_);
+    const AcclSample accl{
+        .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+        .linear_acceleration_xyz = data,
+    };
     if (self->accl_ingress_.Push(QueuedAccl{.sample = accl}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
     }
   }
 
-  static void OnQuatStatic(bool, Self* self, LibXR::RawData& data)
+  static void OnQuatStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
+                           const QuatSample& data)
   {
-    const auto& quat = *reinterpret_cast<const QuatStamped*>(data.addr_);
+    const QuatReading quat{
+        .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+        .rotation_wxyz = data,
+    };
     if (self->quat_ingress_.Push(QueuedQuat{.sample = quat}) != LibXR::ErrorCode::OK)
     {
       self->overflowed_.store(true, std::memory_order_relaxed);
@@ -755,7 +784,7 @@ class CameraFrameSync
     while (CameraFrameSyncCore::TryBuildFrontImu(
         pending_gyros_, pending_accls_, pending_quats_, imu_history_,
         relation_.last_imu_sensor_period_us, history_limit,
-        [](const GyroStamped& gyro, const AcclStamped& accl, const QuatStamped& quat)
+        [](const GyroSample& gyro, const AcclSample& accl, const QuatReading& quat)
         {
           return AssembledImu{
               .sensor_timestamp_us = gyro.sensor_timestamp_us,

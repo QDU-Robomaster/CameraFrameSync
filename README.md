@@ -22,9 +22,9 @@
 - 图像写入接口
   - `CameraBase<Info>::RegisterImageSink(...)`
 - 原始小话题
-  - `<camera.Name()>_gyro`
-  - `<camera.Name()>_accl`
-  - `<camera.Name()>_quat`
+  - `<camera.Name()>_gyro`：`std::array<float, 3>`，角速度，单位 rad/s
+  - `<camera.Name()>_accl`：`std::array<float, 3>`，线加速度，单位 m/s^2
+  - `<camera.Name()>_quat`：`std::array<float, 4>`，姿态四元数，顺序 wxyz
 - 一次性同步探针命令
   - `sensor_sync_cmd`
 
@@ -77,7 +77,7 @@ constructor_args:
 
 这版实现只使用**传感器侧时间戳**：
 
-- 原始 `gyro / accl / quat` 使用 `sensor_timestamp_us`
+- 原始 `gyro / accl / quat` 的采样时刻来自 Topic timestamp
 - 图像使用 `ImageFrame::timestamp_us`
 - 同步主逻辑只记录这两类传感器侧时间戳
 
@@ -94,6 +94,8 @@ constructor_args:
 ## 数据流
 
 1. `gyro / accl / quat` 回调只入各自无锁 ingress 队列
+   - payload 只保存测量值
+   - 传感器侧采样时间从 Topic timestamp 进入队列
 2. 图像 sink commit 回调记录 `ImageFrame::timestamp_us`，它是唯一同步触发点
 3. 每次处理图像提交时：
    - 先排空四路 ingress
@@ -105,7 +107,7 @@ constructor_args:
 
 组装规则：
 
-- 以 `gyro.sensor_timestamp_us` 为主轴
+- 以 gyro 消息的 Topic timestamp 为主轴
 - `accl / quat` 在同一个 IMU 时间域里配对
 
 具体做法：
