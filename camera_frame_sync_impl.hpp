@@ -211,9 +211,8 @@ void CameraFrameSync<CameraInfoV>::OnGyroStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
 {
-  const QueuedGyro sample{.sample = {.sensor_timestamp_us =
-                                         static_cast<uint64_t>(timestamp),
-                                     .angular_velocity_xyz = ToImuVector(data)}};
+  const GyroSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+                          .angular_velocity_xyz = ToImuVector(data)};
   if (self->gyro_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     self->overflowed_.store(true, std::memory_order_relaxed);
@@ -225,9 +224,8 @@ void CameraFrameSync<CameraInfoV>::OnAcclStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
 {
-  const QueuedAccl sample{.sample = {.sensor_timestamp_us =
-                                         static_cast<uint64_t>(timestamp),
-                                     .linear_acceleration_xyz = ToImuVector(data)}};
+  const AcclSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+                          .linear_acceleration_xyz = ToImuVector(data)};
   if (self->accl_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     self->overflowed_.store(true, std::memory_order_relaxed);
@@ -239,9 +237,8 @@ void CameraFrameSync<CameraInfoV>::OnQuatStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data)
 {
-  const QueuedQuat sample{.sample = {.sensor_timestamp_us =
-                                         static_cast<uint64_t>(timestamp),
-                                     .rotation_wxyz = ToQuatSample(data)}};
+  const QuatReading sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+                           .rotation_wxyz = ToQuatSample(data)};
   if (self->quat_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     self->overflowed_.store(true, std::memory_order_relaxed);
@@ -292,7 +289,7 @@ void CameraFrameSync<CameraInfoV>::ProcessSyncWorkWithoutImage()
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
 {
-  QueuedGyro gyro{};
+  GyroSample gyro{};
   while (gyro_ingress_.Pop(gyro) == LibXR::ErrorCode::OK)
   {
     if (pending_gyros_.PushBackDropOldest(gyro))
@@ -301,7 +298,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     }
   }
 
-  QueuedAccl accl{};
+  AcclSample accl{};
   while (accl_ingress_.Pop(accl) == LibXR::ErrorCode::OK)
   {
     if (pending_accls_.PushBackDropOldest(accl))
@@ -310,7 +307,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     }
   }
 
-  QueuedQuat quat{};
+  QuatReading quat{};
   while (quat_ingress_.Pop(quat) == LibXR::ErrorCode::OK)
   {
     if (pending_quats_.PushBackDropOldest(quat))
@@ -333,7 +330,7 @@ void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
 template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 {
-  QueuedGyro queued_gyro{};
+  GyroSample queued_gyro{};
   if (!pending_gyros_.Front(queued_gyro))
   {
     return false;
@@ -343,17 +340,18 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
     return false;
   }
 
-  const uint64_t gyro_ts = queued_gyro.sample.sensor_timestamp_us;
-  QueuedAccl queued_accl{};
+  const uint64_t gyro_ts = queued_gyro.sensor_timestamp_us;
+  AcclSample queued_accl{};
+  // 以 gyro 为主时间轴；早于 gyro 的 accl/quat 已不可能组成当前 IMU 帧。
   while (pending_accls_.Front(queued_accl) &&
-         queued_accl.sample.sensor_timestamp_us < gyro_ts)
+         queued_accl.sensor_timestamp_us < gyro_ts)
   {
     pending_accls_.PopFront();
   }
 
-  QueuedQuat queued_quat{};
+  QuatReading queued_quat{};
   while (pending_quats_.Front(queued_quat) &&
-         queued_quat.sample.sensor_timestamp_us < gyro_ts)
+         queued_quat.sensor_timestamp_us < gyro_ts)
   {
     pending_quats_.PopFront();
   }
@@ -362,23 +360,21 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
     return false;
   }
 
-  const uint64_t accl_ts = queued_accl.sample.sensor_timestamp_us;
-  const uint64_t quat_ts = queued_quat.sample.sensor_timestamp_us;
+  const uint64_t accl_ts = queued_accl.sensor_timestamp_us;
+  const uint64_t quat_ts = queued_quat.sensor_timestamp_us;
   if (accl_ts > gyro_ts || quat_ts > gyro_ts)
   {
+    // Topic timestamp 已是传感器时间；同一 IMU 帧三路时间戳必须精确一致。
     pending_gyros_.PopFront();
     ResetLock("raw-imu-missing-channel", "exact timestamp join failed");
     return true;
   }
 
-  const auto& gyro = queued_gyro.sample;
-  const auto& accl = queued_accl.sample;
-  const auto& quat = queued_quat.sample;
   const AssembledImu imu{
-      .sensor_timestamp_us = gyro.sensor_timestamp_us,
-      .rotation_wxyz = quat.rotation_wxyz,
-      .angular_velocity_xyz = gyro.angular_velocity_xyz,
-      .linear_acceleration_xyz = accl.linear_acceleration_xyz,
+      .sensor_timestamp_us = queued_gyro.sensor_timestamp_us,
+      .rotation_wxyz = queued_quat.rotation_wxyz,
+      .angular_velocity_xyz = queued_gyro.angular_velocity_xyz,
+      .linear_acceleration_xyz = queued_accl.linear_acceleration_xyz,
   };
 
   pending_gyros_.PopFront();
@@ -410,6 +406,6 @@ void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_u
   }
   if (imu_cadence_.stable)
   {
-    relation_.imu_period_us = imu_cadence_.period_us;
+    periods_.imu_us = imu_cadence_.period_us;
   }
 }
