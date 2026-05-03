@@ -13,46 +13,22 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
     LibXR::HardwareContainer&, LibXR::ApplicationManager&,
     typename CameraFrameSync<CameraInfoV>::Base& camera,
     typename CameraFrameSync<CameraInfoV>::RuntimeParam runtime)
-    : image_topic_name_(camera.ImageTopicNameView()),
-      imu_topic_name_(camera.ImuTopicNameView()),
-      host_topic_domain_name_(runtime.host_topic_domain_name),
-      host_topic_domain_(host_topic_domain_name_.c_str()),
-      sync_command_topic_name_(runtime.sync_command_topic_name),
-      sync_result_topic_name_(runtime.sync_result_topic_name),
-      sensor_name_(RequireSensorName(camera.NameView())),
-      gyro_topic_name_(sensor_name_ + "_gyro"),
-      accl_topic_name_(sensor_name_ + "_accl"),
-      quat_topic_name_(sensor_name_ + "_quat"),
-      image_topic_(image_topic_name_.c_str(), image_topic_config),
-      synced_imu_topic_(LibXR::Topic::FindOrCreate<ImuStamped>(
-          imu_topic_name_.c_str(), &host_topic_domain_)),
-      sync_command_topic_(LibXR::Topic::FindOrCreate<CameraSync::SyncCommand>(
-          sync_command_topic_name_.c_str(), &host_topic_domain_)),
-      sync_result_topic_(LibXR::Topic::FindOrCreate<CameraSync::SyncEvent>(
-          sync_result_topic_name_.c_str(), &host_topic_domain_)),
-      gyro_topic_(LibXR::Topic::FindOrCreate<RawImuVector>(gyro_topic_name_.c_str(),
-                                                           &host_topic_domain_)),
-      accl_topic_(LibXR::Topic::FindOrCreate<RawImuVector>(accl_topic_name_.c_str(),
-                                                           &host_topic_domain_)),
-      quat_topic_(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_topic_name_.c_str(),
-                                                            &host_topic_domain_)),
-      gyro_cb_(LibXR::Topic::Callback::Create(OnGyroStatic, this)),
-      accl_cb_(LibXR::Topic::Callback::Create(OnAcclStatic, this)),
-      quat_cb_(LibXR::Topic::Callback::Create(OnQuatStatic, this)),
-      sync_result_cb_(LibXR::Topic::Callback::Create(OnSyncResultStatic, this)),
-      sync_mode_(runtime.mode),
-      offset_us_(runtime.offset_us),
-      sync_probe_div_(runtime.sync_probe_div),
-      sync_active_level_(runtime.sync_active_level == 0 ? 0U : 1U)
+    : topics_(camera, runtime),
+      callbacks_(this)
 {
+  sync_mode_ = runtime.mode;
+  offset_us_ = runtime.offset_us;
+  sync_probe_div_ = runtime.sync_probe_div;
+  sync_active_level_ = runtime.sync_active_level == 0 ? 0U : 1U;
+
   ASSERT(sync_probe_div_ != 0);
 
-  if (!image_topic_.Valid())
+  if (!topics_.image.Valid())
   {
     char message[96] = {};
     std::snprintf(message, sizeof(message),
                   "CameraFrameSync: image topic creation failed (err=%d)",
-                  static_cast<int>(image_topic_.GetError()));
+                  static_cast<int>(topics_.image.GetError()));
     throw std::runtime_error(message);
   }
   if (!AcquireInitialWritableImage())
@@ -66,34 +42,35 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
     throw std::runtime_error("CameraFrameSync: image sink registration failed");
   }
 
-  gyro_topic_.RegisterCallback(gyro_cb_);
-  accl_topic_.RegisterCallback(accl_cb_);
-  quat_topic_.RegisterCallback(quat_cb_);
-  sync_result_topic_.RegisterCallback(sync_result_cb_);
+  topics_.gyro.RegisterCallback(callbacks_.gyro);
+  topics_.accl.RegisterCallback(callbacks_.accl);
+  topics_.quat.RegisterCallback(callbacks_.quat);
+  topics_.sync_result.RegisterCallback(callbacks_.sync_result);
 
   XR_LOG_INFO(
       "CameraFrameSync: enabled sensor=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s",
-      sensor_name_.c_str(), host_topic_domain_name_.c_str(),
-      image_topic_name_.c_str(), imu_topic_name_.c_str(), gyro_topic_name_.c_str(),
-      accl_topic_name_.c_str(), quat_topic_name_.c_str(), SyncModeName(sync_mode_));
+      topics_.sensor_name.c_str(), topics_.host_domain_name.c_str(),
+      topics_.image_name.c_str(), topics_.imu_name.c_str(),
+      topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
+      topics_.quat_name.c_str(), SyncModeName(sync_mode_));
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
 const char* CameraFrameSync<CameraInfoV>::ImageTopicName() const
 {
-  return image_topic_name_.c_str();
+  return topics_.image_name.c_str();
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
 const char* CameraFrameSync<CameraInfoV>::ImuTopicName() const
 {
-  return imu_topic_name_.c_str();
+  return topics_.imu_name.c_str();
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
 const char* CameraFrameSync<CameraInfoV>::HostTopicDomainName() const
 {
-  return host_topic_domain_name_.c_str();
+  return topics_.host_domain_name.c_str();
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -124,16 +101,6 @@ void CameraFrameSync<CameraInfoV>::SetSyncMode(
               SyncModeName(sync_mode_), SyncModeName(mode));
   sync_mode_ = mode;
   ResetRuntimeState();
-}
-
-template <CameraTypes::CameraInfo CameraInfoV>
-std::string CameraFrameSync<CameraInfoV>::RequireSensorName(std::string_view name)
-{
-  if (name.empty())
-  {
-    throw std::runtime_error("CameraFrameSync: camera name is required");
-  }
-  return std::string(name);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -185,7 +152,7 @@ CameraFrameSync<CameraInfoV>::ToQuatSample(
 template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::AcquireInitialWritableImage()
 {
-  if (image_topic_.CreateData(current_image_) != LibXR::ErrorCode::OK)
+  if (topics_.image.CreateData(current_image_) != LibXR::ErrorCode::OK)
   {
     return false;
   }
@@ -211,7 +178,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
   }
 
   ImageData next_image;
-  if (image_topic_.CreateData(next_image) != LibXR::ErrorCode::OK ||
+  if (topics_.image.CreateData(next_image) != LibXR::ErrorCode::OK ||
       next_image.GetData() == nullptr)
   {
     ProcessSyncWorkWithoutImage();
@@ -220,7 +187,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
 
   const uint64_t image_timestamp_us =
       static_cast<uint64_t>(committed_image->timestamp_us);
-  const auto publish_ans = image_topic_.Publish(current_image_);
+  const auto publish_ans = topics_.image.Publish(current_image_);
   current_image_ = std::move(next_image);
 
   if (publish_ans == LibXR::ErrorCode::OK)

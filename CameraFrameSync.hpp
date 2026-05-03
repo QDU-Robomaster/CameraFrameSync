@@ -194,6 +194,83 @@ class CameraFrameSync
     LibXR::LockFreeQueue<T> queue_;
   };
 
+  /**
+   * @brief 模块持有的 topic 名称和句柄。
+   *
+   * 字符串必须由模块持有，保证 Topic/Domain 内部保存的 c_str() 生命周期覆盖模块
+   * 全生命周期。
+   */
+  struct Topics
+  {
+    Topics(const Base& camera, const RuntimeParam& runtime)
+        : image_name(camera.ImageTopicNameView()),
+          imu_name(camera.ImuTopicNameView()),
+          host_domain_name(runtime.host_topic_domain_name),
+          sync_command_name(runtime.sync_command_topic_name),
+          sync_result_name(runtime.sync_result_topic_name),
+          sensor_name(camera.NameView()),
+          gyro_name(sensor_name + "_gyro"),
+          accl_name(sensor_name + "_accl"),
+          quat_name(sensor_name + "_quat"),
+          host_domain(host_domain_name.c_str()),
+          image(image_name.c_str(), image_topic_config),
+          synced_imu(LibXR::Topic::FindOrCreate<ImuStamped>(
+              imu_name.c_str(), &host_domain)),
+          sync_command(LibXR::Topic::FindOrCreate<CameraSync::SyncCommand>(
+              sync_command_name.c_str(), &host_domain)),
+          sync_result(LibXR::Topic::FindOrCreate<CameraSync::SyncEvent>(
+              sync_result_name.c_str(), &host_domain)),
+          gyro(LibXR::Topic::FindOrCreate<RawImuVector>(gyro_name.c_str(),
+                                                        &host_domain)),
+          accl(LibXR::Topic::FindOrCreate<RawImuVector>(accl_name.c_str(),
+                                                        &host_domain)),
+          quat(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_name.c_str(),
+                                                         &host_domain))
+    {
+      if (sensor_name.empty())
+      {
+        throw std::runtime_error("CameraFrameSync: camera name is required");
+      }
+    }
+
+    std::string image_name;
+    std::string imu_name;
+    std::string host_domain_name;
+    std::string sync_command_name;
+    std::string sync_result_name;
+    std::string sensor_name;
+    std::string gyro_name;
+    std::string accl_name;
+    std::string quat_name;
+    LibXR::Topic::Domain host_domain;
+    ImageTopic image;
+    LibXR::Topic synced_imu;
+    LibXR::Topic sync_command;
+    LibXR::Topic sync_result;
+    LibXR::Topic gyro;
+    LibXR::Topic accl;
+    LibXR::Topic quat;
+  };
+
+  /**
+   * @brief topic 回调对象集合，回调只负责把输入塞进模块内部队列/邮箱。
+   */
+  struct TopicCallbacks
+  {
+    explicit TopicCallbacks(Self* self)
+        : gyro(LibXR::Topic::Callback::Create(OnGyroStatic, self)),
+          accl(LibXR::Topic::Callback::Create(OnAcclStatic, self)),
+          quat(LibXR::Topic::Callback::Create(OnQuatStatic, self)),
+          sync_result(LibXR::Topic::Callback::Create(OnSyncResultStatic, self))
+    {
+    }
+
+    LibXR::Topic::Callback gyro;
+    LibXR::Topic::Callback accl;
+    LibXR::Topic::Callback quat;
+    LibXR::Topic::Callback sync_result;
+  };
+
   struct GyroSample
   {
     uint64_t sensor_timestamp_us{};
@@ -279,7 +356,6 @@ class CameraFrameSync
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;
 
-  static std::string RequireSensorName(std::string_view name);
   static const char* SyncModeName(SyncMode mode);
   static const char* StateName(SyncState state);
   static ImuVector ToImuVector(const RawImuVector& data);
@@ -333,29 +409,10 @@ class CameraFrameSync
   void HandleOverflowRecovery();
 
  private:
-  std::string image_topic_name_;
-  std::string imu_topic_name_;
-  std::string host_topic_domain_name_;
-  LibXR::Topic::Domain host_topic_domain_;
-  std::string sync_command_topic_name_;
-  std::string sync_result_topic_name_;
-  std::string sensor_name_;
-  std::string gyro_topic_name_;
-  std::string accl_topic_name_;
-  std::string quat_topic_name_;
+  Topics topics_;
+  TopicCallbacks callbacks_;
 
-  ImageTopic image_topic_;
   ImageData current_image_{};
-  LibXR::Topic synced_imu_topic_;
-  LibXR::Topic sync_command_topic_;
-  LibXR::Topic sync_result_topic_;
-  LibXR::Topic gyro_topic_;
-  LibXR::Topic accl_topic_;
-  LibXR::Topic quat_topic_;
-  LibXR::Topic::Callback gyro_cb_{};
-  LibXR::Topic::Callback accl_cb_{};
-  LibXR::Topic::Callback quat_cb_{};
-  LibXR::Topic::Callback sync_result_cb_{};
 
   LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
   LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};

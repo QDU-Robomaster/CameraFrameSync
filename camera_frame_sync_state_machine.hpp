@@ -187,7 +187,7 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   probe_ack_seq_.store(0);
   active_probe_seq_.store(cmd.seq);
 
-  sync_command_topic_.Publish(cmd);
+  topics_.sync_command.Publish(cmd);
 
   XR_LOG_INFO(
       "CameraFrameSync: sync command sent seq=%u div=%u active=%u image_period_us=%u imu_period_us=%u sync_period_us=%u",
@@ -384,7 +384,7 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
       .angular_velocity_xyz = imu.angular_velocity_xyz,
       .linear_acceleration_xyz = imu.linear_acceleration_xyz,
   };
-  synced_imu_topic_.Publish(synced);
+  topics_.synced_imu.Publish(synced);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
