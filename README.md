@@ -1,60 +1,111 @@
 # CameraFrameSync
 
-`CameraFrameSync` 负责两件事：
+`CameraFrameSync` 是相机帧和 IMU 的同步桥：
 
-1. 承接 `CameraBase<Info>` 的图像 lease，并把图像发布到 `LinuxSharedTopic`
-2. 订阅原始 `gyro / accl / quat`，用图像提交时的 `ImageFrame::timestamp_us` 完成图像与 IMU 对齐，再发布同步后的 `imu`
+- 从 `CameraBase<Info>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
+- 订阅同一相机前缀下的原始 `gyro / accl / quat`
+- 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
 
-当前支持两种同步模式：
+模块不创建线程。原始 IMU 和 `CameraSync` 回执都只在 Topic 回调里入队，状态机只在图像提交时推进。
 
-- `RAW_PROBE`
-  - 当前默认模式
-  - 通过原始传感器节拍和一次性 `sensor_sync_cmd` 探针锁定图像与 IMU
-- `LATEST_IMU`
-  - 兼容之前“默认认为图像与 IMU 已同步”的用法
-  - 每张图像直接取当前最新的原始 IMU 作为同步 IMU
-  - 仍然会在 IMU 自己时间域里应用 `offset_us`
-
-## 输入与输出
+## Topic
 
 输入：
 
-- 图像写入接口
-  - `CameraBase<Info>::RegisterImageSink(...)`
-- 原始小话题
-  - `<camera.Name()>_gyro`：`std::array<float, 3>`，角速度，单位 rad/s
-  - `<camera.Name()>_accl`：`std::array<float, 3>`，线加速度，单位 m/s^2
-  - `<camera.Name()>_quat`：`std::array<float, 4>`，姿态四元数，顺序 wxyz
-- 一次性同步探针命令
-  - `sensor_sync_cmd`
+- 图像：`CameraBase<Info>::RegisterImageSink(...)`
+- 原始陀螺：`<camera.Name()>_gyro`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
+- 原始加速度：`<camera.Name()>_accl`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
+- 原始姿态：`<camera.Name()>_quat`，payload 为 `LibXR::Quaternion<float>`
+- 同步回执：`camera_sync_result`，payload 为 `CameraSync::SyncEvent`
 
 输出：
 
-- 图像共享话题
-  - `camera.ImageTopicName()`
-- 同步后 IMU 话题
-  - `camera.ImuTopicName()`
+- 图像共享 topic：`camera.ImageTopicName()`
+- 同步 IMU topic：`camera.ImuTopicName()`
+- 同步命令：`camera_sync_command`，payload 为 `CameraSync::SyncCommand`
 
-其中：
+实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。
 
-- `sensor_sync_cmd` 是固定名字，不跟随相机名变化
-- 原始 `gyro / accl / quat` 前缀直接取 `camera.Name()`
-- `camera.Name()` 必须非空；模块内部不再做隐式回退
-- 可通过 YAML 构造参数或 `SetSyncMode(...)` 在 `RAW_PROBE / LATEST_IMU` 之间切换
-- 运行时只保留一个调节点：
-  - `offset_us`
-  - 它表示在 IMU 自己的 `sensor_timestamp_us` 时间域里，对最终取样位置做常量平移
+## 时间戳契约
 
-## YAML 配置
+只使用传感器侧时间戳：
 
-`CameraFrameSync` 默认保持实机路径的 `RAW_PROBE`：
+- 图像时间来自 `ImageFrame::timestamp_us`
+- 原始 IMU 时间来自 Topic envelope timestamp
+- `CameraSync::SyncEvent` 的同步点时间来自 result topic 的 envelope timestamp
+
+相机时间和 IMU 时间不做绝对值比较。相机侧只看相邻图像的时间差，IMU 侧只看相邻 IMU 的时间差和 `CameraSync` 回传的 IMU 时间戳。
+
+## 原始 IMU 组装
+
+IMU 组装以 gyro 为主轴：
+
+1. 三路回调分别把样本放进固定长度队列
+2. 图像提交时，把队列推进到能确定为止
+3. 取 gyro 队首时间戳
+4. 丢掉所有早于该 gyro 的 accl / quat
+5. 如果 accl / quat 缺失，先停住，不丢 gyro
+6. 如果 accl / quat 已经晚于该 gyro，说明这条 gyro 缺帧，丢 gyro 并回到观察态
+7. 三路 timestamp 完全一致时，组装一条完整 IMU 历史
+
+这里不再做半周期近邻匹配。当前协议要求同一帧 IMU 的 `gyro / accl / quat` envelope timestamp 完全一致。
+
+## 同步模式
+
+`LATEST_IMU`：
+
+- 不发 `CameraSync::SyncCommand`
+- 每张图像直接绑定当前最新完整 IMU
+- 如果 `offset_us` 指向的最终 IMU 还没到，当前图像留在唯一 pending 槽位里等待
+
+`RAW_PROBE`：
+
+- 默认实机模式
+- 通过 `CameraSync::SyncCommand` 触发一次节拍扰动
+- 通过 `CameraSync::SyncEvent` 的 envelope timestamp 得到同步点 IMU 时间
+- 锁定后按 IMU 周期递推后续图像对应的同步 IMU
+
+## RAW_PROBE 状态机
+
+状态只有三种：
+
+- `OBSERVING`：持续观察图像周期和完整 IMU 周期
+- `PROBE_SENT`：已发送一次 `CameraSync::SyncCommand`，等待 probe 图像和同 seq 回执
+- `SYNCED`：已锁定，后续按 IMU 时间轴递推
+
+流程：
+
+1. `OBSERVING` 中观察到稳定图像周期 `T` 和稳定 IMU 周期 `t`
+2. 计算 `N = round(T / t)`，同步 IMU 周期为 `N * t`
+3. 发送 `CameraSync::SyncCommand{div=sync_probe_div, active_level, seq}`
+4. MCU 在下一段反向半周期执行命令，并在同步点发布 `CameraSync::SyncEvent{seq}`
+5. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
+6. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
+7. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
+
+`sync_probe_div = 3` 时，期望 probe 图像 gap 为 `2T`。通用公式是 `T * (div + 1) / 2`。
+
+## offset_us
+
+`offset_us` 只在 IMU 时间域内使用：
+
+1. 先确定同步点 IMU：`sync_imu_ts`
+2. 再计算最终样本：`final_imu_ts = sync_imu_ts + offset_us`
+3. 如果最终样本还没到，当前图像等待
+4. 发布时 `ImuStamped.timestamp_us` 写图像时间戳，IMU 内容来自 `final_imu_ts`
+
+等待期间不会重新选择同步点 IMU。
+
+## 配置
+
+默认配置走实机 `RAW_PROBE`：
 
 ```yaml
 constructor_args:
   camera: '@camera'
 ```
 
-需要文件回放或已经对齐的数据源时，在 YAML 里直接传 `RuntimeParam`：
+内录或已经同步的数据源使用 `LATEST_IMU`：
 
 ```yaml
 constructor_args:
@@ -63,216 +114,21 @@ constructor_args:
     expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::LATEST_IMU, .offset_us = 0}"
 ```
 
-## 当前同步策略
+Webots / 实机可显式配置同步 topic：
 
-先说模式边界：
+```yaml
+runtime:
+  expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::RAW_PROBE, .offset_us = 0, .host_topic_domain_name = \"host\", .sync_command_topic_name = \"camera_sync_command\", .sync_result_topic_name = \"camera_sync_result\", .sync_probe_div = 3, .sync_active_level = 1}"
+```
 
-- `RAW_PROBE`
-  - 使用下面整套 cadence / probe / 重锁逻辑
-- `LATEST_IMU`
-  - 不发 `sensor_sync_cmd`
-  - 不要求图像 cadence 锁定
-  - 每次处理图像时直接取当前 `imu_history` 里的最新 IMU
-  - 如果 `offset_us` 指向的最终 IMU 还没到，就把当前图像留在唯一的待处理槽位里等待
+## 日志
 
-这版实现只使用**传感器侧时间戳**：
+模块只在状态边界打日志：
 
-- 原始 `gyro / accl / quat` 的采样时刻来自 Topic timestamp
-- 图像使用 `ImageFrame::timestamp_us`
-- 同步主逻辑只记录这两类传感器侧时间戳
+- 启动时打印图像、IMU、原始 topic 和模式
+- 发送 `CameraSync::SyncCommand`
+- 进入 `SYNCED`
+- 从 `PROBE_SENT / SYNCED` 回到 `OBSERVING`
+- ingress 溢出导致运行时状态重置
 
-约束也很明确：
-
-- 不拿相机时间戳和 IMU 时间戳做跨域绝对值比较
-- 只在各自时间域里做差分
-- 跨域关系只靠：
-  - 图像基线周期 `T`
-  - IMU 基线周期 `t`
-  - 估算出的整数步长 `N = round(T / t)`
-  - 一次性 `2T` 探针引入的节拍变化
-
-## 数据流
-
-1. `gyro / accl / quat` 回调只入各自无锁 ingress 队列
-   - payload 只保存测量值
-   - 传感器侧采样时间从 Topic timestamp 进入队列
-2. 图像 sink commit 回调记录 `ImageFrame::timestamp_us`，它是唯一同步触发点
-3. 每次处理图像提交时：
-   - 先排空四路 ingress
-   - 再按 `gyro` 主时间轴组装原始 IMU 历史
-   - 最后串行处理待同步图像时间戳
-   - 当前如果有一张图像还在等 offset 目标 IMU，就继续重试这一张，不会改成处理后面的图像
-
-## 原始 IMU 组装
-
-组装规则：
-
-- 以 gyro 消息的 Topic timestamp 为主轴
-- `accl / quat` 在同一个 IMU 时间域里配对
-
-具体做法：
-
-- 启动初期还没观察到稳定 IMU 周期时
-  - 为 `accl / quat` 各取第一条时间不早于 `gyro` 的样本
-- 一旦已经得到稳定 IMU 周期
-  - 在 `gyro` 的正负半个周期窗口内
-  - 为 `accl / quat` 各选离它最近的样本
-  - 如果前后距离完全相同，优先更晚样本
-- 如果某一路已经越过半周期窗口还找不到可配对样本
-  - 当前 `gyro` 直接丢弃
-  - 避免整条组装链被卡死
-
-## 图像侧状态机
-
-这一节主要描述 `RAW_PROBE` 模式。
-
-状态只有两种，再加一个 `probe_pending` 标记：
-
-- `OBSERVING`
-  - 持续观察节拍并维护原始 IMU 历史
-  - 图像提交和 `gyro` 节拍稳定后，才允许发一次 `sensor_sync_cmd`
-- `SYNCED`
-  - 已经进入稳态跟踪
-
-其中：
-
-- `probe_pending = false`
-  - 当前没有等待中的 `2T` 探针
-- `probe_pending = true`
-  - 已经发过一次 probe，正在等待那次 `2T` 图像 gap
-
-任何一条稳定节拍断掉，都会直接 reset 回 `OBSERVING`。
-
-## 锁定流程
-
-这一节只适用于 `RAW_PROBE`。
-
-1. 持续观察节拍
-   - 图像提交 cadence 稳定后记录正常图像基线周期 `T`
-   - 原始 IMU 历史形成稳定周期后记录 `t`
-2. 根据 `T / t` 估算图像对应的 IMU 整数步长 `N`
-3. 自动发出一次 `sensor_sync_cmd`
-4. 下位机只把**下一次图像间隔**拉成 `2T`，随后自动恢复到 `T`
-5. 当主机看到 `T -> 2T` 这次图像节拍变化时：
-   - 在 IMU 历史里找一对间隔约为 `2 * N * t` 的 IMU
-   - 这对 IMU 的后一条就是 probe 图像对应的同步 IMU 候选
-6. 如果 probe 图像还缺少后续 IMU 历史，先继续等待
-7. 命中后记下：
-   - 上一条同步 IMU 时间戳
-   - 同步 IMU 周期
-8. 命中后立刻进入 `SYNCED`
-9. 后续普通图像进入稳态跟踪
-
-## 稳态跟踪
-
-这一节只适用于 `RAW_PROBE`。
-
-锁定后不再全局扫描，而是沿着上一帧关系递推：
-
-1. 预测下一条同步 IMU 的目标时间戳
-   - `expected_sync_imu_ts = last_sync_imu_ts + sync_imu_period`
-2. 只有当 IMU 历史已经覆盖这个目标时，才允许处理当前图像
-3. 在 IMU 历史里找离这个目标最近、且误差仍在容差内的样本
-4. 找到后，先把它当作“同步 IMU”
-5. 再在 IMU 自己时间域里应用 `offset_us`
-6. 由 `sync_imu_ts + offset_us` 找最终要发布的 IMU 样本
-
-如果这一步只差 `offset_us` 对应的目标 IMU 还没到：
-
-- 当前图像会停在模块内部唯一的“待处理图像”槽位里等待
-- 但已经选中的 `sync_imu` 不会在下一次重试时被重新改写
-- 也就是“等最终样本”，而不是“边等边改同步基准”
-
-最终发布时：
-
-- 图像仍保留自己的相机侧时间戳
-- 同步后 `imu.timestamp_us` 也使用这张图像的传感器侧时间戳
-
-## 等待、拒绝与恢复
-
-`LATEST_IMU` 模式下不会走 probe 锁定，也不会按 `T / 2T` 图像 gap 做接受判定。
-它只保留两类行为：
-
-- `WAIT`
-  - 当前图像选中的“最新 IMU”还缺少 `offset_us` 对应的最终样本
-- `DROP`
-  - 图像时间戳回退/乱序
-  - 或者已经覆盖 `offset_us` 目标，但仍找不到合法最终 IMU
-
-`RAW_PROBE` 模式则继续使用下面这套完整重锁语义：
-
-等待与恢复只看数据覆盖情况和传感器时间差：
-
-- `WAIT`
-  - IMU 历史还没覆盖 probe 候选
-  - 或者还没覆盖稳态预测目标
-  - 或者 `offset_us` 目标样本还没到
-- `REJECT`
-  - probe 挂起后，下一张图像 gap 不是 `2T`
-  - 稳态下普通图像 gap 不是 `T`
-  - 预测目标已经被 IMU 历史覆盖，但仍找不到合法候选
-- `RESET`
-  - 任一路 cadence 失稳
-  - ingress / history 溢出
-  - 图像时间戳回退或乱序
-
-reset 后会：
-
-- 清掉 probe 挂起状态
-- 清掉当前等待中的图像
-- 清掉当前锁定关系
-- 清掉图像基线
-- 立刻回到 `OBSERVING`
-
-## 运行日志
-
-模块只在低频状态边界打日志，不在 IMU 回调或每帧稳态路径刷屏。
-
-会打日志的情况：
-
-- 模块启用，记录图像话题、同步 IMU 话题、原始 IMU 话题和当前模式
-- `SetSyncMode(...)` 切换模式并清空运行状态
-- `RAW_PROBE` 发出一次 `sensor_sync_cmd`
-- 状态从 `OBSERVING` 进入 `SYNCED`
-- 状态从 `SYNCED` 回到 `OBSERVING`，并记录 reset 原因
-- ingress / history 溢出触发同步状态清空
-
-正常稳态下不应该持续出现 `SYNCED -> OBSERVING`。如果出现，优先看日志里的
-`reason` 和 `detail` 字段，例如 `cadence-broken / gyro`、`image-rejected / synced`
-或 `queue-overflow`。
-
-## `Subscriber` 语义
-
-`Subscriber::Wait()` 仍然保持严格匹配：
-
-- 先等一帧图像
-- 再等一条 `timestamp_us` 与该图像完全相同的同步后 `imu`
-- 两者对上才返回 `SyncedFrame`
-
-下游 `Subscriber` 不参与原始 IMU 重同步；重同步都在 `CameraFrameSync` 内部完成。
-
-## 默认边界
-
-- 图像共享话题
-  - `slot_num = 8`
-  - `queue_num = 2`
-- ingress 队列长度
-  - `imu_ingress_length = 128`
-  - `image_ingress_length = 32`
-- 历史缓存长度
-  - `pending_limit = 256`
-  - `history_limit = 256`
-- `Subscriber` 消费语义
-  - 图像仍由共享图像话题阻塞等待
-  - 同步后 IMU 使用单槽 `SyncSubscriber` 等待，不再维护额外队列
-- 节拍稳定观察阈值
-  - `cadence_stable_gaps = 2`
-  - `raw_cadence_min_tolerance_us = 300`
-  - `image_cadence_min_tolerance_us = 1500`
-
-## 模板参数与依赖
-
-- 模板参数
-  - `Info`：编译期 `CameraTypes::CameraInfo`
-- 依赖
-  - `qdu-future/CameraBase`
+正常稳态不应持续出现 `-> OBSERVING`。

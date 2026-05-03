@@ -64,6 +64,13 @@ jobs:
             https://github.com/QDU-Robomaster/CameraBase \
             ./Modules/CameraBase
 
+      - name: Pull CameraSync dependency
+        run: |
+          git clone --depth=1 \
+            --branch master \
+            https://github.com/QDU-Robomaster/CameraSync \
+            ./Modules/CameraSync
+
       - name: Create FakeCamera module
         run: |
           mkdir -p Modules/FakeCamera
