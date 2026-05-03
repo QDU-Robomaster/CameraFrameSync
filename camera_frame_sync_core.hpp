@@ -10,17 +10,15 @@ namespace CameraFrameSyncCore
 {
 
 /**
- * @brief 固定容量环形缓存，满时写入新值并丢弃最旧值。
- *
- * 该类型不做线程同步，只用于 CameraFrameSync 状态机线程内的短历史缓存。
+ * @brief 固定容量短历史，满时丢弃最旧样本。
  */
 template <typename T, size_t Capacity>
-class FixedRingBuffer
+class SampleHistory
 {
  public:
   using ValueType = T;
 
-  static_assert(Capacity > 0, "FixedRingBuffer requires non-zero capacity");
+  static_assert(Capacity > 0, "SampleHistory requires non-zero capacity");
 
   /**
    * @brief 是否为空。
@@ -35,29 +33,30 @@ class FixedRingBuffer
   /**
    * @brief 返回最旧元素。
    */
-  const T& Front() const { return storage_[head_]; }
+  const T& Front() const { return storage_[0]; }
+  T& Front() { return storage_[0]; }
 
   /**
    * @brief 返回最新元素。
    */
-  const T& Back() const { return storage_[PhysicalIndex(size_ - 1)]; }
+  const T& Back() const { return storage_[size_ - 1]; }
+  T& Back() { return storage_[size_ - 1]; }
 
   /**
    * @brief 按从旧到新的逻辑下标访问元素。
    */
-  T& operator[](size_t index) { return storage_[PhysicalIndex(index)]; }
+  T& operator[](size_t index) { return storage_[index]; }
 
   /**
    * @brief 按从旧到新的逻辑下标访问元素。
    */
-  const T& operator[](size_t index) const { return storage_[PhysicalIndex(index)]; }
+  const T& operator[](size_t index) const { return storage_[index]; }
 
   /**
    * @brief 清空缓存。
    */
   void Clear()
   {
-    head_ = 0;
     size_ = 0;
   }
 
@@ -70,13 +69,16 @@ class FixedRingBuffer
   {
     if (size_ < Capacity)
     {
-      storage_[PhysicalIndex(size_)] = value;
+      storage_[size_] = value;
       ++size_;
       return false;
     }
 
-    storage_[head_] = value;
-    head_ = Increment(head_);
+    for (size_t i = 1; i < Capacity; ++i)
+    {
+      storage_[i - 1] = storage_[i];
+    }
+    storage_[Capacity - 1] = value;
     return true;
   }
 
@@ -90,21 +92,15 @@ class FixedRingBuffer
       return;
     }
 
-    head_ = Increment(head_);
+    for (size_t i = 1; i < size_; ++i)
+    {
+      storage_[i - 1] = storage_[i];
+    }
     --size_;
   }
 
  private:
-  size_t PhysicalIndex(size_t logical_index) const
-  {
-    return (head_ + logical_index) % Capacity;
-  }
-
-  size_t Increment(size_t index) const { return (index + 1) % Capacity; }
-
- private:
   std::array<T, Capacity> storage_{};
-  size_t head_{0};
   size_t size_{0};
 };
 

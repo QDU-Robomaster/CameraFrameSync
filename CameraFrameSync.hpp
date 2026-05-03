@@ -163,7 +163,36 @@ class CameraFrameSync
  private:
   using SyncState = CameraFrameSyncCore::SyncState;
   template <typename T, size_t Capacity>
-  using FixedRingBuffer = CameraFrameSyncCore::FixedRingBuffer<T, Capacity>;
+  using SampleHistory = CameraFrameSyncCore::SampleHistory<T, Capacity>;
+
+  template <typename T>
+  class DropOldestQueue
+  {
+   public:
+    explicit DropOldestQueue(size_t capacity) : queue_(capacity) {}
+
+    bool Empty() const { return queue_.Size() == 0; }
+    bool Front(T& out) { return queue_.Peek(out) == LibXR::ErrorCode::OK; }
+    void PopFront() { queue_.Pop(); }
+    void Clear() { queue_.Reset(); }
+
+    bool PushBackDropOldest(const T& value)
+    {
+      if (queue_.Push(value) == LibXR::ErrorCode::OK)
+      {
+        return false;
+      }
+
+      T dropped{};
+      queue_.Pop(dropped);
+      const auto push_ans = queue_.Push(value);
+      ASSERT(push_ans == LibXR::ErrorCode::OK);
+      return true;
+    }
+
+   private:
+    LibXR::LockFreeQueue<T> queue_;
+  };
 
   struct GyroSample
   {
@@ -333,11 +362,11 @@ class CameraFrameSync
   LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
   std::atomic<bool> overflowed_{false};
 
-  FixedRingBuffer<QueuedGyro, pending_limit> pending_gyros_{};
-  FixedRingBuffer<QueuedAccl, pending_limit> pending_accls_{};
-  FixedRingBuffer<QueuedQuat, pending_limit> pending_quats_{};
-  FixedRingBuffer<ImageSample, image_event_limit> image_events_{};
-  FixedRingBuffer<AssembledImu, history_limit> imu_history_{};
+  DropOldestQueue<QueuedGyro> pending_gyros_{pending_limit};
+  DropOldestQueue<QueuedAccl> pending_accls_{pending_limit};
+  DropOldestQueue<QueuedQuat> pending_quats_{pending_limit};
+  DropOldestQueue<ImageSample> image_events_{image_event_limit};
+  SampleHistory<AssembledImu, history_limit> imu_history_{};
 
   LibXR::Mutex sync_state_mutex_{};
   SyncMode sync_mode_{SyncMode::RAW_PROBE};

@@ -363,7 +363,8 @@ void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
 template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 {
-  if (pending_gyros_.Empty())
+  QueuedGyro queued_gyro{};
+  if (!pending_gyros_.Front(queued_gyro))
   {
     return false;
   }
@@ -372,24 +373,27 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
     return false;
   }
 
-  const uint64_t gyro_ts = pending_gyros_.Front().sample.sensor_timestamp_us;
-  while (!pending_accls_.Empty() &&
-         pending_accls_.Front().sample.sensor_timestamp_us < gyro_ts)
+  const uint64_t gyro_ts = queued_gyro.sample.sensor_timestamp_us;
+  QueuedAccl queued_accl{};
+  while (pending_accls_.Front(queued_accl) &&
+         queued_accl.sample.sensor_timestamp_us < gyro_ts)
   {
     pending_accls_.PopFront();
   }
-  while (!pending_quats_.Empty() &&
-         pending_quats_.Front().sample.sensor_timestamp_us < gyro_ts)
+
+  QueuedQuat queued_quat{};
+  while (pending_quats_.Front(queued_quat) &&
+         queued_quat.sample.sensor_timestamp_us < gyro_ts)
   {
     pending_quats_.PopFront();
   }
-  if (pending_accls_.Empty() || pending_quats_.Empty())
+  if (!pending_accls_.Front(queued_accl) || !pending_quats_.Front(queued_quat))
   {
     return false;
   }
 
-  const uint64_t accl_ts = pending_accls_.Front().sample.sensor_timestamp_us;
-  const uint64_t quat_ts = pending_quats_.Front().sample.sensor_timestamp_us;
+  const uint64_t accl_ts = queued_accl.sample.sensor_timestamp_us;
+  const uint64_t quat_ts = queued_quat.sample.sensor_timestamp_us;
   if (accl_ts > gyro_ts || quat_ts > gyro_ts)
   {
     pending_gyros_.PopFront();
@@ -397,9 +401,9 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
     return true;
   }
 
-  const auto& gyro = pending_gyros_.Front().sample;
-  const auto& accl = pending_accls_.Front().sample;
-  const auto& quat = pending_quats_.Front().sample;
+  const auto& gyro = queued_gyro.sample;
+  const auto& accl = queued_accl.sample;
+  const auto& quat = queued_quat.sample;
   const AssembledImu imu{
       .sensor_timestamp_us = gyro.sensor_timestamp_us,
       .rotation_wxyz = quat.rotation_wxyz,

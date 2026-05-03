@@ -45,7 +45,7 @@ class SequenceHarness
 {
  public:
   template <typename T, size_t Capacity>
-  using Ring = FixedRingBuffer<T, Capacity>;
+  using Ring = SampleHistory<T, Capacity>;
 
   void SetMode(SyncMode mode)
   {

@@ -7,8 +7,11 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
   {
     if (!pending_image_.valid)
     {
+      if (!image_events_.Front(pending_image_.sample))
+      {
+        break;
+      }
       pending_image_.valid = true;
-      pending_image_.sample = image_events_.Front();
       image_events_.PopFront();
     }
 
