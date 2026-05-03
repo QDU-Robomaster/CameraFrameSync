@@ -4,7 +4,7 @@
 /* === MODULE MANIFEST V2 ===
 module_description: 相机共享图像桥与原始 imu 同步器
 constructor_args:
-  camera: @camera
+  camera: '@camera'
   runtime:
     mode: CameraFrameSync<Info>::SyncMode::RAW_PROBE
     offset_us: 0
