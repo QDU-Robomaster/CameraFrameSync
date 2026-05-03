@@ -106,7 +106,6 @@ class CameraFrameSync
         "camera_sync_command";  ///< CameraSync 命令 topic。
     std::string_view sync_result_topic_name =
         "camera_sync_result";           ///< CameraSync 回执 topic。
-    std::string_view raw_imu_topic_prefix = {};  ///< 原始 IMU topic 前缀，空值沿用相机名。
     uint32_t sync_probe_div = 3;         ///< MCU 临时分频系数。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
   };
@@ -207,9 +206,7 @@ class CameraFrameSync
           host_domain_name(runtime.host_topic_domain_name),
           sync_command_name(runtime.sync_command_topic_name),
           sync_result_name(runtime.sync_result_topic_name),
-          raw_imu_prefix(runtime.raw_imu_topic_prefix.empty()
-                             ? camera.NameView()
-                             : runtime.raw_imu_topic_prefix),
+          raw_imu_prefix(camera.NameView()),
           gyro_name(raw_imu_prefix + "_gyro"),
           accl_name(raw_imu_prefix + "_accl"),
           quat_name(raw_imu_prefix + "_quat"),
@@ -287,21 +284,6 @@ class CameraFrameSync
     QuatSample rotation_wxyz{};
   };
 
-  struct QueuedGyro
-  {
-    GyroSample sample{};
-  };
-
-  struct QueuedAccl
-  {
-    AcclSample sample{};
-  };
-
-  struct QueuedQuat
-  {
-    QuatReading sample{};
-  };
-
   struct ImageSample
   {
     uint64_t sensor_timestamp_us{};
@@ -315,28 +297,55 @@ class CameraFrameSync
     ImuVector linear_acceleration_xyz{};
   };
 
-  struct PendingImage
+  /**
+   * @brief 已锁定同步基准、但还在等待 offset 后最终 IMU 的挂起匹配。
+   */
+  struct PendingMatch
   {
     bool valid{false};
-    ImageSample sample{};
-    bool cadence_observed{false};
-    bool sync_candidate_valid{false};
-    uint64_t sync_candidate_sensor_timestamp_us{0};
-    uint64_t sync_candidate_period_us{0};
+    uint64_t imu_timestamp_us{0};
+    uint64_t period_us{0};
+  };
+
+  /**
+   * @brief 状态机当前持有的一帧图像时间戳。
+   *
+   * 真实图像已经发布到共享槽位；这里不能换下一张图像重试，否则会破坏
+   * 图像时间戳、同步基准 IMU 和最终 offset IMU 的对应关系。
+   */
+  struct PendingFrame
+  {
+    bool valid{false};
+    ImageSample image{};
+    bool cadence_consumed{false};
+    PendingMatch match{};
   };
 
   struct SyncMatch
   {
-    const AssembledImu* sync_imu{nullptr};
-    uint64_t sync_period_us{0};
+    const AssembledImu* imu{nullptr};
+    uint64_t period_us{0};
   };
 
-  struct SyncRelation
+  /**
+   * @brief 已观察到的正常发布周期。
+   *
+   * 这些周期只用于识别探针 gap 和在 IMU 时间轴上递推，不用于比较相机与
+   * IMU 时间戳的绝对值。
+   */
+  struct ObservedPeriods
   {
-    uint64_t image_period_us{0};
-    uint64_t imu_period_us{0};
-    uint64_t sync_period_us{0};
-    uint64_t last_sync_imu_timestamp_us{0};
+    uint64_t image_us{0};
+    uint64_t imu_us{0};
+  };
+
+  /**
+   * @brief RAW_PROBE 锁定后的 IMU 时间轴关系。
+   */
+  struct LockedSync
+  {
+    uint64_t period_us{0};
+    uint64_t last_imu_timestamp_us{0};
   };
 
   enum class ImageDecision : uint8_t
@@ -381,15 +390,15 @@ class CameraFrameSync
   void ObserveImuCadence(uint64_t sensor_timestamp_us);
 
   void ProcessImageEvents();
-  ImageDecision ProcessLatestImage(PendingImage& image);
-  ImageDecision ProcessRawProbeImage(PendingImage& image);
+  ImageDecision ProcessLatestImage(PendingFrame& frame);
+  ImageDecision ProcessRawProbeImage(PendingFrame& frame);
   CameraFrameSyncCore::CadenceUpdate ObserveNormalImageCadence(uint64_t image_ts);
   void MaybeStartProbe();
-  ImageDecision TryProbeImage(PendingImage& image);
-  ImageDecision TryLatestImuMatch(PendingImage& image);
-  ImageDecision TrySyncedImage(PendingImage& image);
-  ImageDecision ResumePendingMatch(PendingImage& image);
-  ImageDecision PublishOrRememberMatch(PendingImage& image,
+  ImageDecision TryProbeImage(PendingFrame& frame);
+  ImageDecision TryLatestImuMatch(PendingFrame& frame);
+  ImageDecision TrySyncedImage(PendingFrame& frame);
+  ImageDecision ResumePendingMatch(PendingFrame& frame);
+  ImageDecision PublishOrRememberMatch(PendingFrame& frame,
                                        const SyncMatch& match);
   ImageDecision PublishMatchedImage(const ImageSample& image, const SyncMatch& match);
   void PublishSyncedImu(uint64_t image_timestamp_us, const AssembledImu& imu);
@@ -401,7 +410,7 @@ class CameraFrameSync
   void RememberImage(uint64_t image_timestamp_us);
   void ResetImageObservation();
   void ClearPendingProbe();
-  void ClearPendingImage();
+  void ClearPendingFrame();
   void ResetLock(const char* reason, const char* detail);
   void ResetRuntimeState();
   void HandleOverflowRecovery();
@@ -412,14 +421,14 @@ class CameraFrameSync
 
   ImageData current_image_{};
 
-  LibXR::LockFreeQueue<QueuedGyro> gyro_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedAccl> accl_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QueuedQuat> quat_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<GyroSample> gyro_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<AcclSample> accl_ingress_{imu_ingress_length};
+  LibXR::LockFreeQueue<QuatReading> quat_ingress_{imu_ingress_length};
   std::atomic<bool> overflowed_{false};
 
-  DropOldestQueue<QueuedGyro> pending_gyros_{pending_limit};
-  DropOldestQueue<QueuedAccl> pending_accls_{pending_limit};
-  DropOldestQueue<QueuedQuat> pending_quats_{pending_limit};
+  DropOldestQueue<GyroSample> pending_gyros_{pending_limit};
+  DropOldestQueue<AcclSample> pending_accls_{pending_limit};
+  DropOldestQueue<QuatReading> pending_quats_{pending_limit};
   DropOldestQueue<ImageSample> image_events_{image_event_limit};
   SampleHistory<AssembledImu, history_limit> imu_history_{};
 
@@ -437,10 +446,11 @@ class CameraFrameSync
   SyncState state_{SyncState::OBSERVING};
   CameraFrameSyncCore::CadenceState image_cadence_{};
   CameraFrameSyncCore::CadenceState imu_cadence_{};
-  SyncRelation relation_{};
+  ObservedPeriods periods_{};
+  LockedSync locked_sync_{};
   bool last_image_valid_{false};
   uint64_t last_image_timestamp_us_{0};
-  PendingImage pending_image_{};
+  PendingFrame pending_frame_{};
   uint32_t pending_probe_seq_{0};
   bool pending_probe_ack_valid_{false};
   uint64_t pending_probe_imu_timestamp_us_{0};
