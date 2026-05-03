@@ -25,21 +25,24 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
 
   if (!topics_.image.Valid())
   {
-    char message[96] = {};
-    std::snprintf(message, sizeof(message),
-                  "CameraFrameSync: image topic creation failed (err=%d)",
-                  static_cast<int>(topics_.image.GetError()));
-    throw std::runtime_error(message);
+    XR_LOG_ERROR("CameraFrameSync: image topic creation failed err=%d",
+                 static_cast<int>(topics_.image.GetError()));
+    ASSERT(false);
+    return;
   }
   if (!AcquireInitialWritableImage())
   {
-    throw std::runtime_error("CameraFrameSync: initial image slot acquisition failed");
+    XR_LOG_ERROR("CameraFrameSync: initial image slot acquisition failed");
+    ASSERT(false);
+    return;
   }
   if (!camera.RegisterImageSink(current_image_.GetData(),
                                 ImageCommitCallback::Create(CommitImageAdapter, this)))
   {
     current_image_.Reset();
-    throw std::runtime_error("CameraFrameSync: image sink registration failed");
+    XR_LOG_ERROR("CameraFrameSync: image sink registration failed");
+    ASSERT(false);
+    return;
   }
 
   topics_.gyro.RegisterCallback(callbacks_.gyro);
@@ -48,8 +51,8 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   topics_.sync_result.RegisterCallback(callbacks_.sync_result);
 
   XR_LOG_INFO(
-      "CameraFrameSync: enabled sensor=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s",
-      topics_.sensor_name.c_str(), topics_.host_domain_name.c_str(),
+      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s",
+      topics_.raw_imu_prefix.c_str(), topics_.host_domain_name.c_str(),
       topics_.image_name.c_str(), topics_.imu_name.c_str(),
       topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
       topics_.quat_name.c_str(), SyncModeName(sync_mode_));

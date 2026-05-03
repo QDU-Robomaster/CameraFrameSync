@@ -34,9 +34,7 @@ depends:
 #include <array>
 #include <atomic>
 #include <cstddef>
-#include <cstdio>
 #include <cstdint>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -108,6 +106,7 @@ class CameraFrameSync
         "camera_sync_command";  ///< CameraSync 命令 topic。
     std::string_view sync_result_topic_name =
         "camera_sync_result";           ///< CameraSync 回执 topic。
+    std::string_view raw_imu_topic_prefix = {};  ///< 原始 IMU topic 前缀，空值沿用相机名。
     uint32_t sync_probe_div = 3;         ///< MCU 临时分频系数。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
   };
@@ -208,10 +207,12 @@ class CameraFrameSync
           host_domain_name(runtime.host_topic_domain_name),
           sync_command_name(runtime.sync_command_topic_name),
           sync_result_name(runtime.sync_result_topic_name),
-          sensor_name(camera.NameView()),
-          gyro_name(sensor_name + "_gyro"),
-          accl_name(sensor_name + "_accl"),
-          quat_name(sensor_name + "_quat"),
+          raw_imu_prefix(runtime.raw_imu_topic_prefix.empty()
+                             ? camera.NameView()
+                             : runtime.raw_imu_topic_prefix),
+          gyro_name(raw_imu_prefix + "_gyro"),
+          accl_name(raw_imu_prefix + "_accl"),
+          quat_name(raw_imu_prefix + "_quat"),
           host_domain(host_domain_name.c_str()),
           image(image_name.c_str(), image_topic_config),
           synced_imu(LibXR::Topic::FindOrCreate<ImuStamped>(
@@ -227,10 +228,7 @@ class CameraFrameSync
           quat(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_name.c_str(),
                                                          &host_domain))
     {
-      if (sensor_name.empty())
-      {
-        throw std::runtime_error("CameraFrameSync: camera name is required");
-      }
+      ASSERT(!raw_imu_prefix.empty());
     }
 
     std::string image_name;
@@ -238,7 +236,7 @@ class CameraFrameSync
     std::string host_domain_name;
     std::string sync_command_name;
     std::string sync_result_name;
-    std::string sensor_name;
+    std::string raw_imu_prefix;
     std::string gyro_name;
     std::string accl_name;
     std::string quat_name;
