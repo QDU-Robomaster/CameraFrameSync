@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "libxr.hpp"
+#include "linux_shared_topic.hpp"
 
 /**
  * @brief 一组已同步的图像共享槽位和 IMU 数据。
@@ -42,6 +43,15 @@ class CameraFrameSyncSubscriber
   using ImageData = typename ImageTopicT::Data;
 
   /**
+   * @brief 图像订阅使用丢旧语义，避免启动同步或消费滞后时反压相机。
+   *
+   * 图像是同步基线但不是积压队列；如果当前图像等不到同 timestamp 的 IMU，
+   * 后续更近的图像应覆盖旧描述符，不能让共享图像 publish 返回 FULL。
+   */
+  static constexpr LibXR::LinuxSharedSubscriberMode image_subscriber_mode =
+      LibXR::LinuxSharedSubscriberMode::BROADCAST_DROP_OLD;
+
+  /**
    * @brief 从 CameraFrameSync 实例推导 topic 名称。
    */
   template <typename SyncT>
@@ -70,7 +80,7 @@ class CameraFrameSyncSubscriber
         imu_topic_name_(imu_topic_name),
         host_topic_domain_name_(host_topic_domain_name),
         host_topic_domain_(host_topic_domain_name_.c_str()),
-        image_sub_(image_topic_name_.c_str()),
+        image_sub_(image_topic_name_.c_str(), image_subscriber_mode),
         imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(
                      imu_topic_name_.c_str(), UINT32_MAX, &host_topic_domain_)),
                  latest_imu_)
@@ -89,8 +99,8 @@ class CameraFrameSyncSubscriber
    * @param timeout_ms 总超时时间，UINT32_MAX 表示无限等待。
    * @return OK 表示成功；其他错误来自底层 topic 等待或超时。
    *
-   * 如果先拿到的图像没有对应 IMU，会继续等待；如果 IMU 已经越过该图像时间戳，
-   * 说明该图像无法配对，当前图像会被释放并等待下一张。
+   * 等待顺序是先同步 IMU、后图像。同步 IMU 是 CameraFrameSync 已经完成配对的
+   * 事件；这样 RAW_PROBE 启动阶段还没有同步结果时，消费者不会拿住无效图像槽位。
    */
   LibXR::ErrorCode Wait(SyncedFrame& out, uint32_t timeout_ms)
   {
@@ -98,35 +108,29 @@ class CameraFrameSyncSubscriber
 
     while (true)
     {
-      ImageData image_data;
-      const auto wait_ans =
-          image_sub_.Wait(image_data, RemainingMs(deadline_ms, timeout_ms));
-      if (wait_ans != LibXR::ErrorCode::OK)
+      ImuStampedT imu{};
+      const auto imu_ans = WaitForNextImu(deadline_ms, timeout_ms, imu);
+      if (imu_ans != LibXR::ErrorCode::OK)
       {
-        return wait_ans;
+        return imu_ans;
       }
 
-      const auto* image = image_data.GetData();
-      if (image == nullptr)
+      ImageData image;
+      const auto image_ans =
+          WaitForMatchingImage(static_cast<uint64_t>(imu.timestamp_us),
+                               deadline_ms, timeout_ms, image);
+      if (image_ans == LibXR::ErrorCode::OK)
       {
-        image_data.Reset();
-        continue;
-      }
-
-      const auto imu_ans =
-          WaitForMatchingImu(static_cast<uint64_t>(image->timestamp_us),
-                             deadline_ms, timeout_ms, out.imu);
-      if (imu_ans == LibXR::ErrorCode::OK)
-      {
-        out.image = std::move(image_data);
+        out.imu = imu;
+        out.image = std::move(image);
         return LibXR::ErrorCode::OK;
       }
-      if (imu_ans == LibXR::ErrorCode::EMPTY)
+      if (image_ans == LibXR::ErrorCode::EMPTY)
       {
-        image_data.Reset();
+        // 图像已经越过该 IMU timestamp，说明这组数据因丢旧策略被跳过。
         continue;
       }
-      return imu_ans;
+      return image_ans;
     }
   }
 
@@ -158,38 +162,79 @@ class CameraFrameSyncSubscriber
   }
 
   /**
-   * @brief 阻塞等待指定图像时间戳对应的同步 IMU。
+   * @brief 等待下一条 timestamp 单调前进的同步 IMU。
    */
-  LibXR::ErrorCode WaitForMatchingImu(uint64_t image_timestamp_us,
-                                      uint64_t deadline_ms,
-                                      uint32_t timeout_ms,
-                                      ImuStampedT& matched_imu)
+  LibXR::ErrorCode WaitForNextImu(uint64_t deadline_ms, uint32_t timeout_ms,
+                                  ImuStampedT& imu)
   {
     while (true)
     {
-      if (latest_imu_valid_)
-      {
-        const uint64_t imu_timestamp_us =
-            static_cast<uint64_t>(latest_imu_.timestamp_us);
-        if (imu_timestamp_us == image_timestamp_us)
-        {
-          matched_imu = latest_imu_;
-          latest_imu_valid_ = false;
-          return LibXR::ErrorCode::OK;
-        }
-        if (imu_timestamp_us > image_timestamp_us)
-        {
-          return LibXR::ErrorCode::EMPTY;
-        }
-      }
-
       const auto wait_ans =
           imu_sub_.Wait(RemainingMs(deadline_ms, timeout_ms));
       if (wait_ans != LibXR::ErrorCode::OK)
       {
         return wait_ans;
       }
-      latest_imu_valid_ = true;
+
+      const uint64_t imu_timestamp_us =
+          static_cast<uint64_t>(latest_imu_.timestamp_us);
+      if (last_imu_valid_ && imu_timestamp_us <= last_imu_timestamp_us_)
+      {
+        // SyncSubscriber 可能留下旧信号量计数；payload 是最新值，旧计数直接吃掉。
+        continue;
+      }
+
+      last_imu_valid_ = true;
+      last_imu_timestamp_us_ = imu_timestamp_us;
+      imu = latest_imu_;
+      return LibXR::ErrorCode::OK;
+    }
+  }
+
+  /**
+   * @brief 从共享图像流中找到指定 timestamp 的图像。
+   *
+   * 早于目标 IMU 的图像直接释放；晚于目标 IMU 的图像保留在 pending_image_，等待
+   * 后续 IMU 追上，避免因为一次错过就丢掉可能可配对的最新图像。
+   */
+  LibXR::ErrorCode WaitForMatchingImage(uint64_t imu_timestamp_us,
+                                        uint64_t deadline_ms,
+                                        uint32_t timeout_ms,
+                                        ImageData& image)
+  {
+    while (true)
+    {
+      if (pending_image_.Empty())
+      {
+        const auto wait_ans = image_sub_.Wait(
+            pending_image_, RemainingMs(deadline_ms, timeout_ms));
+        if (wait_ans != LibXR::ErrorCode::OK)
+        {
+          return wait_ans;
+        }
+      }
+
+      const auto* frame = pending_image_.GetData();
+      if (frame == nullptr)
+      {
+        pending_image_.Reset();
+        continue;
+      }
+
+      const uint64_t image_timestamp_us =
+          static_cast<uint64_t>(frame->timestamp_us);
+      if (image_timestamp_us < imu_timestamp_us)
+      {
+        pending_image_.Reset();
+        continue;
+      }
+      if (image_timestamp_us == imu_timestamp_us)
+      {
+        image = std::move(pending_image_);
+        return LibXR::ErrorCode::OK;
+      }
+
+      return LibXR::ErrorCode::EMPTY;
     }
   }
 
@@ -201,5 +246,7 @@ class CameraFrameSyncSubscriber
   typename ImageTopicT::Subscriber image_sub_;
   ImuStampedT latest_imu_{};
   LibXR::Topic::SyncSubscriber<ImuStampedT> imu_sub_;
-  bool latest_imu_valid_{false};
+  bool last_imu_valid_{false};
+  uint64_t last_imu_timestamp_us_{0};
+  ImageData pending_image_{};
 };

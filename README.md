@@ -101,8 +101,9 @@ IMU 组装以 gyro 为主轴：
 后续模块通过 `CameraFrameSync::Subscriber` 消费同步结果：
 
 - `Wait(out, timeout_ms)` 是阻塞接口，`UINT32_MAX` 表示无限等待
+- `Wait()` 先等待同步后 IMU，再取同 timestamp 的共享图像；RAW_PROBE 启动尚未锁定时，消费者不会持有未同步图像槽位
 - 成功返回时，`out.image` 持有共享图像槽位，`out.imu` 是 timestamp 完全相同的同步 IMU
-- 如果某张图像已经被 IMU 时间轴越过，Subscriber 会释放这张图并继续等下一张
+- 图像订阅使用丢旧语义；如果某张图像已经被 IMU 时间轴越过，Subscriber 会释放这张图并继续等下一张
 - 回调里不做 Detector/Tracker 工作，重计算应放在消费者线程里
 
 ## 配置
