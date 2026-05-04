@@ -94,8 +94,8 @@ class SequenceHarness
   SyncState State() const { return state_; }
   uint32_t ProbeSentCount() const { return probe_sent_count_; }
   uint32_t LastProbeSeq() const { return last_probe_seq_; }
-  uint64_t ImagePeriodUs() const { return relation_.image_period_us; }
-  uint64_t ImuPeriodUs() const { return relation_.imu_period_us; }
+  uint64_t ImagePeriodUs() const { return periods_.image_us; }
+  uint64_t ImuPeriodUs() const { return periods_.imu_us; }
 
   const std::vector<uint32_t>& PublishedTags() const { return published_tags_; }
   const std::vector<uint64_t>& SyncImuTimestamps() const { return sync_imu_timestamps_; }
@@ -104,28 +104,37 @@ class SequenceHarness
   const std::vector<uint64_t>& HistoryTimestamps() const { return history_timestamps_; }
 
  private:
-  struct PendingImage
+  struct PendingMatch
+  {
+    bool valid{false};
+    uint64_t imu_timestamp_us{0};
+    uint64_t period_us{0};
+  };
+
+  struct PendingFrame
   {
     bool valid{false};
     ImageEvent event{};
     bool cadence_observed{false};
-    bool sync_candidate_valid{false};
-    uint64_t sync_candidate_timestamp_us{0};
-    uint64_t sync_period_us{0};
+    PendingMatch match{};
   };
 
-  struct Relation
+  struct ObservedPeriods
   {
-    uint64_t image_period_us{0};
-    uint64_t imu_period_us{0};
-    uint64_t sync_period_us{0};
-    uint64_t last_sync_imu_timestamp_us{0};
+    uint64_t image_us{0};
+    uint64_t imu_us{0};
+  };
+
+  struct LockedSync
+  {
+    uint64_t period_us{0};
+    uint64_t last_imu_timestamp_us{0};
   };
 
   struct Match
   {
-    const Imu* sync_imu{nullptr};
-    uint64_t sync_period_us{0};
+    const Imu* imu{nullptr};
+    uint64_t period_us{0};
   };
 
   enum class Decision : uint8_t
@@ -149,10 +158,11 @@ class SequenceHarness
     images_.Clear();
     history_.Clear();
     history_timestamps_.clear();
-    pending_image_ = {};
+    pending_frame_ = {};
     image_cadence_ = {};
     imu_cadence_ = {};
-    relation_ = {};
+    periods_ = {};
+    locked_sync_ = {};
     state_ = SyncState::OBSERVING;
     last_image_valid_ = false;
     last_image_timestamp_us_ = 0;
@@ -164,8 +174,7 @@ class SequenceHarness
   void ResetLock()
   {
     state_ = SyncState::OBSERVING;
-    relation_.sync_period_us = 0;
-    relation_.last_sync_imu_timestamp_us = 0;
+    locked_sync_ = {};
     ClearPendingProbe();
   }
 
@@ -180,7 +189,7 @@ class SequenceHarness
   void ResetImageObservation()
   {
     image_cadence_ = {};
-    relation_.image_period_us = 0;
+    periods_.image_us = 0;
     last_image_valid_ = false;
     last_image_timestamp_us_ = 0;
   }
@@ -236,41 +245,41 @@ class SequenceHarness
     }
     if (imu_cadence_.stable)
     {
-      relation_.imu_period_us = imu_cadence_.period_us;
+      periods_.imu_us = imu_cadence_.period_us;
     }
     return true;
   }
 
   void ProcessImages()
   {
-    while (pending_image_.valid || !images_.Empty())
+    while (pending_frame_.valid || !images_.Empty())
     {
-      if (!pending_image_.valid)
+      if (!pending_frame_.valid)
       {
-        pending_image_.valid = true;
-        pending_image_.event = images_.Front();
+        pending_frame_.valid = true;
+        pending_frame_.event = images_.Front();
         images_.PopFront();
       }
 
       const Decision decision =
-          mode_ == SyncMode::LATEST_IMU ? ProcessLatest(pending_image_)
-                                        : ProcessRawProbe(pending_image_);
+          mode_ == SyncMode::LATEST_IMU ? ProcessLatest(pending_frame_)
+                                        : ProcessRawProbe(pending_frame_);
       if (decision == Decision::WAIT)
       {
         break;
       }
       if (decision == Decision::RESET)
       {
-        reset_tags_.push_back(pending_image_.event.tag);
-        pending_image_ = {};
+        reset_tags_.push_back(pending_frame_.event.tag);
+        pending_frame_ = {};
         ResetLock();
         continue;
       }
-      pending_image_ = {};
+      pending_frame_ = {};
     }
   }
 
-  Decision ProcessLatest(PendingImage& image)
+  Decision ProcessLatest(PendingFrame& image)
   {
     if (last_image_valid_ && image.event.sensor_timestamp_us <= last_image_timestamp_us_)
     {
@@ -278,7 +287,7 @@ class SequenceHarness
       return Decision::DONE;
     }
 
-    const Decision decision = image.sync_candidate_valid
+    const Decision decision = image.match.valid
                                   ? Resume(image)
                                   : PublishOrRemember(image, LatestMatch());
     if (decision != Decision::WAIT)
@@ -288,9 +297,9 @@ class SequenceHarness
     return decision;
   }
 
-  Decision ProcessRawProbe(PendingImage& image)
+  Decision ProcessRawProbe(PendingFrame& image)
   {
-    if (image.sync_candidate_valid)
+    if (image.match.valid)
     {
       return Resume(image);
     }
@@ -354,14 +363,14 @@ class SequenceHarness
     return Decision::RESET;
   }
 
-  CadenceUpdate ObserveImage(PendingImage& image)
+  CadenceUpdate ObserveImage(PendingFrame& image)
   {
     image.cadence_observed = true;
     const auto update = ObserveCadence(image_cadence_, image.event.sensor_timestamp_us,
                                        stable_gaps, image_tolerance_us);
     if (image_cadence_.stable)
     {
-      relation_.image_period_us = image_cadence_.period_us;
+      periods_.image_us = image_cadence_.period_us;
     }
     return update;
   }
@@ -374,8 +383,7 @@ class SequenceHarness
       return;
     }
 
-    relation_.sync_period_us = EstimatedSyncPeriod();
-    if (relation_.sync_period_us == 0)
+    if (EstimatedSyncPeriod() == 0)
     {
       return;
     }
@@ -389,7 +397,7 @@ class SequenceHarness
     active_probe_seq_ = last_probe_seq_;
   }
 
-  Decision TryProbeImage(PendingImage& image)
+  Decision TryProbeImage(PendingFrame& image)
   {
     if (!probe_ack_valid_ && probe_ack_seq_ == last_probe_seq_)
     {
@@ -405,7 +413,7 @@ class SequenceHarness
     }
 
     const Imu* sync_imu = FindBySensorTimestamp(
-        history_, probe_ack_timestamp_us_, ImuTimestampToleranceUs(relation_.imu_period_us));
+        history_, probe_ack_timestamp_us_, ImuTimestampToleranceUs(periods_.imu_us));
     if (sync_imu == nullptr)
     {
       return Decision::RESET;
@@ -419,67 +427,64 @@ class SequenceHarness
     {
       return {};
     }
-    return Match{&history_.Back(), relation_.imu_period_us != 0 ? relation_.imu_period_us : 1};
+    return Match{&history_.Back(), periods_.imu_us != 0 ? periods_.imu_us : 1};
   }
 
-  Decision TrySyncedImage(PendingImage& image)
+  Decision TrySyncedImage(PendingFrame& image)
   {
-    const uint64_t expected = relation_.last_sync_imu_timestamp_us + relation_.sync_period_us;
+    const uint64_t expected = locked_sync_.last_imu_timestamp_us + locked_sync_.period_us;
     if (!HistoryReached(expected))
     {
       return Decision::WAIT;
     }
     const Imu* sync_imu =
-        FindBySensorTimestamp(history_, expected,
-                              ImuTimestampToleranceUs(relation_.imu_period_us));
+        FindBySensorTimestamp(history_, expected, ImuTimestampToleranceUs(periods_.imu_us));
     if (sync_imu == nullptr)
     {
       return Decision::RESET;
     }
-    return PublishOrRemember(image, Match{sync_imu, relation_.sync_period_us});
+    return PublishOrRemember(image, Match{sync_imu, locked_sync_.period_us});
   }
 
-  Decision Resume(PendingImage& image)
+  Decision Resume(PendingFrame& image)
   {
     const Imu* sync_imu =
-        FindBySensorTimestamp(history_, image.sync_candidate_timestamp_us, 0);
+        FindBySensorTimestamp(history_, image.match.imu_timestamp_us, 0);
     if (sync_imu == nullptr)
     {
       return Decision::RESET;
     }
-    return PublishOrRemember(image, Match{sync_imu, image.sync_period_us});
+    return PublishOrRemember(image, Match{sync_imu, image.match.period_us});
   }
 
-  Decision PublishOrRemember(PendingImage& image, Match match)
+  Decision PublishOrRemember(PendingFrame& image, Match match)
   {
-    if (match.sync_imu == nullptr || match.sync_period_us == 0)
+    if (match.imu == nullptr || match.period_us == 0)
     {
       return Decision::WAIT;
     }
 
-    const uint64_t final_ts =
-        ApplyOffsetUs(match.sync_imu->sensor_timestamp_us, offset_us_);
+    const uint64_t final_ts = ApplyOffsetUs(match.imu->sensor_timestamp_us, offset_us_);
     if (!HistoryReached(final_ts))
     {
-      image.sync_candidate_valid = true;
-      image.sync_candidate_timestamp_us = match.sync_imu->sensor_timestamp_us;
-      image.sync_period_us = match.sync_period_us;
+      image.match.valid = true;
+      image.match.imu_timestamp_us = match.imu->sensor_timestamp_us;
+      image.match.period_us = match.period_us;
       return Decision::WAIT;
     }
 
     const Imu* final_imu =
-        FindBySensorTimestamp(history_, final_ts,
-                              ImuTimestampToleranceUs(relation_.imu_period_us));
+        FindBySensorTimestamp(history_, final_ts, ImuTimestampToleranceUs(periods_.imu_us));
     if (final_imu == nullptr)
     {
       return Decision::RESET;
     }
 
     published_tags_.push_back(image.event.tag);
-    sync_imu_timestamps_.push_back(match.sync_imu->sensor_timestamp_us);
+    sync_imu_timestamps_.push_back(match.imu->sensor_timestamp_us);
     final_imu_timestamps_.push_back(final_imu->sensor_timestamp_us);
-    relation_.sync_period_us = match.sync_period_us;
-    relation_.last_sync_imu_timestamp_us = match.sync_imu->sensor_timestamp_us;
+    locked_sync_.period_us = match.period_us;
+    locked_sync_.last_imu_timestamp_us = match.imu->sensor_timestamp_us;
     state_ = SyncState::SYNCED;
     ClearPendingProbe();
     RememberImage(image.event.sensor_timestamp_us);
@@ -489,8 +494,8 @@ class SequenceHarness
   uint64_t EstimatedSyncPeriod() const
   {
     const uint32_t stride =
-        EstimateStrideSamples(relation_.image_period_us, relation_.imu_period_us);
-    return stride == 0 ? 0 : relation_.imu_period_us * static_cast<uint64_t>(stride);
+        EstimateStrideSamples(periods_.image_us, periods_.imu_us);
+    return stride == 0 ? 0 : periods_.imu_us * static_cast<uint64_t>(stride);
   }
 
   bool HistoryReached(uint64_t timestamp_us) const
@@ -500,16 +505,15 @@ class SequenceHarness
 
   bool IsNormalGap(uint64_t gap_us) const
   {
-    return relation_.image_period_us != 0 &&
-           AbsDiffUs(gap_us, relation_.image_period_us) <=
-               ImageGapToleranceUs(relation_.image_period_us);
+    return periods_.image_us != 0 && AbsDiffUs(gap_us, periods_.image_us) <=
+                                         ImageGapToleranceUs(periods_.image_us);
   }
 
   bool IsProbeGap(uint64_t gap_us) const
   {
-    const uint64_t expected = ProbeImageGapUs(relation_.image_period_us, probe_div);
+    const uint64_t expected = ProbeImageGapUs(periods_.image_us, probe_div);
     return expected != 0 && AbsDiffUs(gap_us, expected) <=
-                                ImageGapToleranceUs(relation_.image_period_us);
+                                ImageGapToleranceUs(periods_.image_us);
   }
 
   void RememberImage(uint64_t timestamp_us)
@@ -530,8 +534,9 @@ class SequenceHarness
   SyncState state_{SyncState::OBSERVING};
   CadenceState image_cadence_{};
   CadenceState imu_cadence_{};
-  Relation relation_{};
-  PendingImage pending_image_{};
+  ObservedPeriods periods_{};
+  LockedSync locked_sync_{};
+  PendingFrame pending_frame_{};
 
   bool last_image_valid_{false};
   uint64_t last_image_timestamp_us_{0};
