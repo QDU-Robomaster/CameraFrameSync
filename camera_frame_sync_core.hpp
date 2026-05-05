@@ -174,7 +174,7 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
 }
 
 /**
- * @brief CameraSync 临时分频后，Host 应观察到的 probe 图像间隔。
+ * @brief CameraSync 探针分频后，Host 应观察到的 probe 图像间隔。
  */
 inline uint64_t ProbeImageGapUs(uint64_t image_period_us, uint32_t div)
 {
@@ -183,14 +183,13 @@ inline uint64_t ProbeImageGapUs(uint64_t image_period_us, uint32_t div)
     return 0;
   }
 
-  const uint64_t multiplier = static_cast<uint64_t>(div) + 1ULL;
+  const uint64_t multiplier = static_cast<uint64_t>(div);
   if (image_period_us > std::numeric_limits<uint64_t>::max() / multiplier)
   {
     return std::numeric_limits<uint64_t>::max();
   }
 
-  // CameraSync 拉长的是一个反向半周期；正常一帧是两个半周期。
-  return (image_period_us * multiplier) / 2ULL;
+  return image_period_us * multiplier;
 }
 
 /**

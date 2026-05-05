@@ -77,13 +77,14 @@ IMU 组装以 gyro 为主轴：
 
 1. `OBSERVING` 中观察到稳定图像周期 `T` 和稳定 IMU 周期 `t`
 2. 计算 `N = round(T / t)`，同步 IMU 周期为 `N * t`
-3. 发送 `CameraSync::SyncCommand{div=sync_probe_div, active_level, seq}`
-4. MCU 在下一段反向半周期执行命令，并在同步点发布 `CameraSync::SyncEvent{seq}`
-5. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
-6. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
-7. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
+3. 根据 IMU 周期和 `target_trigger_hz` 计算 `run_trigger_div`
+4. 发送 `CameraSync::SyncCommand{sync_probe_div, run_trigger_div, active_level, seq}`
+5. MCU 制造一次可预测的 probe 图像 gap，并在同步点发布 `CameraSync::SyncEvent{seq, run_trigger_div}`
+6. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
+7. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
+8. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
 
-`sync_probe_div = 3` 时，期望 probe 图像 gap 为 `2T`。通用公式是 `T * (div + 1) / 2`。
+`sync_probe_div = 3` 时，期望 probe 图像 gap 为 `3T`。通用公式是 `T * sync_probe_div`。
 
 ## offset_us
 
@@ -121,14 +122,30 @@ constructor_args:
 constructor_args:
   camera: '@camera'
   runtime:
-    expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::LATEST_IMU, .offset_us = 0}"
+    mode: {expr: "CameraFrameSync<Info>::SyncMode::LATEST_IMU"}
+    offset_us: 0
+    host_topic_domain_name: libxr_def_domain
+    sync_command_topic_name: camera_sync_command
+    sync_result_topic_name: camera_sync_result
+    sync_probe_div: 3
+    sync_active_level: 1
+    target_trigger_hz: {expr: 50.0F}
 ```
 
 Webots / 实机可显式配置同步 topic：
 
 ```yaml
-runtime:
-  expr: "CameraFrameSync<Info>::RuntimeParam{.mode = CameraFrameSync<Info>::SyncMode::RAW_PROBE, .offset_us = 0, .host_topic_domain_name = \"host\", .sync_command_topic_name = \"camera_sync_command\", .sync_result_topic_name = \"camera_sync_result\", .sync_probe_div = 3, .sync_active_level = 1}"
+constructor_args:
+  camera: '@camera'
+  runtime:
+    mode: {expr: "CameraFrameSync<Info>::SyncMode::RAW_PROBE"}
+    offset_us: 0
+    host_topic_domain_name: host
+    sync_command_topic_name: camera_sync_command
+    sync_result_topic_name: camera_sync_result
+    sync_probe_div: 3
+    sync_active_level: 1
+    target_trigger_hz: {expr: 50.0F}
 ```
 
 ## 日志

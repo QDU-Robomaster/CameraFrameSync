@@ -26,8 +26,11 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   offset_us_ = runtime.offset_us;
   sync_probe_div_ = runtime.sync_probe_div;
   sync_active_level_ = runtime.sync_active_level == 0 ? 0U : 1U;
+  target_trigger_hz_ = runtime.target_trigger_hz;
 
   ASSERT(sync_probe_div_ != 0);
+  ASSERT(sync_probe_div_ <= UINT8_MAX);
+  ASSERT(target_trigger_hz_ > 0.0F);
 
   // 共享图像 topic 是后续 Detector/Preview 的图像唯一来源，创建失败直接中止。
   if (!topics_.image.Valid())
@@ -60,11 +63,12 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   topics_.sync_result.RegisterCallback(callbacks_.sync_result);
 
   XR_LOG_INFO(
-      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s",
+      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s target_trigger_hz=%.3f",
       topics_.raw_imu_prefix.c_str(), topics_.host_domain_name.c_str(),
       topics_.image_name.c_str(), topics_.imu_name.c_str(),
       topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
-      topics_.quat_name.c_str(), SyncModeName(sync_mode_));
+      topics_.quat_name.c_str(), SyncModeName(sync_mode_),
+      static_cast<double>(target_trigger_hz_));
 }
 
 /**
@@ -316,6 +320,11 @@ void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const CameraSync::SyncEvent& event)
 {
+  if (event.version != 1 || event.run_trigger_div == 0)
+  {
+    return;
+  }
+
   const uint32_t active_seq = self->active_probe_seq_.load();
   if (active_seq == 0 || event.seq != active_seq)
   {
@@ -329,6 +338,7 @@ void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
   }
 
   self->probe_ack_timestamp_us_.store(static_cast<uint64_t>(timestamp));
+  self->probe_ack_run_div_.store(event.run_trigger_div);
   self->probe_ack_seq_.store(event.seq);
 }
 

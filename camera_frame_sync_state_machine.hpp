@@ -180,25 +180,34 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   }
 
   CameraSync::SyncCommand cmd{};
-  cmd.div = sync_probe_div_;
-  cmd.active_level = sync_active_level_;
+  cmd.version = 1;
   cmd.seq = next_sync_seq_++;
+  if (next_sync_seq_ == 0)
+  {
+    next_sync_seq_ = 1;
+  }
+  cmd.sync_probe_div = static_cast<uint8_t>(sync_probe_div_);
+  cmd.run_trigger_div = TargetRunTriggerDiv();
+  cmd.active_level = static_cast<uint8_t>(sync_active_level_);
 
   state_ = SyncState::PROBE_SENT;
   pending_probe_seq_ = cmd.seq;
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;
+  pending_run_period_us_ = periods_.imu_us * static_cast<uint64_t>(cmd.run_trigger_div);
   // 回环很短时回执可能早于 Publish 返回，因此先打开当前 probe 邮箱。
   probe_ack_timestamp_us_.store(0);
   probe_ack_seq_.store(0);
+  probe_ack_run_div_.store(0);
   active_probe_seq_.store(cmd.seq);
 
   topics_.sync_command.Publish(cmd);
 
   XR_LOG_INFO(
-      "CameraFrameSync: sync command sent seq=%u div=%u active=%u image_period_us=%u imu_period_us=%u sync_period_us=%u",
-      static_cast<unsigned>(cmd.seq), static_cast<unsigned>(cmd.div),
-      static_cast<unsigned>(cmd.active_level),
+      "CameraFrameSync: sync command sent seq=%u probe_div=%u run_div=%u active=%u target_hz=%.3f image_period_us=%u imu_period_us=%u sync_period_us=%u",
+      static_cast<unsigned>(cmd.seq), static_cast<unsigned>(cmd.sync_probe_div),
+      static_cast<unsigned>(cmd.run_trigger_div),
+      static_cast<unsigned>(cmd.active_level), static_cast<double>(target_trigger_hz_),
       static_cast<unsigned>(periods_.image_us),
       static_cast<unsigned>(periods_.imu_us),
       static_cast<unsigned>(sync_period_us));
@@ -215,6 +224,12 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
     // 回执 timestamp 来自 IMU 时间轴，是 RAW_PROBE 的唯一跨端同步锚点。
     pending_probe_ack_valid_ = true;
     pending_probe_imu_timestamp_us_ = probe_ack_timestamp_us_.load();
+    const uint32_t ack_run_div = probe_ack_run_div_.load();
+    if (ack_run_div == 0 || ack_run_div > UINT8_MAX)
+    {
+      return ImageDecision::RESET;
+    }
+    pending_run_period_us_ = periods_.imu_us * static_cast<uint64_t>(ack_run_div);
   }
   if (sync_period_us == 0 || !pending_probe_ack_valid_)
   {
@@ -357,12 +372,20 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
   }
 
   PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
-  RememberImage(image.sensor_timestamp_us);
 
   const SyncState old_state = state_;
   state_ = SyncState::SYNCED;
   locked_sync_.period_us = match.period_us;
   locked_sync_.last_imu_timestamp_us = match.imu->sensor_timestamp_us;
+  if (old_state == SyncState::PROBE_SENT && pending_run_period_us_ != 0)
+  {
+    locked_sync_.period_us = pending_run_period_us_;
+    LockImageCadence(image.sensor_timestamp_us, pending_run_period_us_);
+  }
+  else
+  {
+    RememberImage(image.sensor_timestamp_us);
+  }
   ClearPendingProbe();
 
   if (old_state != SyncState::SYNCED)
@@ -393,6 +416,19 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::LockImageCadence(uint64_t image_timestamp_us,
+                                                    uint64_t image_period_us)
+{
+  image_cadence_.has_last_timestamp = true;
+  image_cadence_.stable = true;
+  image_cadence_.last_timestamp_us = image_timestamp_us;
+  image_cadence_.period_us = image_period_us;
+  image_cadence_.stable_count = cadence_stable_gaps;
+  periods_.image_us = image_period_us;
+  RememberImage(image_timestamp_us);
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
 uint64_t CameraFrameSync<CameraInfoV>::EstimatedSyncPeriodUs() const
 {
   if (periods_.image_us == 0 || periods_.imu_us == 0)
@@ -402,6 +438,28 @@ uint64_t CameraFrameSync<CameraInfoV>::EstimatedSyncPeriodUs() const
   const uint32_t stride = CameraFrameSyncCore::EstimateStrideSamples(
       periods_.image_us, periods_.imu_us);
   return stride == 0 ? 0 : periods_.imu_us * static_cast<uint64_t>(stride);
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+uint8_t CameraFrameSync<CameraInfoV>::TargetRunTriggerDiv() const
+{
+  if (periods_.imu_us == 0 || target_trigger_hz_ <= 0.0F)
+  {
+    return 1;
+  }
+
+  const double imu_hz = 1000000.0 / static_cast<double>(periods_.imu_us);
+  const double raw_div = imu_hz / static_cast<double>(target_trigger_hz_);
+  uint32_t div = static_cast<uint32_t>(raw_div + 0.5);
+  if (div == 0)
+  {
+    div = 1;
+  }
+  if (div > UINT8_MAX)
+  {
+    div = UINT8_MAX;
+  }
+  return static_cast<uint8_t>(div);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -451,10 +509,12 @@ void CameraFrameSync<CameraInfoV>::ClearPendingProbe()
 {
   active_probe_seq_.store(0);
   probe_ack_seq_.store(0);
+  probe_ack_run_div_.store(0);
   probe_ack_timestamp_us_.store(0);
   pending_probe_seq_ = 0;
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;
+  pending_run_period_us_ = 0;
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>

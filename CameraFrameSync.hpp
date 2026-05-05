@@ -13,6 +13,7 @@ constructor_args:
     sync_result_topic_name: "camera_sync_result"
     sync_probe_div: 3
     sync_active_level: 1
+    target_trigger_hz: 50.0F
 template_args:
   - Info:
       width: 1280
@@ -114,8 +115,9 @@ class CameraFrameSync
         "camera_sync_command";  ///< CameraSync 命令 topic。
     std::string_view sync_result_topic_name =
         "camera_sync_result";           ///< CameraSync 回执 topic。
-    uint32_t sync_probe_div = 3;         ///< MCU 临时分频系数。
+    uint32_t sync_probe_div = 3;         ///< CameraSync 探针分频倍率。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
+    float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
   };
 
   /**
@@ -484,6 +486,11 @@ class CameraFrameSync
                                  const CameraSync::SyncEvent& event);
 
   /**
+   * @brief 将图像周期观察切到同步完成后的目标运行周期。
+   */
+  void LockImageCadence(uint64_t image_timestamp_us, uint64_t image_period_us);
+
+  /**
    * @brief 图像成功发布后的同步处理入口。
    */
   void ProcessCommittedImage(uint64_t image_timestamp_us);
@@ -580,6 +587,11 @@ class CameraFrameSync
   uint64_t EstimatedSyncPeriodUs() const;
 
   /**
+   * @brief 根据 IMU 周期和目标频率计算 MCU 正常运行分频。
+   */
+  uint8_t TargetRunTriggerDiv() const;
+
+  /**
    * @brief 判断图像间隔是否仍符合正常发布周期。
    */
   bool IsNormalImageGap(uint64_t image_gap_us) const;
@@ -674,13 +686,15 @@ class CameraFrameSync
   int32_t offset_us_{0};
   uint32_t sync_probe_div_{3};
   uint32_t sync_active_level_{1};
-  uint32_t next_sync_seq_{1};
+  float target_trigger_hz_{50.0F};
+  uint8_t next_sync_seq_{1};
 
   /**
    * @brief CameraSync 回执邮箱；回调只接受 active probe 的一次反馈。
    */
   std::atomic<uint32_t> active_probe_seq_{0};
   std::atomic<uint32_t> probe_ack_seq_{0};
+  std::atomic<uint32_t> probe_ack_run_div_{0};
   std::atomic<uint64_t> probe_ack_timestamp_us_{0};
 
   /**
@@ -709,6 +723,7 @@ class CameraFrameSync
   uint32_t pending_probe_seq_{0};
   bool pending_probe_ack_valid_{false};
   uint64_t pending_probe_imu_timestamp_us_{0};
+  uint64_t pending_run_period_us_{0};
 };
 
 #include "camera_frame_sync_impl.hpp"

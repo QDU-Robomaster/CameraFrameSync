@@ -390,6 +390,10 @@ class SequenceHarness
 
     state_ = SyncState::PROBE_SENT;
     last_probe_seq_ = next_seq_++;
+    if (next_seq_ > UINT8_MAX)
+    {
+      next_seq_ = 1;
+    }
     probe_sent_count_++;
     probe_ack_valid_ = false;
     probe_ack_seq_ = 0;
@@ -795,7 +799,7 @@ void TestRawProbeLocksFromCameraSyncAck()
   ExpectEqual(harness.ProbeSentCount(), 1U, "稳定后应只发一次 probe");
   ExpectEqual(harness.State(), SyncState::SYNCED, "收到 CameraSync ack 后应进入 SYNCED");
   Expect(!harness.PublishedTags().empty(), "probe 图像应被发布");
-  ExpectEqual(harness.SyncImuTimestamps().front(), 50000ULL,
+  ExpectEqual(harness.SyncImuTimestamps().front(), 60000ULL,
               "第一帧同步 IMU 应来自 CameraSync result 的 timestamp");
 }
 
@@ -815,16 +819,16 @@ void TestWrongSeqIsIgnoredUntilCorrectAckArrives()
   harness.Drain();
   ExpectEqual(harness.State(), SyncState::PROBE_SENT, "第三张稳定图像后应已发 probe");
 
-  for (uint64_t t = 32000; t <= 50000; t += 2000)
+  for (uint64_t t = 32000; t <= 60000; t += 2000)
   {
     harness.PushRawImu(t);
   }
-  harness.PushSyncAck(harness.LastProbeSeq() + 1U, 50000);
-  harness.PushImage(50000, 4);
+  harness.PushSyncAck(harness.LastProbeSeq() + 1U, 60000);
+  harness.PushImage(60000, 4);
   harness.Drain();
   Expect(harness.PublishedTags().empty(), "错误 seq 的 ack 必须忽略");
 
-  harness.PushSyncAck(harness.LastProbeSeq(), 50000);
+  harness.PushSyncAck(harness.LastProbeSeq(), 60000);
   harness.Drain();
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4},
                     "正确 seq 到达后应发布等待中的 probe 图像");
@@ -844,12 +848,17 @@ void TestProbeWaitsForRawHistory()
   harness.Drain();
   ExpectEqual(harness.State(), SyncState::PROBE_SENT, "稳定后应进入 PROBE_SENT");
 
-  harness.PushSyncAck(harness.LastProbeSeq(), 50000);
-  harness.PushImage(50000, 4);
+  harness.PushSyncAck(harness.LastProbeSeq(), 60000);
+  harness.PushImage(60000, 4);
   harness.Drain();
   Expect(harness.PublishedTags().empty(), "ack 对应 raw IMU 未到时 probe 图像应等待");
 
   harness.PushRawImu(50000);
+  harness.PushRawImu(52000);
+  harness.PushRawImu(54000);
+  harness.PushRawImu(56000);
+  harness.PushRawImu(58000);
+  harness.PushRawImu(60000);
   harness.Drain();
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4},
                     "raw IMU 到达后应完成 probe 锁定");
