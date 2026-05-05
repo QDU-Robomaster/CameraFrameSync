@@ -67,7 +67,7 @@ jobs:
       - name: Pull CameraSync dependency
         run: |
           git clone --depth=1 \
-            --branch codex/camera-sync-run-div-20260505 \
+            --branch master \
             https://github.com/QDU-Robomaster/CameraSync \
             ./Modules/CameraSync
 
