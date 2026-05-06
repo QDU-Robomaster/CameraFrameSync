@@ -60,7 +60,7 @@ jobs:
       - name: Pull CameraBase dependency
         run: |
           git clone --depth=1 \
-            --branch codex/camerabase-internal-recording-20260506 \
+            --branch master \
             https://github.com/QDU-Robomaster/CameraBase \
             ./Modules/CameraBase
 
