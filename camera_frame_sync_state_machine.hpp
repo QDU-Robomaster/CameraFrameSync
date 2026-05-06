@@ -97,9 +97,11 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
   }
 
   const uint64_t image_gap_us = image_ts - last_image_timestamp_us_;
-  if (state_ == SyncState::PROBE_SENT && IsProbeImageGap(image_gap_us))
+  if (state_ == SyncState::PROBE_SENT &&
+      (IsProbeImageGap(image_gap_us) ||
+       (probe_ack_seq_.load() == pending_probe_seq_ && !IsNormalImageGap(image_gap_us))))
   {
-    // 这次 gap 是同步探针制造的异常间隔，不能拿来重估正常图像周期。
+    // 这次 gap 是同步探针或切换运行分频制造的异常间隔，不能拿来重估正常图像周期。
     if (!frame.cadence_consumed)
     {
       image_cadence_.last_timestamp_us = image_ts;

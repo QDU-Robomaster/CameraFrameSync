@@ -322,7 +322,9 @@ class SequenceHarness
     }
 
     const uint64_t image_gap = image_ts - last_image_timestamp_us_;
-    if (state_ == SyncState::PROBE_SENT && IsProbeGap(image_gap))
+    if (state_ == SyncState::PROBE_SENT &&
+        (IsProbeGap(image_gap) ||
+         (probe_ack_seq_ == last_probe_seq_ && !IsNormalGap(image_gap))))
     {
       if (!image.cadence_observed)
       {
@@ -885,6 +887,30 @@ void TestBadProbeGapResets()
                     "cadence 断裂直接重置，不需要把图像标为业务拒绝");
 }
 
+void TestAckedTransitionGapLocks()
+{
+  SequenceHarness harness;
+
+  for (uint64_t t = 2000; t <= 50000; t += 2000)
+  {
+    harness.PushRawImu(t);
+  }
+  harness.PushImage(10000, 1);
+  harness.PushImage(20000, 2);
+  harness.PushImage(30000, 3);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::PROBE_SENT, "稳定后应进入 PROBE_SENT");
+
+  harness.PushSyncAck(harness.LastProbeSeq(), 50000);
+  harness.PushImage(50000, 4);
+  harness.Drain();
+
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "带回执的分频切换过渡 gap 应完成同步");
+  ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4},
+                    "过渡 gap 对应图像应作为 probe 图像发布");
+}
+
 void TestSyncedModeTracksByImuPeriod()
 {
   SequenceHarness harness;
@@ -944,6 +970,7 @@ int main()
       {"raw-probe/错误seq忽略", TestWrongSeqIsIgnoredUntilCorrectAckArrives},
       {"raw-probe/等待raw历史覆盖ack", TestProbeWaitsForRawHistory},
       {"raw-probe/错误probe gap重置", TestBadProbeGapResets},
+      {"raw-probe/带回执过渡gap可锁定", TestAckedTransitionGapLocks},
       {"synced/按imu周期递推", TestSyncedModeTracksByImuPeriod},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
   };
