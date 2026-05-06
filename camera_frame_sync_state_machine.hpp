@@ -164,6 +164,59 @@ CameraFrameSync<CameraInfoV>::ObserveNormalImageCadence(uint64_t image_ts)
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::ObserveDroppedImage(uint64_t image_ts)
+{
+  if (!last_image_valid_)
+  {
+    ObserveNormalImageCadence(image_ts);
+    RememberImage(image_ts);
+    return;
+  }
+
+  if (image_ts <= last_image_timestamp_us_)
+  {
+    ResetImageObservation();
+    ObserveNormalImageCadence(image_ts);
+    RememberImage(image_ts);
+    return;
+  }
+
+  const uint64_t image_gap_us = image_ts - last_image_timestamp_us_;
+  const SyncState old_state = state_;
+  const bool normal_gap = IsNormalImageGap(image_gap_us);
+  const bool dropped_probe_gap =
+      old_state == SyncState::PROBE_SENT &&
+      (IsProbeImageGap(image_gap_us) ||
+       (probe_ack_seq_.load() == pending_probe_seq_ && !normal_gap));
+
+  if (dropped_probe_gap)
+  {
+    ResetLock("dropped-probe-image", "publish failed");
+    ResetImageObservation();
+    ObserveNormalImageCadence(image_ts);
+    RememberImage(image_ts);
+    return;
+  }
+
+  const auto update = ObserveNormalImageCadence(image_ts);
+  if (old_state == SyncState::SYNCED && normal_gap)
+  {
+    if (locked_sync_.period_us != 0 && locked_sync_.last_imu_timestamp_us != 0)
+    {
+      locked_sync_.last_imu_timestamp_us += locked_sync_.period_us;
+    }
+    RememberImage(image_ts);
+    return;
+  }
+
+  if (update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
+  {
+    ResetLock("dropped-image-cadence-broken", "publish failed");
+  }
+  RememberImage(image_ts);
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
 {
   if (sync_mode_ != SyncMode::RAW_PROBE || state_ != SyncState::OBSERVING)

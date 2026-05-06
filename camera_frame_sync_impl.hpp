@@ -256,8 +256,8 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
   {
     XR_LOG_WARN("CameraFrameSync: image publish failed err=%d",
                 static_cast<int>(publish_ans));
-    // 发布失败时不能制造不存在的图像事件，但仍要处理 IMU / 回执积压。
-    ProcessSyncWorkWithoutImage();
+    // 发布失败时不能制造不存在的图像事件，但要把该图像计入同步时间基线。
+    ProcessDroppedImage(image_timestamp_us);
   }
   return current_image_.GetData();
 }
@@ -368,6 +368,19 @@ void CameraFrameSync<CameraInfoV>::ProcessSyncWorkWithoutImage()
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   CollectIncomingTopics();
   HandleOverflowRecovery();
+  ProcessImageEvents();
+}
+
+/**
+ * @brief 图像未发布给下游时，维护内部时间基线但不发布同步 IMU。
+ */
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::ProcessDroppedImage(uint64_t image_timestamp_us)
+{
+  LibXR::Mutex::LockGuard lock(sync_state_mutex_);
+  CollectIncomingTopics();
+  HandleOverflowRecovery();
+  ObserveDroppedImage(image_timestamp_us);
   ProcessImageEvents();
 }
 

@@ -508,6 +508,11 @@ class CameraFrameSync
   void ProcessSyncWorkWithoutImage();
 
   /**
+   * @brief 图像共享 topic 发布失败后，只推进同步时间基线。
+   */
+  void ProcessDroppedImage(uint64_t image_timestamp_us);
+
+  /**
    * @brief 将回调入口队列的数据搬到状态机私有 pending 队列。
    */
   void CollectIncomingTopics();
@@ -546,6 +551,11 @@ class CameraFrameSync
    * @brief 观察正常图像发布周期；probe gap 不应调用此路径。
    */
   CameraFrameSyncCore::CadenceUpdate ObserveNormalImageCadence(uint64_t image_ts);
+
+  /**
+   * @brief 图像未发布给下游时，按丢帧维护 RAW_PROBE 时间基线。
+   */
+  void ObserveDroppedImage(uint64_t image_ts);
 
   /**
    * @brief 周期稳定后向 MCU 下发一次 CameraSync 探针命令。
