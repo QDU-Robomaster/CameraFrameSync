@@ -27,6 +27,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   sync_probe_div_ = runtime.sync_probe_div;
   sync_active_level_ = runtime.sync_active_level == 0 ? 0U : 1U;
   target_trigger_hz_ = runtime.target_trigger_hz;
+  OpenRecording(runtime, camera);
 
   ASSERT(sync_probe_div_ != 0);
   ASSERT(sync_probe_div_ <= UINT8_MAX);
@@ -69,6 +70,117 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
       topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
       topics_.quat_name.c_str(), SyncModeName(sync_mode_),
       static_cast<double>(target_trigger_hz_));
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+std::string CameraFrameSync<CameraInfoV>::MakeDefaultRecordingDir(
+    std::string_view camera_name)
+{
+  std::time_t now = std::time(nullptr);
+  std::tm local{};
+#if defined(_WIN32)
+  localtime_s(&local, &now);
+#else
+  localtime_r(&now, &local);
+#endif
+
+  std::ostringstream leaf;
+  leaf << std::put_time(&local, "%Y%m%d_%H%M%S") << "_";
+  if (camera_name.empty())
+  {
+    leaf << "camera";
+  }
+  else
+  {
+    for (char ch : camera_name)
+    {
+      const bool ok = (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-';
+      leaf << (ok ? ch : '_');
+    }
+  }
+  return (std::filesystem::path("runs") / "camera_record" / leaf.str()).string();
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::OpenRecording(
+    const typename CameraFrameSync<CameraInfoV>::RuntimeParam& runtime,
+    const typename CameraFrameSync<CameraInfoV>::Base& camera)
+{
+  if (!runtime.record_enable)
+  {
+    return;
+  }
+
+  if (camera.RecordingEnabled() && !camera.RecordingFileStemView().empty())
+  {
+    recording_file_stem_ = std::string(camera.RecordingFileStemView());
+  }
+  else
+  {
+    const std::string dir = MakeDefaultRecordingDir(camera.NameView());
+    recording_file_stem_ = std::filesystem::path(dir).filename().string();
+  }
+
+  if (!runtime.record_dir.empty())
+  {
+    recording_output_dir_ = std::string(runtime.record_dir);
+  }
+  else if (camera.RecordingEnabled() && !camera.RecordingOutputDirView().empty())
+  {
+    recording_output_dir_ = std::string(camera.RecordingOutputDirView());
+  }
+  else
+  {
+    recording_output_dir_ = (std::filesystem::path("runs") / "camera_record" /
+                             recording_file_stem_)
+                                .string();
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(recording_output_dir_, ec);
+  if (ec)
+  {
+    XR_LOG_ERROR("CameraFrameSync: create recording dir failed %s: %s",
+                 recording_output_dir_.c_str(), ec.message().c_str());
+    ASSERT(false);
+    return;
+  }
+
+  const auto dir = std::filesystem::path(recording_output_dir_);
+  const auto detail_path = dir / (recording_file_stem_ + "_sync.csv");
+  const auto capture_imu_path = dir / (recording_file_stem_ + "_imu.csv");
+  recording_detail_csv_.open(detail_path, std::ios::out | std::ios::trunc);
+  recording_capture_imu_csv_.open(capture_imu_path, std::ios::out | std::ios::trunc);
+  if (!recording_detail_csv_.is_open() || !recording_capture_imu_csv_.is_open())
+  {
+    XR_LOG_ERROR("CameraFrameSync: open sync recording failed dir=%s stem=%s",
+                 recording_output_dir_.c_str(), recording_file_stem_.c_str());
+    ASSERT(false);
+    return;
+  }
+
+  recording_detail_csv_
+      << "row,image_timestamp_us,sync_imu_timestamp_us,final_imu_timestamp_us,"
+         "qw,qx,qy,qz,gx,gy,gz,ax,ay,az,mode\n";
+  recording_enabled_ = true;
+  XR_LOG_PASS("CameraFrameSync: sync recording enabled dir=%s stem=%s",
+              recording_output_dir_.c_str(), recording_file_stem_.c_str());
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::CloseRecording()
+{
+  if (recording_detail_csv_.is_open())
+  {
+    recording_detail_csv_.flush();
+    recording_detail_csv_.close();
+  }
+  if (recording_capture_imu_csv_.is_open())
+  {
+    recording_capture_imu_csv_.flush();
+    recording_capture_imu_csv_.close();
+  }
 }
 
 /**
