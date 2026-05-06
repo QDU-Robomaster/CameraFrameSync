@@ -1026,6 +1026,38 @@ void TestDroppedPublishedImageKeepsSync()
                     "丢帧后锁定 IMU 基线应跳过被丢弃的一帧");
 }
 
+void TestConsecutiveDroppedImagesKeepSync()
+{
+  SequenceHarness harness;
+
+  for (uint64_t t = 2000; t <= 110000; t += 2000)
+  {
+    harness.PushRawImu(t);
+  }
+
+  harness.PushImage(10000, 1);
+  harness.PushImage(20000, 2);
+  harness.PushImage(30000, 3);
+  harness.Drain();
+  harness.PushSyncAck(harness.LastProbeSeq(), 60000);
+  harness.PushImage(60000, 4);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::SYNCED, "probe 图像应先锁定同步");
+
+  harness.DropImage(70000);
+  harness.DropImage(80000);
+  harness.PushImage(90000, 5);
+  harness.Drain();
+
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "连续发布失败的图像不应打断同步");
+  ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4, 5},
+                    "连续丢帧不发布，但恢复后的图像应正常发布");
+  ExpectVectorEqual(harness.SyncImuTimestamps(),
+                    std::vector<uint64_t>{60000, 90000},
+                    "连续丢帧后锁定 IMU 基线应逐帧跳过");
+}
+
 void TestCompositeResetAndRelock()
 {
   SequenceHarness harness;
@@ -1066,6 +1098,7 @@ int main()
       {"raw-probe/带回执过渡gap可锁定", TestAckedTransitionGapLocks},
       {"synced/按imu周期递推", TestSyncedModeTracksByImuPeriod},
       {"synced/发布失败丢帧保持同步", TestDroppedPublishedImageKeepsSync},
+      {"synced/连续发布失败丢帧保持同步", TestConsecutiveDroppedImagesKeepSync},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
   };
 
