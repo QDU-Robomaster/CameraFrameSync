@@ -424,10 +424,10 @@ class CameraFrameSync
     RESET = 2,  ///< 当前帧打破同步关系，丢帧后重新观察。
   };
 
-  static constexpr size_t imu_ingress_length = 128;    ///< topic 回调入口队列长度。
-  static constexpr size_t pending_limit = 128;         ///< 状态机待处理队列长度。
-  static constexpr size_t image_event_limit = 32;      ///< 图像时间戳待处理队列长度。
-  static constexpr size_t history_limit = 128;         ///< 可供 offset 查找的 IMU 历史长度。
+  static constexpr size_t imu_ingress_length = 1024;   ///< topic 回调入口队列长度。
+  static constexpr size_t pending_limit = 1024;        ///< 状态机待处理队列长度。
+  static constexpr size_t image_event_limit = 64;      ///< 图像时间戳待处理队列长度。
+  static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 历史长度。
   static constexpr uint32_t cadence_stable_gaps = 2;   ///< 判定周期稳定所需连续 gap 数。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。

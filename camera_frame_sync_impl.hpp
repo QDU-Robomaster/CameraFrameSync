@@ -233,17 +233,18 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
     return nullptr;
   }
 
+  const uint64_t image_timestamp_us =
+      static_cast<uint64_t>(committed_image->timestamp_us);
+
   ImageData next_image;
   if (topics_.image.CreateData(next_image) != LibXR::ErrorCode::OK ||
       next_image.GetData() == nullptr)
   {
-    // 没有新槽位时继续让 CameraBase 写旧槽位，同时推进已到达的同步数据。
-    ProcessSyncWorkWithoutImage();
+    // 没有新槽位时当前图像无法交给下游，但仍是一次真实相机帧到达。
+    ProcessDroppedImage(image_timestamp_us);
     return committed_image;
   }
 
-  const uint64_t image_timestamp_us =
-      static_cast<uint64_t>(committed_image->timestamp_us);
   const auto publish_ans = topics_.image.Publish(current_image_);
   current_image_ = std::move(next_image);
 
