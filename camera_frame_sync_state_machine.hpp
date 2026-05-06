@@ -371,6 +371,8 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
     return ImageDecision::RESET;
   }
 
+  RecordSyncedImu(image.sensor_timestamp_us, match.imu->sensor_timestamp_us,
+                  *final_imu);
   PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
 
   const SyncState old_state = state_;
@@ -413,6 +415,42 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
       .linear_acceleration_xyz = imu.linear_acceleration_xyz,
   };
   topics_.synced_imu.Publish(synced);
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::RecordSyncedImu(
+    uint64_t image_timestamp_us, uint64_t sync_imu_timestamp_us,
+    const typename CameraFrameSync<CameraInfoV>::AssembledImu& final_imu)
+{
+  if (!recording_enabled_)
+  {
+    return;
+  }
+
+  recording_sync_csv_ << recording_row_index_ << ","
+                      << static_cast<unsigned long long>(image_timestamp_us) << ","
+                      << static_cast<unsigned long long>(sync_imu_timestamp_us) << ","
+                      << static_cast<unsigned long long>(final_imu.sensor_timestamp_us)
+                      << "," << final_imu.rotation_wxyz[0] << ","
+                      << final_imu.rotation_wxyz[1] << ","
+                      << final_imu.rotation_wxyz[2] << ","
+                      << final_imu.rotation_wxyz[3] << ","
+                      << final_imu.angular_velocity_xyz[0] << ","
+                      << final_imu.angular_velocity_xyz[1] << ","
+                      << final_imu.angular_velocity_xyz[2] << ","
+                      << final_imu.linear_acceleration_xyz[0] << ","
+                      << final_imu.linear_acceleration_xyz[1] << ","
+                      << final_imu.linear_acceleration_xyz[2] << ","
+                      << SyncModeName(sync_mode_) << "\n";
+  if (!recording_sync_csv_.good())
+  {
+    XR_LOG_ERROR("CameraFrameSync: sync recording write failed row=%u",
+                 static_cast<unsigned>(recording_row_index_));
+    ASSERT(false);
+    return;
+  }
+  ++recording_row_index_;
+  recording_sync_csv_.flush();
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>

@@ -24,6 +24,21 @@
 - 同步 IMU topic：`camera.ImuTopicName()`
 - 同步命令：`camera_sync_command`，payload 为 `CameraSync::SyncCommand`
 
+## 内录分工
+
+完整图像内录不走 `CameraFrameSync::Subscriber`。图像由 `CameraBase` 在生产者
+`CommitImage()` 路径写出，避免后级订阅者消费慢导致丢帧。
+
+`CameraFrameSync` 只记录同步结果：
+
+- `sync_imu.csv`
+  - `image_timestamp_us`：当前图像的相机时间戳
+  - `sync_imu_timestamp_us`：同步状态机锁定的 IMU 基准时间戳
+  - `final_imu_timestamp_us`：施加 `offset_us` 后实际写入下游的 IMU 样本时间戳
+  - `qw/qx/qy/qz/gx/gy/gz/ax/ay/az`：最终 IMU 样本数据
+
+如果 `record_dir` 为空且上游 `CameraBase` 已经开启内录，sync 会复用同一个目录。
+
 实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。原始 IMU topic 由 `camera.Name()` 派生；实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，相机运行配置里的 `camera_name` 应设为 `gimbal`，图像 topic 和同步后 IMU topic 仍可单独配置。
 
 ## 时间戳契约
@@ -130,6 +145,8 @@ constructor_args:
     sync_probe_div: 3
     sync_active_level: 1
     target_trigger_hz: {expr: 50.0F}
+    record_enable: false
+    record_dir: ""
 ```
 
 Webots / 实机可显式配置同步 topic：
@@ -146,6 +163,8 @@ constructor_args:
     sync_probe_div: 3
     sync_active_level: 1
     target_trigger_hz: {expr: 50.0F}
+    record_enable: false
+    record_dir: ""
 ```
 
 ## 日志

@@ -14,6 +14,8 @@ constructor_args:
     sync_probe_div: 3
     sync_active_level: 1
     target_trigger_hz: 50.0F
+    record_enable: false
+    record_dir: ""
 template_args:
   - Info:
       width: 1280
@@ -34,8 +36,13 @@ depends:
 
 #include <array>
 #include <atomic>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -118,6 +125,8 @@ class CameraFrameSync
     uint32_t sync_probe_div = 3;         ///< CameraSync 探针分频倍率。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
     float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
+    bool record_enable = false;          ///< 是否记录同步映射和 IMU 数据。
+    std::string_view record_dir = {};    ///< 为空时复用 CameraBase 的内录目录。
   };
 
   /**
@@ -134,6 +143,8 @@ class CameraFrameSync
    */
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera, RuntimeParam runtime);
+
+  ~CameraFrameSync() { CloseRecording(); }
 
   /**
    * @brief 返回共享图像 topic 名称。
@@ -582,6 +593,12 @@ class CameraFrameSync
   void PublishSyncedImu(uint64_t image_timestamp_us, const AssembledImu& imu);
 
   /**
+   * @brief 记录图像时间戳、同步基准 IMU 时间戳和最终 IMU 数据。
+   */
+  void RecordSyncedImu(uint64_t image_timestamp_us, uint64_t sync_imu_timestamp_us,
+                       const AssembledImu& final_imu);
+
+  /**
    * @brief 估计相邻图像在 IMU 时间轴上跨过的采样周期。
    */
   uint64_t EstimatedSyncPeriodUs() const;
@@ -640,6 +657,21 @@ class CameraFrameSync
    * @brief 入口队列溢出后执行保守恢复。
    */
   void HandleOverflowRecovery();
+
+  /**
+   * @brief 初始化同步 CSV 记录器。
+   */
+  void OpenRecording(const RuntimeParam& runtime, const Base& camera);
+
+  /**
+   * @brief 关闭同步 CSV 记录器。
+   */
+  void CloseRecording();
+
+  /**
+   * @brief 没有 CameraBase 内录目录时生成独立同步记录目录。
+   */
+  static std::string MakeDefaultRecordingDir(std::string_view camera_name);
 
  private:
   /**
@@ -724,6 +756,11 @@ class CameraFrameSync
   bool pending_probe_ack_valid_{false};
   uint64_t pending_probe_imu_timestamp_us_{0};
   uint64_t pending_run_period_us_{0};
+
+  bool recording_enabled_{false};
+  uint64_t recording_row_index_{0};
+  std::string recording_output_dir_{};
+  std::ofstream recording_sync_csv_{};
 };
 
 #include "camera_frame_sync_impl.hpp"
