@@ -202,6 +202,35 @@ inline uint64_t ImageGapToleranceUs(uint64_t image_period_us)
 }
 
 /**
+ * @brief 判断图像 gap 是否为正常周期的整数倍。
+ *
+ * 返回值为匹配到的周期倍数；返回 0 表示不匹配。
+ */
+inline uint32_t MatchImageGapStride(uint64_t gap_us, uint64_t image_period_us,
+                                    uint32_t max_stride)
+{
+  if (image_period_us == 0 || max_stride == 0)
+  {
+    return 0;
+  }
+
+  const uint64_t stride = (gap_us + image_period_us / 2ULL) / image_period_us;
+  if (stride == 0 || stride > max_stride)
+  {
+    return 0;
+  }
+  if (image_period_us > std::numeric_limits<uint64_t>::max() / stride)
+  {
+    return 0;
+  }
+
+  const uint64_t expected = image_period_us * stride;
+  return AbsDiffUs(gap_us, expected) <= ImageGapToleranceUs(image_period_us)
+             ? static_cast<uint32_t>(stride)
+             : 0;
+}
+
+/**
  * @brief IMU 时间戳匹配容差。
  */
 inline uint64_t ImuTimestampToleranceUs(uint64_t imu_period_us)

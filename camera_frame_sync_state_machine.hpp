@@ -110,11 +110,22 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
     return TryProbeImage(frame);
   }
 
+  const uint32_t image_gap_stride = state_ == SyncState::SYNCED
+                                        ? MatchImageGapStride(image_gap_us)
+                                        : 0;
   auto cadence_update = CameraFrameSyncCore::CadenceUpdate::STABLE;
   if (!frame.cadence_consumed)
   {
-    cadence_update = ObserveNormalImageCadence(image_ts);
-    frame.cadence_consumed = true;
+    if (image_gap_stride > 1)
+    {
+      image_cadence_.last_timestamp_us = image_ts;
+      frame.cadence_consumed = true;
+    }
+    else
+    {
+      cadence_update = ObserveNormalImageCadence(image_ts);
+      frame.cadence_consumed = true;
+    }
   }
   if (cadence_update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
   {
@@ -140,11 +151,12 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
       return ImageDecision::RESET;
 
     case SyncState::SYNCED:
-      if (!IsNormalImageGap(image_gap_us))
+      if (image_gap_stride == 0)
       {
         return ImageDecision::RESET;
       }
-      return frame.match.valid ? ResumePendingMatch(frame) : TrySyncedImage(frame);
+      return frame.match.valid ? ResumePendingMatch(frame)
+                               : TrySyncedImage(frame, image_gap_stride);
   }
 
   return ImageDecision::RESET;
@@ -198,12 +210,24 @@ void CameraFrameSync<CameraInfoV>::ObserveDroppedImage(uint64_t image_ts)
     return;
   }
 
-  const auto update = ObserveNormalImageCadence(image_ts);
-  if (old_state == SyncState::SYNCED && normal_gap)
+  const uint32_t image_gap_stride =
+      old_state == SyncState::SYNCED ? MatchImageGapStride(image_gap_us) : 0;
+  auto update = CameraFrameSyncCore::CadenceUpdate::STABLE;
+  if (image_gap_stride > 1)
+  {
+    image_cadence_.last_timestamp_us = image_ts;
+  }
+  else
+  {
+    update = ObserveNormalImageCadence(image_ts);
+  }
+
+  if (old_state == SyncState::SYNCED && image_gap_stride != 0)
   {
     if (locked_sync_.period_us != 0 && locked_sync_.last_imu_timestamp_us != 0)
     {
-      locked_sync_.last_imu_timestamp_us += locked_sync_.period_us;
+      locked_sync_.last_imu_timestamp_us +=
+          locked_sync_.period_us * static_cast<uint64_t>(image_gap_stride);
     }
     RememberImage(image_ts);
     return;
@@ -330,15 +354,18 @@ CameraFrameSync<CameraInfoV>::TryLatestImuMatch(
 template <CameraTypes::CameraInfo CameraInfoV>
 typename CameraFrameSync<CameraInfoV>::ImageDecision
 CameraFrameSync<CameraInfoV>::TrySyncedImage(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame,
+    uint32_t image_gap_stride)
 {
-  if (locked_sync_.last_imu_timestamp_us == 0 || locked_sync_.period_us == 0)
+  if (locked_sync_.last_imu_timestamp_us == 0 || locked_sync_.period_us == 0 ||
+      image_gap_stride == 0)
   {
     return ImageDecision::RESET;
   }
 
   const uint64_t expected_sync_ts =
-      locked_sync_.last_imu_timestamp_us + locked_sync_.period_us;
+      locked_sync_.last_imu_timestamp_us +
+      locked_sync_.period_us * static_cast<uint64_t>(image_gap_stride);
   if (!ImuHistoryReached(expected_sync_ts))
   {
     // 图像已到达，但对应的 IMU 时间点可能还没从 SharedTopic 上来。
@@ -527,6 +554,13 @@ bool CameraFrameSync<CameraInfoV>::IsNormalImageGap(uint64_t image_gap_us) const
   return periods_.image_us != 0 &&
          CameraFrameSyncCore::AbsDiffUs(image_gap_us, periods_.image_us) <=
              CameraFrameSyncCore::ImageGapToleranceUs(periods_.image_us);
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+uint32_t CameraFrameSync<CameraInfoV>::MatchImageGapStride(uint64_t image_gap_us) const
+{
+  return CameraFrameSyncCore::MatchImageGapStride(
+      image_gap_us, periods_.image_us, max_synced_image_gap_stride);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>

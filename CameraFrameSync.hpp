@@ -429,6 +429,7 @@ class CameraFrameSync
   static constexpr size_t image_event_limit = 64;      ///< 图像时间戳待处理队列长度。
   static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 历史长度。
   static constexpr uint32_t cadence_stable_gaps = 2;   ///< 判定周期稳定所需连续 gap 数。
+  static constexpr uint32_t max_synced_image_gap_stride = 8;  ///< 同步态可接受的连续丢图数量。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。
 
@@ -575,7 +576,7 @@ class CameraFrameSync
   /**
    * @brief RAW_PROBE 已锁定后，沿 IMU 时间轴递推下一帧同步基准。
    */
-  ImageDecision TrySyncedImage(PendingFrame& frame);
+  ImageDecision TrySyncedImage(PendingFrame& frame, uint32_t image_gap_stride);
 
   /**
    * @brief 继续处理之前已锁定同步基准、但等待 offset IMU 的图像。
@@ -612,6 +613,11 @@ class CameraFrameSync
    * @brief 判断图像间隔是否仍符合正常发布周期。
    */
   bool IsNormalImageGap(uint64_t image_gap_us) const;
+
+  /**
+   * @brief 判断图像间隔是否为正常周期的整数倍。
+   */
+  uint32_t MatchImageGapStride(uint64_t image_gap_us) const;
 
   /**
    * @brief 判断图像间隔是否符合 CameraSync 探针制造的异常周期。

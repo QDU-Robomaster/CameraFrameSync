@@ -341,10 +341,20 @@ class SequenceHarness
       return TryProbeImage(image);
     }
 
+    const uint32_t image_gap_stride =
+        state_ == SyncState::SYNCED ? MatchNormalGapStride(image_gap) : 0;
     auto update = CadenceUpdate::STABLE;
     if (!image.cadence_observed)
     {
-      update = ObserveImage(image);
+      if (image_gap_stride > 1)
+      {
+        image_cadence_.last_timestamp_us = image_ts;
+        image.cadence_observed = true;
+      }
+      else
+      {
+        update = ObserveImage(image);
+      }
     }
     if (update == CadenceUpdate::BROKEN)
     {
@@ -367,7 +377,10 @@ class SequenceHarness
         }
         return Decision::RESET;
       case SyncState::SYNCED:
-        return IsNormalGap(image_gap) ? TrySyncedImage(image) : Decision::RESET;
+      {
+        return image_gap_stride != 0 ? TrySyncedImage(image, image_gap_stride)
+                                     : Decision::RESET;
+      }
     }
     return Decision::RESET;
   }
@@ -403,7 +416,9 @@ class SequenceHarness
 
     const uint64_t image_gap = image_ts - last_image_timestamp_us_;
     const SyncState old_state = state_;
-    const bool normal_gap = IsNormalGap(image_gap);
+    const uint32_t image_gap_stride =
+        old_state == SyncState::SYNCED ? MatchNormalGapStride(image_gap) : 0;
+    const bool normal_gap = image_gap_stride == 1;
     const bool dropped_probe_gap =
         old_state == SyncState::PROBE_SENT &&
         (IsProbeGap(image_gap) ||
@@ -418,16 +433,25 @@ class SequenceHarness
       return;
     }
 
-    const auto update =
-        ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+    auto update = CadenceUpdate::STABLE;
+    if (image_gap_stride > 1)
+    {
+      image_cadence_.last_timestamp_us = image_ts;
+    }
+    else
+    {
+      update =
+          ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+    }
     if (image_cadence_.stable)
     {
       periods_.image_us = image_cadence_.period_us;
     }
 
-    if (old_state == SyncState::SYNCED && normal_gap)
+    if (old_state == SyncState::SYNCED && image_gap_stride != 0)
     {
-      locked_sync_.last_imu_timestamp_us += locked_sync_.period_us;
+      locked_sync_.last_imu_timestamp_us +=
+          locked_sync_.period_us * static_cast<uint64_t>(image_gap_stride);
       RememberImage(image_ts);
       return;
     }
@@ -498,9 +522,16 @@ class SequenceHarness
     return Match{&history_.Back(), periods_.imu_us != 0 ? periods_.imu_us : 1};
   }
 
-  Decision TrySyncedImage(PendingFrame& image)
+  Decision TrySyncedImage(PendingFrame& image, uint32_t image_gap_stride)
   {
-    const uint64_t expected = locked_sync_.last_imu_timestamp_us + locked_sync_.period_us;
+    if (image_gap_stride == 0)
+    {
+      return Decision::RESET;
+    }
+
+    const uint64_t expected =
+        locked_sync_.last_imu_timestamp_us +
+        locked_sync_.period_us * static_cast<uint64_t>(image_gap_stride);
     if (!HistoryReached(expected))
     {
       return Decision::WAIT;
@@ -575,6 +606,11 @@ class SequenceHarness
   {
     return periods_.image_us != 0 && AbsDiffUs(gap_us, periods_.image_us) <=
                                          ImageGapToleranceUs(periods_.image_us);
+  }
+
+  uint32_t MatchNormalGapStride(uint64_t gap_us) const
+  {
+    return MatchImageGapStride(gap_us, periods_.image_us, 8);
   }
 
   bool IsProbeGap(uint64_t gap_us) const
@@ -1058,6 +1094,36 @@ void TestConsecutiveDroppedImagesKeepSync()
                     "连续丢帧后锁定 IMU 基线应逐帧跳过");
 }
 
+void TestSkippedPublishedImageGapKeepsSync()
+{
+  SequenceHarness harness;
+
+  for (uint64_t t = 2000; t <= 110000; t += 2000)
+  {
+    harness.PushRawImu(t);
+  }
+
+  harness.PushImage(10000, 1);
+  harness.PushImage(20000, 2);
+  harness.PushImage(30000, 3);
+  harness.Drain();
+  harness.PushSyncAck(harness.LastProbeSeq(), 60000);
+  harness.PushImage(60000, 4);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::SYNCED, "probe 图像应先锁定同步");
+
+  harness.PushImage(80000, 5);
+  harness.Drain();
+
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "同步态整数倍图像 gap 不应打断同步");
+  ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4, 5},
+                    "跳过一帧后下一张成功图像应正常发布");
+  ExpectVectorEqual(harness.SyncImuTimestamps(),
+                    std::vector<uint64_t>{60000, 80000},
+                    "整数倍图像 gap 应按倍数推进 IMU 同步点");
+}
+
 void TestCompositeResetAndRelock()
 {
   SequenceHarness harness;
@@ -1099,6 +1165,7 @@ int main()
       {"synced/按imu周期递推", TestSyncedModeTracksByImuPeriod},
       {"synced/发布失败丢帧保持同步", TestDroppedPublishedImageKeepsSync},
       {"synced/连续发布失败丢帧保持同步", TestConsecutiveDroppedImagesKeepSync},
+      {"synced/成功图像整数倍gap保持同步", TestSkippedPublishedImageGapKeepsSync},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
   };
 
