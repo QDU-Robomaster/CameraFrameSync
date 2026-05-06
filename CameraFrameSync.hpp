@@ -14,6 +14,8 @@ constructor_args:
     sync_probe_div: 3
     sync_active_level: 1
     target_trigger_hz: 50.0F
+    record_enable: false
+    record_dir: ""
 template_args:
   - Info:
       width: 1280
@@ -44,6 +46,7 @@ depends:
 #include "CameraSync.hpp"
 #include "app_framework.hpp"
 #include "camera_frame_sync_core.hpp"
+#include "camera_frame_sync_recording.hpp"
 #include "camera_frame_sync_subscriber.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
@@ -118,6 +121,8 @@ class CameraFrameSync
     uint32_t sync_probe_div = 3;         ///< CameraSync 探针分频倍率。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
     float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
+    bool record_enable = false;          ///< 是否记录同步映射和 IMU 数据。
+    std::string_view record_dir = {};    ///< 为空时复用 CameraBase 的内录目录。
   };
 
   /**
@@ -134,6 +139,8 @@ class CameraFrameSync
    */
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera, RuntimeParam runtime);
+
+  ~CameraFrameSync() { recording_.Close(); }
 
   /**
    * @brief 返回共享图像 topic 名称。
@@ -724,6 +731,8 @@ class CameraFrameSync
   bool pending_probe_ack_valid_{false};
   uint64_t pending_probe_imu_timestamp_us_{0};
   uint64_t pending_run_period_us_{0};
+
+  CameraFrameSyncRecording recording_{};
 };
 
 #include "camera_frame_sync_impl.hpp"

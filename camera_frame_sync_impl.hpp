@@ -27,6 +27,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   sync_probe_div_ = runtime.sync_probe_div;
   sync_active_level_ = runtime.sync_active_level == 0 ? 0U : 1U;
   target_trigger_hz_ = runtime.target_trigger_hz;
+  recording_.Open(runtime, camera);
 
   ASSERT(sync_probe_div_ != 0);
   ASSERT(sync_probe_div_ <= UINT8_MAX);
