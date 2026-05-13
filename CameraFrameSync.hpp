@@ -5,17 +5,6 @@
 module_description: 相机共享图像桥与原始 IMU 同步器
 constructor_args:
   camera: '@camera'
-  runtime:
-    mode: CameraFrameSyncMode::RAW_PROBE
-    offset_us: 0
-    host_topic_domain_name: "host"
-    sync_command_topic_name: "camera_sync_command"
-    sync_result_topic_name: "camera_sync_result"
-    sync_probe_div: 3
-    sync_active_level: 1
-    target_trigger_hz: 50.0F
-    record_enable: false
-    record_dir: ""
 template_args:
   - Info:
       width: 1280
