@@ -6,7 +6,7 @@ module_description: 相机共享图像桥与原始 IMU 同步器
 constructor_args:
   camera: '@camera'
   runtime:
-    mode: CameraFrameSync<Info>::SyncMode::RAW_PROBE
+    mode: CameraFrameSyncMode::RAW_PROBE
     offset_us: 0
     host_topic_domain_name: "host"
     sync_command_topic_name: "camera_sync_command"
@@ -54,6 +54,15 @@ depends:
 #include "transform.hpp"
 
 /**
+ * @brief 图像与 IMU 的同步模式。
+ */
+enum class CameraFrameSyncMode : uint8_t
+{
+  RAW_PROBE = 0,   ///< 通过 CameraSync command/result 显式锁定。
+  LATEST_IMU = 1,  ///< 数据源已同步时，图像直接绑定最新完整 IMU。
+};
+
+/**
  * @brief 图像共享发布与 IMU 同步模块。
  *
  * 原始 gyro/accl/quat 回调只入队；同步回执只记录当前 probe 的命中结果。
@@ -94,14 +103,7 @@ class CameraFrameSync
       .queue_num = 2,
   };
 
-  /**
-   * @brief 图像与 IMU 的同步模式。
-   */
-  enum class SyncMode : uint8_t
-  {
-    RAW_PROBE = 0,   ///< 通过 CameraSync command/result 显式锁定。
-    LATEST_IMU = 1,  ///< 数据源已同步时，图像直接绑定最新完整 IMU。
-  };
+  using SyncMode = CameraFrameSyncMode;  ///< 图像与 IMU 的同步模式。
 
   /**
    * @brief 运行时配置。
