@@ -59,7 +59,7 @@ enum class CameraFrameSyncMode : uint8_t
  * RAW_PROBE 模式使用 MCU 侧 CameraSync 的回执 timestamp 锁定 IMU 时间轴。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
-class CameraFrameSync
+class CameraFrameSync : public LibXR::Application
 {
  public:
   using Self = CameraFrameSync<CameraInfoV>;        ///< 当前模板实例类型。
@@ -165,6 +165,11 @@ class CameraFrameSync
    * @brief 切换同步模式并重置运行时状态。
    */
   void SetSyncMode(SyncMode mode);
+
+  /**
+   * @brief 输出上一监控周期内的相机、IMU 和同步帧统计。
+   */
+  void OnMonitor() override;
 
  private:
   using SyncState = CameraFrameSyncCore::SyncState;
@@ -678,6 +683,20 @@ class CameraFrameSync
    * @brief 任一路队列溢出都会置位，随后在图像提交路径统一重置。
    */
   std::atomic<bool> overflowed_{false};
+
+  /**
+   * @brief 监控周期计数器。
+   */
+  std::atomic<uint64_t> monitor_raw_gyro_count_{0};
+  std::atomic<uint64_t> monitor_raw_accl_count_{0};
+  std::atomic<uint64_t> monitor_raw_quat_count_{0};
+  std::atomic<uint64_t> monitor_image_input_count_{0};
+  std::atomic<uint64_t> monitor_image_publish_ok_count_{0};
+  std::atomic<uint64_t> monitor_image_drop_count_{0};
+  std::atomic<uint64_t> monitor_assembled_imu_count_{0};
+  std::atomic<uint64_t> monitor_synced_output_count_{0};
+  std::atomic<uint64_t> monitor_reset_count_{0};
+  std::atomic<uint64_t> monitor_overflow_count_{0};
 
   /**
    * @brief 状态机私有 pending 队列和短 IMU 历史。

@@ -499,6 +499,7 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
       .linear_acceleration_xyz = imu.linear_acceleration_xyz,
   };
   topics_.synced_imu.Publish(synced);
+  monitor_synced_output_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -623,6 +624,7 @@ void CameraFrameSync<CameraInfoV>::ResetLock(const char* reason, const char* det
   state_ = SyncState::OBSERVING;
   locked_sync_ = {};
   ClearPendingProbe();
+  monitor_reset_count_.fetch_add(1, std::memory_order_relaxed);
 
   if (old_state != SyncState::OBSERVING)
   {
@@ -637,6 +639,7 @@ void CameraFrameSync<CameraInfoV>::ResetLock(const char* reason, const char* det
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ResetRuntimeState()
 {
+  monitor_reset_count_.fetch_add(1, std::memory_order_relaxed);
   pending_gyros_.Clear();
   pending_accls_.Clear();
   pending_quats_.Clear();

@@ -16,7 +16,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 CameraFrameSync<CameraInfoV>::CameraFrameSync(
-    LibXR::HardwareContainer&, LibXR::ApplicationManager&,
+    LibXR::HardwareContainer&, LibXR::ApplicationManager& app,
     typename CameraFrameSync<CameraInfoV>::Base& camera,
     typename CameraFrameSync<CameraInfoV>::RuntimeParam runtime)
     : topics_(camera, runtime),
@@ -70,6 +70,66 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
       topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
       topics_.quat_name.c_str(), SyncModeName(sync_mode_),
       static_cast<double>(target_trigger_hz_));
+  app.Register(*this);
+}
+
+/**
+ * @brief 输出上一监控周期内的相机、IMU 和同步帧统计。
+ */
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::OnMonitor()
+{
+  const uint64_t raw_gyro =
+      monitor_raw_gyro_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t raw_accl =
+      monitor_raw_accl_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t raw_quat =
+      monitor_raw_quat_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t image_input =
+      monitor_image_input_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t image_publish_ok =
+      monitor_image_publish_ok_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t image_drop =
+      monitor_image_drop_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t assembled_imu =
+      monitor_assembled_imu_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t synced_output =
+      monitor_synced_output_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t reset_count =
+      monitor_reset_count_.exchange(0, std::memory_order_relaxed);
+  const uint64_t overflow_count =
+      monitor_overflow_count_.exchange(0, std::memory_order_relaxed);
+
+  SyncMode mode = SyncMode::RAW_PROBE;
+  SyncState state = SyncState::OBSERVING;
+  uint64_t image_period_us = 0;
+  uint64_t imu_period_us = 0;
+  uint64_t sync_period_us = 0;
+  {
+    LibXR::Mutex::LockGuard lock(sync_state_mutex_);
+    mode = sync_mode_;
+    state = state_;
+    image_period_us = periods_.image_us;
+    imu_period_us = periods_.imu_us;
+    sync_period_us = locked_sync_.period_us;
+  }
+
+  XR_LOG_INFO(
+      "CameraFrameSync monitor: mode=%s state=%s raw_imu=%llu/%llu/%llu assembled=%llu image=%llu pub=%llu drop=%llu synced=%llu reset=%llu overflow=%llu image_period_us=%llu imu_period_us=%llu sync_period_us=%llu",
+      SyncModeName(mode), StateName(state),
+      static_cast<unsigned long long>(raw_gyro),
+      static_cast<unsigned long long>(raw_accl),
+      static_cast<unsigned long long>(raw_quat),
+      static_cast<unsigned long long>(assembled_imu),
+      static_cast<unsigned long long>(image_input),
+      static_cast<unsigned long long>(image_publish_ok),
+      static_cast<unsigned long long>(image_drop),
+      static_cast<unsigned long long>(synced_output),
+      static_cast<unsigned long long>(reset_count),
+      static_cast<unsigned long long>(overflow_count),
+      static_cast<unsigned long long>(image_period_us),
+      static_cast<unsigned long long>(imu_period_us),
+      static_cast<unsigned long long>(sync_period_us));
 }
 
 /**
@@ -235,12 +295,14 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
 
   const uint64_t image_timestamp_us =
       static_cast<uint64_t>(committed_image->timestamp_us);
+  monitor_image_input_count_.fetch_add(1, std::memory_order_relaxed);
 
   ImageData next_image;
   if (topics_.image.CreateData(next_image) != LibXR::ErrorCode::OK ||
       next_image.GetData() == nullptr)
   {
     // 没有新槽位时当前图像无法交给下游，但仍是一次真实相机帧到达。
+    monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
     ProcessDroppedImage(image_timestamp_us);
     return committed_image;
   }
@@ -251,6 +313,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
   if (publish_ans == LibXR::ErrorCode::OK)
   {
     // 只有共享图像发布成功，图像 timestamp 才进入同步状态机。
+    monitor_image_publish_ok_count_.fetch_add(1, std::memory_order_relaxed);
     ProcessCommittedImage(image_timestamp_us);
   }
   else
@@ -258,6 +321,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
     XR_LOG_WARN("CameraFrameSync: image publish failed err=%d",
                 static_cast<int>(publish_ans));
     // 发布失败时不能制造不存在的图像事件，但要把该图像计入同步时间基线。
+    monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
     ProcessDroppedImage(image_timestamp_us);
   }
   return current_image_.GetData();
@@ -273,9 +337,11 @@ void CameraFrameSync<CameraInfoV>::OnGyroStatic(
 {
   const GyroSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
                           .angular_velocity_xyz = ToImuVector(data)};
+  self->monitor_raw_gyro_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->gyro_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     // 回调不能做重同步，只标记溢出，后续由图像提交路径统一恢复。
+    self->monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
     self->overflowed_.store(true, std::memory_order_relaxed);
   }
 }
@@ -290,9 +356,11 @@ void CameraFrameSync<CameraInfoV>::OnAcclStatic(
 {
   const AcclSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
                           .linear_acceleration_xyz = ToImuVector(data)};
+  self->monitor_raw_accl_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->accl_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     // 回调不能做重同步，只标记溢出，后续由图像提交路径统一恢复。
+    self->monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
     self->overflowed_.store(true, std::memory_order_relaxed);
   }
 }
@@ -307,9 +375,11 @@ void CameraFrameSync<CameraInfoV>::OnQuatStatic(
 {
   const QuatReading sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
                            .rotation_wxyz = ToQuatSample(data)};
+  self->monitor_raw_quat_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->quat_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
     // 回调不能做重同步，只标记溢出，后续由图像提交路径统一恢复。
+    self->monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
     self->overflowed_.store(true, std::memory_order_relaxed);
   }
 }
@@ -354,6 +424,7 @@ void CameraFrameSync<CameraInfoV>::ProcessCommittedImage(uint64_t image_timestam
   CollectIncomingTopics();
   if (image_events_.PushBackDropOldest({.sensor_timestamp_us = image_timestamp_us}))
   {
+    monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
     overflowed_.store(true, std::memory_order_relaxed);
   }
   HandleOverflowRecovery();
@@ -397,6 +468,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     if (pending_gyros_.PushBackDropOldest(gyro))
     {
       // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
   }
@@ -407,6 +479,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     if (pending_accls_.PushBackDropOldest(accl))
     {
       // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
   }
@@ -417,6 +490,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
     if (pending_quats_.PushBackDropOldest(quat))
     {
       // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
   }
@@ -504,6 +578,7 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
   }
 
   imu_history_.PushBackDropOldest(imu);
+  monitor_assembled_imu_count_.fetch_add(1, std::memory_order_relaxed);
   ObserveImuCadence(imu.sensor_timestamp_us);
   return true;
 }
