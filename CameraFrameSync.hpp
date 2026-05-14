@@ -426,6 +426,7 @@ class CameraFrameSync : public LibXR::Application
   static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 历史长度。
   static constexpr uint32_t cadence_stable_gaps = 2;   ///< 判定周期稳定所需连续 gap 数。
   static constexpr uint32_t max_synced_image_gap_stride = 8;  ///< 同步态可接受的连续丢图数量。
+  static constexpr uint32_t max_raw_imu_gap_stride = 8;  ///< 稳定后可接受的连续 raw IMU 缺样数量。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。
   static constexpr uint64_t probe_ack_timeout_min_us =

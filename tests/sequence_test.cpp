@@ -155,6 +155,7 @@ class SequenceHarness
   static constexpr uint32_t stable_gaps = 2;
   static constexpr uint64_t imu_tolerance_us = 300;
   static constexpr uint64_t image_tolerance_us = 1500;
+  static constexpr uint32_t max_raw_imu_gap_stride = 8;
   static constexpr uint32_t probe_div = 3;
   static constexpr uint64_t probe_ack_timeout_min_us = 100000;
 
@@ -230,11 +231,10 @@ class SequenceHarness
     {
       return false;
     }
-    if (accls_.Front().sensor_timestamp_us > gyro_ts ||
-        quats_.Front().sensor_timestamp_us > gyro_ts)
+    if (accls_.Front().sensor_timestamp_us != gyro_ts ||
+        quats_.Front().sensor_timestamp_us != gyro_ts)
     {
       gyros_.PopFront();
-      ResetLock();
       return true;
     }
 
@@ -246,6 +246,23 @@ class SequenceHarness
 
     history_.PushBackDropOldest(imu);
     history_timestamps_.push_back(imu.sensor_timestamp_us);
+    if (imu_cadence_.stable && imu_cadence_.has_last_timestamp &&
+        imu_cadence_.period_us != 0 &&
+        imu.sensor_timestamp_us > imu_cadence_.last_timestamp_us)
+    {
+      const uint64_t gap_us =
+          imu.sensor_timestamp_us - imu_cadence_.last_timestamp_us;
+      const uint32_t stride = MatchPeriodGapStride(
+          gap_us, imu_cadence_.period_us, imu_tolerance_us,
+          max_raw_imu_gap_stride);
+      if (stride > 1)
+      {
+        imu_cadence_.last_timestamp_us = imu.sensor_timestamp_us;
+        periods_.imu_us = imu_cadence_.period_us;
+        return true;
+      }
+    }
+
     const auto update = ObserveCadence(imu_cadence_, imu.sensor_timestamp_us,
                                        stable_gaps, imu_tolerance_us);
     if (update == CadenceUpdate::BROKEN)
@@ -879,7 +896,7 @@ void EmitWarmup(StreamDriver& driver, size_t image_count, uint32_t imu_after_cou
   }
 }
 
-void TestExactJoinWaitsForAllChannels()
+void TestRawJoinWaitsForAllChannels()
 {
   SequenceHarness harness;
 
@@ -894,23 +911,30 @@ void TestExactJoinWaitsForAllChannels()
                     "三路 timestamp 相同后应组装 IMU");
 }
 
-void TestExactJoinDropsOldAndMissingChannels()
+void TestRawJoinRequiresExactGyroTimestamp()
 {
   SequenceHarness harness;
 
   harness.PushGyro(2000);
-  harness.PushAccl(1000);
-  harness.PushAccl(3000);
+  harness.PushAccl(2000);
   harness.PushQuat(2000);
   harness.Drain();
-  Expect(harness.HistoryTimestamps().empty(),
-         "accl 已经越过 gyro 时应丢弃当前 gyro，不应近邻拼接");
+  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{2000},
+                    "当前 DevC raw 三通道使用同一个 gyro timestamp，应 exact join");
 
   harness.PushGyro(3000);
+  harness.PushAccl(3001);
   harness.PushQuat(3000);
   harness.Drain();
-  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{3000},
-                    "下一条 timestamp 完全一致的 gyro/accl/quat 应恢复组装");
+  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{2000},
+                    "非 exact timestamp 不能拼到当前 gyro");
+
+  harness.PushGyro(4000);
+  harness.PushAccl(4000);
+  harness.PushQuat(4000);
+  harness.Drain();
+  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{2000, 4000},
+                    "丢弃无法匹配的 gyro 后应继续组装后续 raw IMU");
 }
 
 void TestLatestModePublishesWithoutProbe()
@@ -1225,6 +1249,28 @@ void TestSkippedPublishedImageGapKeepsSync()
                     "整数倍图像 gap 应按倍数推进 IMU 同步点");
 }
 
+void TestRawImuChannelMissDoesNotDropSyncLock()
+{
+  SequenceHarness harness;
+  StreamDriver driver(harness);
+
+  EmitWarmup(driver, 8);
+  ExpectEqual(harness.State(), SyncState::SYNCED, "warmup 后应同步");
+
+  const uint64_t missed_ts = driver.NextImuTimestamp();
+  harness.PushGyro(missed_ts);
+  harness.PushAccl(missed_ts + 1000);
+  harness.PushQuat(missed_ts);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "单个 raw gyro 缺少可匹配辅通道时不应立即打断相机同步锁");
+
+  harness.PushRawImu(missed_ts + driver.ImuPeriodUs());
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "稳定 IMU 周期内的整数倍 raw 缺样不应打断同步锁");
+}
+
 void TestCompositeResetAndRelock()
 {
   SequenceHarness harness;
@@ -1254,8 +1300,8 @@ struct NamedTest
 int main()
 {
   const std::vector<NamedTest> tests = {
-      {"exact-join/等待三路齐全", TestExactJoinWaitsForAllChannels},
-      {"exact-join/丢旧样本和缺帧gyro", TestExactJoinDropsOldAndMissingChannels},
+      {"raw-join/等待三路齐全", TestRawJoinWaitsForAllChannels},
+      {"raw-join/要求gyro精确时间戳", TestRawJoinRequiresExactGyroTimestamp},
       {"latest/无需probe直接发布", TestLatestModePublishesWithoutProbe},
       {"latest/等待offset目标imu", TestLatestModeWaitsForOffsetTarget},
       {"raw-probe/使用CameraSync回执锁定", TestRawProbeLocksFromCameraSyncAck},
@@ -1268,6 +1314,7 @@ int main()
       {"synced/发布失败丢帧保持同步", TestDroppedPublishedImageKeepsSync},
       {"synced/连续发布失败丢帧保持同步", TestConsecutiveDroppedImagesKeepSync},
       {"synced/成功图像整数倍gap保持同步", TestSkippedPublishedImageGapKeepsSync},
+      {"synced/raw imu单点缺样保持同步", TestRawImuChannelMissDoesNotDropSyncLock},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
   };
 

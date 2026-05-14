@@ -231,6 +231,36 @@ inline uint32_t MatchImageGapStride(uint64_t gap_us, uint64_t image_period_us,
 }
 
 /**
+ * @brief 判断 gap 是否为给定周期的整数倍。
+ *
+ * tolerance_us 由调用者按数据源类型提供；IMU 不能复用图像的大容差。
+ */
+inline uint32_t MatchPeriodGapStride(uint64_t gap_us, uint64_t period_us,
+                                     uint64_t tolerance_us,
+                                     uint32_t max_stride)
+{
+  if (period_us == 0 || max_stride == 0)
+  {
+    return 0;
+  }
+
+  const uint64_t stride = (gap_us + period_us / 2ULL) / period_us;
+  if (stride == 0 || stride > max_stride)
+  {
+    return 0;
+  }
+  if (period_us > std::numeric_limits<uint64_t>::max() / stride)
+  {
+    return 0;
+  }
+
+  const uint64_t expected = period_us * stride;
+  return AbsDiffUs(gap_us, expected) <= tolerance_us
+             ? static_cast<uint32_t>(stride)
+             : 0;
+}
+
+/**
  * @brief IMU 时间戳匹配容差。
  */
 inline uint64_t ImuTimestampToleranceUs(uint64_t imu_period_us)

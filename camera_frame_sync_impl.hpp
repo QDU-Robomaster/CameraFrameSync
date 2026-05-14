@@ -529,7 +529,8 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 
   const uint64_t gyro_ts = queued_gyro.sensor_timestamp_us;
   AcclSample queued_accl{};
-  // 以 gyro 为主时间轴；早于 gyro 的 accl/quat 已不可能组成当前 IMU 帧。
+  // 当前 DevC 固件把 gyro/accl/quat 都写成同一个 gyro interrupt timestamp。
+  // 因此 raw 三通道 join 保持 exact；不匹配代表某个通道缺了这一拍。
   while (pending_accls_.Front(queued_accl) &&
          queued_accl.sensor_timestamp_us < gyro_ts)
   {
@@ -550,11 +551,12 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 
   const uint64_t accl_ts = queued_accl.sensor_timestamp_us;
   const uint64_t quat_ts = queued_quat.sensor_timestamp_us;
-  if (accl_ts > gyro_ts || quat_ts > gyro_ts)
+  if (accl_ts != gyro_ts || quat_ts != gyro_ts)
   {
-    // Topic timestamp 已是传感器时间；同一 IMU 帧三路时间戳必须精确一致。
+    // 当前 gyro 对应的辅通道样本已经错过或尚未出现在相同 timestamp；
+    // 丢这一个 raw 点即可。
+    // 是否影响相机同步由后续所需同步时间戳是否仍能在历史中找到决定。
     pending_gyros_.PopFront();
-    ResetLock("raw-imu-missing-channel", "exact timestamp join failed");
     return true;
   }
 
@@ -589,6 +591,22 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_us)
 {
+  if (imu_cadence_.stable && imu_cadence_.has_last_timestamp &&
+      imu_cadence_.period_us != 0 &&
+      sensor_timestamp_us > imu_cadence_.last_timestamp_us)
+  {
+    const uint64_t gap_us = sensor_timestamp_us - imu_cadence_.last_timestamp_us;
+    const uint32_t gap_stride = CameraFrameSyncCore::MatchPeriodGapStride(
+        gap_us, imu_cadence_.period_us, imu_cadence_tolerance_us,
+        max_raw_imu_gap_stride);
+    if (gap_stride > 1)
+    {
+      imu_cadence_.last_timestamp_us = sensor_timestamp_us;
+      periods_.imu_us = imu_cadence_.period_us;
+      return;
+    }
+  }
+
   const auto update = CameraFrameSyncCore::ObserveCadence(
       imu_cadence_, sensor_timestamp_us, cadence_stable_gaps,
       imu_cadence_tolerance_us);
