@@ -160,7 +160,7 @@ jobs:
         run: |
           mkdir -p build
           cd build
-          cmake ..
+          cmake .. -DXR_LOG_MESSAGE_MAX_LEN=256 -DLIBXR_PRINT_INTEGER_ENABLE_64BIT=1
           make
 
       - name: Create Tag via GitHub API
