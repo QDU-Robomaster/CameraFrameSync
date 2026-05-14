@@ -89,7 +89,7 @@ IMU 组装以 gyro 为主轴：
 状态只有三种：
 
 - `OBSERVING`：持续观察图像周期和完整 IMU 周期
-- `PROBE_SENT`：已发送一次 `CameraSync::SyncCommand`，等待 probe 图像和同 seq 回执
+- `PROBE_SENT`：已发送一次 `CameraSync::SyncCommand`，等待 probe 图像和同 seq 回执；若回执长期未到会超时回到 `OBSERVING` 并重发 probe
 - `SYNCED`：已锁定，后续按 IMU 时间轴递推
 
 流程：
@@ -102,6 +102,11 @@ IMU 组装以 gyro 为主轴：
 6. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
 7. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
 8. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
+
+如果首个 `SyncCommand` 在启动阶段被串口转发层丢掉，或 MCU 未返回匹配
+`SyncEvent`，状态机不会永久停在 `PROBE_SENT`。模块按 IMU 时间轴等待
+`max(100ms, probe_gap + 4 * image_period)`，超时后清掉当前 probe 并重新观察、
+重新发送下一次 probe。
 
 `sync_probe_div = 3` 时，期望 probe 图像 gap 为 `3T`。通用公式是 `T * sync_probe_div`。
 
@@ -179,6 +184,7 @@ constructor_args:
 - 发送 `CameraSync::SyncCommand`
 - 进入 `SYNCED`
 - 从 `PROBE_SENT / SYNCED` 回到 `OBSERVING`
+- `probe-timeout` 表示 probe 命令或回执丢失后触发了自动恢复
 - ingress 溢出导致运行时状态重置
 
 正常稳态不应持续出现 `-> OBSERVING`。

@@ -428,6 +428,8 @@ class CameraFrameSync : public LibXR::Application
   static constexpr uint32_t max_synced_image_gap_stride = 8;  ///< 同步态可接受的连续丢图数量。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。
+  static constexpr uint64_t probe_ack_timeout_min_us =
+      100000ULL;  ///< probe 发出后等待回执的最短超时时间。
 
   /**
    * @brief 返回同步模式的日志名称。
@@ -563,6 +565,16 @@ class CameraFrameSync : public LibXR::Application
    * @brief 处理探针图像，等待对应 CameraSync 回执和 IMU 历史到达。
    */
   ImageDecision TryProbeImage(PendingFrame& frame);
+
+  /**
+   * @brief 估算当前 probe 最长等待时间。
+   */
+  uint64_t ProbeTimeoutUs() const;
+
+  /**
+   * @brief 判断当前 probe 是否已经超时。
+   */
+  bool ProbeTimedOut() const;
 
   /**
    * @brief LATEST_IMU 模式下用最新完整 IMU 建立本帧匹配。
@@ -757,6 +769,7 @@ class CameraFrameSync : public LibXR::Application
   bool pending_probe_ack_valid_{false};
   uint64_t pending_probe_imu_timestamp_us_{0};
   uint64_t pending_run_period_us_{0};
+  uint64_t pending_probe_start_imu_timestamp_us_{0};
 
   CameraFrameSyncRecording recording_{};
 };

@@ -156,6 +156,7 @@ class SequenceHarness
   static constexpr uint64_t imu_tolerance_us = 300;
   static constexpr uint64_t image_tolerance_us = 1500;
   static constexpr uint32_t probe_div = 3;
+  static constexpr uint64_t probe_ack_timeout_min_us = 100000;
 
   void ResetRuntime()
   {
@@ -191,6 +192,7 @@ class SequenceHarness
     probe_ack_seq_ = 0;
     probe_ack_valid_ = false;
     probe_ack_timestamp_us_ = 0;
+    probe_start_imu_timestamp_us_ = 0;
   }
 
   void ResetImageObservation()
@@ -372,6 +374,13 @@ class SequenceHarness
       case SyncState::PROBE_SENT:
         if (IsNormalGap(image_gap))
         {
+          if (ProbeTimedOut())
+          {
+            ResetLock();
+            RememberImage(image_ts);
+            MaybeStartProbe();
+            return Decision::DONE;
+          }
           RememberImage(image_ts);
           return Decision::DONE;
         }
@@ -486,6 +495,8 @@ class SequenceHarness
     probe_ack_valid_ = false;
     probe_ack_seq_ = 0;
     probe_ack_timestamp_us_ = 0;
+    probe_start_imu_timestamp_us_ =
+        history_.Empty() ? 0 : history_.Back().sensor_timestamp_us;
     active_probe_seq_ = last_probe_seq_;
   }
 
@@ -497,6 +508,14 @@ class SequenceHarness
     }
     if (!probe_ack_valid_)
     {
+      if (ProbeTimedOut())
+      {
+        ResetLock();
+        ResetImageObservation();
+        ObserveImage(image);
+        RememberImage(image.event.sensor_timestamp_us);
+        return Decision::DONE;
+      }
       return Decision::WAIT;
     }
     if (!HistoryReached(probe_ack_timestamp_us_))
@@ -597,6 +616,45 @@ class SequenceHarness
     return stride == 0 ? 0 : periods_.imu_us * static_cast<uint64_t>(stride);
   }
 
+  uint64_t ProbeTimeoutUs() const
+  {
+    uint64_t image_period_us = periods_.image_us;
+    if (image_period_us == 0)
+    {
+      image_period_us = EstimatedSyncPeriod();
+    }
+    if (image_period_us == 0)
+    {
+      return 0;
+    }
+
+    const uint64_t probe_gap_us = ProbeImageGapUs(image_period_us, probe_div);
+    uint64_t timeout_us = probe_gap_us + image_period_us * 4ULL;
+    if (timeout_us < probe_ack_timeout_min_us)
+    {
+      timeout_us = probe_ack_timeout_min_us;
+    }
+    return timeout_us;
+  }
+
+  bool ProbeTimedOut() const
+  {
+    if (state_ != SyncState::PROBE_SENT || probe_start_imu_timestamp_us_ == 0 ||
+        history_.Empty())
+    {
+      return false;
+    }
+
+    const uint64_t timeout_us = ProbeTimeoutUs();
+    if (timeout_us == 0 ||
+        history_.Back().sensor_timestamp_us <= probe_start_imu_timestamp_us_)
+    {
+      return false;
+    }
+    return history_.Back().sensor_timestamp_us - probe_start_imu_timestamp_us_ >=
+           timeout_us;
+  }
+
   bool HistoryReached(uint64_t timestamp_us) const
   {
     return !history_.Empty() && history_.Back().sensor_timestamp_us >= timestamp_us;
@@ -651,6 +709,7 @@ class SequenceHarness
   uint32_t probe_ack_seq_{0};
   bool probe_ack_valid_{false};
   uint64_t probe_ack_timestamp_us_{0};
+  uint64_t probe_start_imu_timestamp_us_{0};
 
   std::vector<uint32_t> published_tags_{};
   std::vector<uint64_t> sync_imu_timestamps_{};
@@ -934,6 +993,48 @@ void TestWrongSeqIsIgnoredUntilCorrectAckArrives()
                     "正确 seq 到达后应发布等待中的 probe 图像");
 }
 
+void TestLostProbeCommandRetriesAndLocks()
+{
+  SequenceHarness harness;
+  uint64_t next_raw = 2000;
+  auto push_raw_until = [&](uint64_t timestamp_us) {
+    while (next_raw <= timestamp_us)
+    {
+      harness.PushRawImu(next_raw);
+      next_raw += 2000;
+    }
+  };
+
+  for (uint64_t image_ts = 10000; image_ts <= 30000; image_ts += 10000)
+  {
+    push_raw_until(image_ts);
+    harness.PushImage(image_ts, static_cast<uint32_t>(image_ts / 10000));
+    harness.Drain();
+  }
+  ExpectEqual(harness.ProbeSentCount(), 1U, "稳定后应发送第一次 probe");
+  ExpectEqual(harness.State(), SyncState::PROBE_SENT, "第一次 probe 应等待回执");
+
+  for (uint64_t image_ts = 40000; image_ts <= 130000; image_ts += 10000)
+  {
+    push_raw_until(image_ts);
+    harness.PushImage(image_ts, static_cast<uint32_t>(image_ts / 10000));
+    harness.Drain();
+  }
+  ExpectEqual(harness.ProbeSentCount(), 2U,
+              "probe 命令或回执丢失后应超时重发");
+  ExpectEqual(harness.State(), SyncState::PROBE_SENT, "重发后应等待新的回执");
+
+  push_raw_until(160000);
+  harness.PushSyncAck(harness.LastProbeSeq(), 160000);
+  harness.PushImage(160000, 16);
+  harness.Drain();
+
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "重发 probe 收到回执后应重新锁定同步");
+  ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{16},
+                    "重发 probe 的图像应正常发布");
+}
+
 void TestProbeWaitsForRawHistory()
 {
   SequenceHarness harness;
@@ -1159,6 +1260,7 @@ int main()
       {"latest/等待offset目标imu", TestLatestModeWaitsForOffsetTarget},
       {"raw-probe/使用CameraSync回执锁定", TestRawProbeLocksFromCameraSyncAck},
       {"raw-probe/错误seq忽略", TestWrongSeqIsIgnoredUntilCorrectAckArrives},
+      {"raw-probe/probe丢失后重发", TestLostProbeCommandRetriesAndLocks},
       {"raw-probe/等待raw历史覆盖ack", TestProbeWaitsForRawHistory},
       {"raw-probe/错误probe gap重置", TestBadProbeGapResets},
       {"raw-probe/带回执过渡gap可锁定", TestAckedTransitionGapLocks},

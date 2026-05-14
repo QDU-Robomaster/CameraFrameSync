@@ -145,6 +145,13 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
       if (IsNormalImageGap(image_gap_us))
       {
         // probe 尚未体现到图像间隔上，继续等真正被拉长的那一帧。
+        if (ProbeTimedOut())
+        {
+          ResetLock("probe-timeout", "normal image gaps without sync result");
+          RememberImage(image_ts);
+          MaybeStartProbe();
+          return ImageDecision::DONE;
+        }
         RememberImage(image_ts);
         return ImageDecision::DONE;
       }
@@ -274,6 +281,8 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;
   pending_run_period_us_ = periods_.imu_us * static_cast<uint64_t>(cmd.run_trigger_div);
+  pending_probe_start_imu_timestamp_us_ =
+      imu_history_.Empty() ? 0 : imu_history_.Back().sensor_timestamp_us;
   // 回环很短时回执可能早于 Publish 返回，因此先打开当前 probe 邮箱。
   probe_ack_timestamp_us_.store(0);
   probe_ack_seq_.store(0);
@@ -312,6 +321,14 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
   }
   if (sync_period_us == 0 || !pending_probe_ack_valid_)
   {
+    if (!pending_probe_ack_valid_ && ProbeTimedOut())
+    {
+      ResetLock("probe-timeout", "probe gap without sync result");
+      ResetImageObservation();
+      ObserveNormalImageCadence(frame.image.sensor_timestamp_us);
+      RememberImage(frame.image.sensor_timestamp_us);
+      return ImageDecision::DONE;
+    }
     return ImageDecision::WAIT;
   }
 
@@ -334,6 +351,50 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
 
   return PublishOrRememberMatch(frame,
                                 SyncMatch{.imu = sync_imu, .period_us = sync_period_us});
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+uint64_t CameraFrameSync<CameraInfoV>::ProbeTimeoutUs() const
+{
+  uint64_t image_period_us = periods_.image_us;
+  if (image_period_us == 0)
+  {
+    image_period_us = EstimatedSyncPeriodUs();
+  }
+  if (image_period_us == 0)
+  {
+    return 0;
+  }
+
+  const uint64_t probe_gap_us =
+      CameraFrameSyncCore::ProbeImageGapUs(image_period_us, sync_probe_div_);
+  uint64_t timeout_us = probe_gap_us + image_period_us * 4ULL;
+  if (timeout_us < probe_ack_timeout_min_us)
+  {
+    timeout_us = probe_ack_timeout_min_us;
+  }
+  return timeout_us;
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+bool CameraFrameSync<CameraInfoV>::ProbeTimedOut() const
+{
+  if (state_ != SyncState::PROBE_SENT ||
+      pending_probe_start_imu_timestamp_us_ == 0 || imu_history_.Empty())
+  {
+    return false;
+  }
+
+  const uint64_t timeout_us = ProbeTimeoutUs();
+  if (timeout_us == 0 ||
+      imu_history_.Back().sensor_timestamp_us <= pending_probe_start_imu_timestamp_us_)
+  {
+    return false;
+  }
+
+  return imu_history_.Back().sensor_timestamp_us -
+             pending_probe_start_imu_timestamp_us_ >=
+         timeout_us;
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -609,6 +670,7 @@ void CameraFrameSync<CameraInfoV>::ClearPendingProbe()
   pending_probe_ack_valid_ = false;
   pending_probe_imu_timestamp_us_ = 0;
   pending_run_period_us_ = 0;
+  pending_probe_start_imu_timestamp_us_ = 0;
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
