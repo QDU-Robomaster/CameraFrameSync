@@ -574,15 +574,48 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
   if (!imu_history_.Empty() &&
       imu.sensor_timestamp_us <= imu_history_.Back().sensor_timestamp_us)
   {
-    // 已组装 IMU 也必须保持单调，否则后续历史查找和周期观察都会失效。
+    const uint64_t previous_timestamp_us = imu_history_.Back().sensor_timestamp_us;
+    if (imu.sensor_timestamp_us < previous_timestamp_us &&
+        previous_timestamp_us - imu.sensor_timestamp_us >=
+            raw_imu_epoch_reset_backward_us)
+    {
+      ResetRawImuEpoch(previous_timestamp_us, imu);
+      return true;
+    }
+
+    // 小幅乱序或重复仍按坏样本处理；只有大幅回退才视为 USB/设备流重启。
     ResetLock("raw-imu-out-of-order", "assembled imu timestamp");
     return true;
   }
 
+  AcceptAssembledImu(imu);
+  return true;
+}
+
+/**
+ * @brief 接受一帧单调递增的完整 raw IMU。
+ */
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::AcceptAssembledImu(const AssembledImu& imu)
+{
   imu_history_.PushBackDropOldest(imu);
   monitor_assembled_imu_count_.fetch_add(1, std::memory_order_relaxed);
   ObserveImuCadence(imu.sensor_timestamp_us);
-  return true;
+}
+
+/**
+ * @brief raw IMU 时间戳大幅回退时，按设备/USB 流重启切换到新 epoch。
+ */
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::ResetRawImuEpoch(
+    uint64_t previous_timestamp_us, const AssembledImu& first_imu)
+{
+  XR_LOG_WARN(
+      "CameraFrameSync: raw IMU timestamp epoch reset previous=%llu current=%llu",
+      static_cast<unsigned long long>(previous_timestamp_us),
+      static_cast<unsigned long long>(first_imu.sensor_timestamp_us));
+  ResetRuntimeState();
+  AcceptAssembledImu(first_imu);
 }
 
 /**

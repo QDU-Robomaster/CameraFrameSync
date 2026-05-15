@@ -156,10 +156,11 @@ class SequenceHarness
   static constexpr uint64_t imu_tolerance_us = 300;
   static constexpr uint64_t image_tolerance_us = 1500;
   static constexpr uint32_t max_raw_imu_gap_stride = 8;
+  static constexpr uint64_t raw_imu_epoch_reset_backward_us = 100000ULL;
   static constexpr uint32_t probe_div = 3;
   static constexpr uint64_t probe_ack_timeout_min_us = 100000;
 
-  void ResetRuntime()
+  void ClearRuntimeState()
   {
     gyros_.Clear();
     accls_.Clear();
@@ -176,6 +177,11 @@ class SequenceHarness
     last_image_valid_ = false;
     last_image_timestamp_us_ = 0;
     ClearPendingProbe();
+  }
+
+  void ResetRuntime()
+  {
+    ClearRuntimeState();
     last_probe_seq_ = 0;
     probe_sent_count_ = 0;
   }
@@ -185,6 +191,12 @@ class SequenceHarness
     state_ = SyncState::OBSERVING;
     locked_sync_ = {};
     ClearPendingProbe();
+  }
+
+  void ResetRawEpoch(const Imu& first_imu)
+  {
+    ClearRuntimeState();
+    AcceptImu(first_imu);
   }
 
   void ClearPendingProbe()
@@ -244,6 +256,26 @@ class SequenceHarness
     accls_.PopFront();
     quats_.PopFront();
 
+    if (!history_.Empty() && imu.sensor_timestamp_us <= history_.Back().sensor_timestamp_us)
+    {
+      const uint64_t previous_timestamp_us = history_.Back().sensor_timestamp_us;
+      if (imu.sensor_timestamp_us < previous_timestamp_us &&
+          previous_timestamp_us - imu.sensor_timestamp_us >=
+              raw_imu_epoch_reset_backward_us)
+      {
+        ResetRawEpoch(imu);
+        return true;
+      }
+      ResetLock();
+      return true;
+    }
+
+    AcceptImu(imu);
+    return true;
+  }
+
+  void AcceptImu(const Imu& imu)
+  {
     history_.PushBackDropOldest(imu);
     history_timestamps_.push_back(imu.sensor_timestamp_us);
     if (imu_cadence_.stable && imu_cadence_.has_last_timestamp &&
@@ -259,7 +291,7 @@ class SequenceHarness
       {
         imu_cadence_.last_timestamp_us = imu.sensor_timestamp_us;
         periods_.imu_us = imu_cadence_.period_us;
-        return true;
+        return;
       }
     }
 
@@ -273,7 +305,6 @@ class SequenceHarness
     {
       periods_.imu_us = imu_cadence_.period_us;
     }
-    return true;
   }
 
   void ProcessImages()
@@ -1271,6 +1302,68 @@ void TestRawImuChannelMissDoesNotDropSyncLock()
               "稳定 IMU 周期内的整数倍 raw 缺样不应打断同步锁");
 }
 
+void TestRawImuEpochResetClearsHistoryAndRelocks()
+{
+  SequenceHarness harness;
+  StreamDriver driver(harness);
+
+  EmitWarmup(driver, 8);
+  ExpectEqual(harness.State(), SyncState::SYNCED, "warmup 后应同步");
+
+  for (size_t i = 0; i < 25; ++i)
+  {
+    driver.EmitImage();
+  }
+  ExpectEqual(harness.State(), SyncState::SYNCED, "旧 epoch 稳态下应保持同步");
+
+  harness.PushRawImu(2000);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::OBSERVING,
+              "raw IMU 时间戳大幅回退后应回到观察态");
+  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{2000},
+                    "旧 epoch IMU 历史应清空，只保留新 epoch 第一帧");
+
+  for (uint64_t t = 4000; t <= 50000; t += 2000)
+  {
+    harness.PushRawImu(t);
+  }
+  harness.PushImage(10000, 101);
+  harness.PushImage(20000, 102);
+  harness.PushImage(30000, 103);
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::PROBE_SENT,
+              "新 epoch 周期稳定后应重新发送 probe");
+
+  for (uint64_t t = 52000; t <= 60000; t += 2000)
+  {
+    harness.PushRawImu(t);
+  }
+  harness.PushSyncAck(harness.LastProbeSeq(), 60000);
+  harness.PushImage(60000, 104);
+  harness.Drain();
+
+  ExpectEqual(harness.State(), SyncState::SYNCED,
+              "新 epoch 收到 CameraSync 回执后应重新同步");
+  ExpectEqual(harness.SyncImuTimestamps().back(), 60000ULL,
+              "重新同步应使用新 epoch 的 CameraSync timestamp");
+}
+
+void TestRawImuSmallRollbackDoesNotResetEpoch()
+{
+  SequenceHarness harness;
+
+  harness.PushRawImu(100000);
+  harness.PushRawImu(102000);
+  harness.Drain();
+
+  harness.PushRawImu(101500);
+  harness.Drain();
+
+  ExpectVectorEqual(harness.HistoryTimestamps(),
+                    std::vector<uint64_t>{100000, 102000},
+                    "小幅乱序不能当作设备 epoch 重启清空历史");
+}
+
 void TestCompositeResetAndRelock()
 {
   SequenceHarness harness;
@@ -1315,6 +1408,8 @@ int main()
       {"synced/连续发布失败丢帧保持同步", TestConsecutiveDroppedImagesKeepSync},
       {"synced/成功图像整数倍gap保持同步", TestSkippedPublishedImageGapKeepsSync},
       {"synced/raw imu单点缺样保持同步", TestRawImuChannelMissDoesNotDropSyncLock},
+      {"raw-imu/epoch重启后重锁", TestRawImuEpochResetClearsHistoryAndRelocks},
+      {"raw-imu/小幅乱序不清epoch", TestRawImuSmallRollbackDoesNotResetEpoch},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
   };
 

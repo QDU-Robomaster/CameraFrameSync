@@ -429,6 +429,8 @@ class CameraFrameSync : public LibXR::Application
   static constexpr uint32_t max_raw_imu_gap_stride = 8;  ///< 稳定后可接受的连续 raw IMU 缺样数量。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。
+  static constexpr uint64_t raw_imu_epoch_reset_backward_us =
+      100000ULL;  ///< raw IMU 时间戳大幅回退时判定设备流重启。
   static constexpr uint64_t probe_ack_timeout_min_us =
       100000ULL;  ///< probe 发出后等待回执的最短超时时间。
 
@@ -526,6 +528,17 @@ class CameraFrameSync : public LibXR::Application
    * @brief 以 gyro timestamp 为主键尝试组装一帧完整 IMU。
    */
   bool TryAssembleOneImu();
+
+  /**
+   * @brief 将一帧完整 IMU 写入历史并更新周期观察。
+   */
+  void AcceptAssembledImu(const AssembledImu& imu);
+
+  /**
+   * @brief raw IMU 时间轴重启后清空旧历史，并接受新 epoch 第一帧。
+   */
+  void ResetRawImuEpoch(uint64_t previous_timestamp_us,
+                        const AssembledImu& first_imu);
 
   /**
    * @brief 更新 IMU 发布周期观察，并在周期破坏时触发重同步。
