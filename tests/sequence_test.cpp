@@ -6,7 +6,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "../camera_frame_sync_core.hpp"
+#include "../CameraFrameSyncCore.hpp"
 
 namespace
 {
