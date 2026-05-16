@@ -16,17 +16,14 @@
 /**
  * @brief CameraFrameSync 同步结果内录。
  *
- * CameraBase 负责保存图像原始字节；这里只保存同步成功后的图像时间戳、
- * IMU 时间戳映射和最终 IMU 数据。
+ * 这里只保存同步成功后的图像时间戳、IMU 时间戳映射和最终 IMU 数据。
+ * 完整同步图像/IMU 采集由 CameraFrameSync 后级的 VisionCapture 负责。
  */
 class CameraFrameSyncRecording
 {
  public:
   /**
    * @brief 打开同步记录 CSV。
-   *
-   * 若 CameraBase 已启用图像内录，则复用 CameraBase 的 stem 和临时目录，使
-   * `_frames.*`、`_sync.csv`、`_imu.csv` 落在同一个可恢复记录包中。
    *
    * @tparam RuntimeParam CameraFrameSync 运行时参数类型。
    * @tparam Camera CameraBase 派生相机类型。
@@ -41,28 +38,16 @@ class CameraFrameSyncRecording
       return;
     }
 
-    if (camera.RecordingEnabled() && !camera.RecordingFileStemView().empty())
-    {
-      file_stem_ = std::string(camera.RecordingFileStemView());
-    }
-    else
-    {
-      const std::string dir = MakeDefaultDir(camera.NameView());
-      file_stem_ = std::filesystem::path(dir).filename().string();
-    }
+    const std::string default_dir = MakeDefaultDir(camera.NameView());
+    file_stem_ = std::filesystem::path(default_dir).filename().string();
 
     if (!runtime.record_dir.empty())
     {
       output_dir_ = std::string(runtime.record_dir);
     }
-    else if (camera.RecordingEnabled() && !camera.RecordingOutputDirView().empty())
-    {
-      output_dir_ = std::string(camera.RecordingOutputDirView());
-    }
     else
     {
-      output_dir_ =
-          (std::filesystem::path("runs") / "camera_record" / file_stem_).string();
+      output_dir_ = default_dir;
     }
 
     std::error_code ec;
@@ -213,11 +198,11 @@ class CameraFrameSyncRecording
   }
 
   /**
-   * @brief 没有 CameraBase 图像内录时生成独立同步记录目录。
+   * @brief 生成独立同步记录目录。
    */
   static std::string MakeDefaultDir(std::string_view camera_name)
   {
-    return (std::filesystem::path("runs") / "camera_record" /
+    return (std::filesystem::path("runs") / "camera_sync" /
             (MakeTimestamp() + "_" + SanitizeName(camera_name)))
         .string();
   }

@@ -24,10 +24,9 @@
 - 同步 IMU topic：`camera.ImuTopicName()`
 - 同步命令：`camera_sync_command`，payload 为 `CameraSync::SyncCommand`
 
-## 内录分工
+## 同步记录
 
-完整图像内录不走 `CameraFrameSync::Subscriber`。图像由 `CameraBase` 在生产者
-`CommitImage()` 路径写出，避免后级订阅者消费慢导致丢帧。
+完整同步图像/IMU 采集由 `CameraFrameSync` 后级的 `VisionCapture` 负责。
 
 `CameraFrameSync` 只记录同步结果：
 
@@ -41,7 +40,7 @@
   - 列顺序为 `timestamp_us,qw,qx,qy,qz,gx,gy,gz,ax,ay,az`
   - `timestamp_us` 使用图像时间戳，payload 使用最终 IMU 样本
 
-如果 `record_dir` 为空且上游 `CameraBase` 已经开启内录，sync 会复用同一个目录。
+如果 `record_dir` 为空，sync 会自动创建 `runs/camera_sync/<时间>_<相机名>/`。
 
 实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。原始 IMU topic 由 `camera.Name()` 派生；实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，相机运行配置里的 `camera_name` 应设为 `gimbal`，图像 topic 和同步后 IMU topic 仍可单独配置。
 

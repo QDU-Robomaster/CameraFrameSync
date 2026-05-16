@@ -113,7 +113,7 @@ class CameraFrameSync : public LibXR::Application
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
     float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
     bool record_enable = false;          ///< 是否记录同步映射和 IMU 数据。
-    std::string_view record_dir = {};    ///< 为空时复用 CameraBase 的内录目录。
+    std::string_view record_dir = {};    ///< 为空时自动创建 runs/camera_sync/...。
   };
 
   /**
