@@ -266,7 +266,8 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   }
 
   CameraSync::SyncCommand cmd{};
-  cmd.version = 1;
+  cmd.flags = 0;
+  cmd.active_level = static_cast<uint8_t>(sync_active_level_);
   cmd.seq = next_sync_seq_++;
   if (next_sync_seq_ == 0)
   {
@@ -274,7 +275,6 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   }
   cmd.sync_probe_div = static_cast<uint8_t>(sync_probe_div_);
   cmd.run_trigger_div = TargetRunTriggerDiv();
-  cmd.active_level = static_cast<uint8_t>(sync_active_level_);
 
   state_ = SyncState::PROBE_SENT;
   pending_probe_seq_ = cmd.seq;
@@ -299,6 +299,21 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
       static_cast<unsigned>(periods_.image_us),
       static_cast<unsigned>(periods_.imu_us),
       static_cast<unsigned>(sync_period_us));
+}
+
+template <CameraTypes::CameraInfo CameraInfoV>
+void CameraFrameSync<CameraInfoV>::SendResetToDefaultCommand()
+{
+  CameraSync::SyncCommand cmd{};
+  // reset 命令不参与同步，所以 seq 和两个分频字段都保持 0。
+  cmd.flags = CameraSync::RESET_TO_DEFAULT;
+  cmd.active_level = static_cast<uint8_t>(sync_active_level_);
+  cmd.seq = 0;
+  cmd.sync_probe_div = 0;
+  cmd.run_trigger_div = 0;
+  topics_.sync_command.Publish(cmd);
+  XR_LOG_INFO("CameraFrameSync: reset CameraSync to default trigger divider active=%u",
+              static_cast<unsigned>(cmd.active_level));
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -686,9 +701,15 @@ void CameraFrameSync<CameraInfoV>::ResetLock(const char* reason, const char* det
 
   if (old_state != SyncState::OBSERVING)
   {
+    const bool reset_camera_sync = sync_mode_ == SyncMode::RAW_PROBE;
+    if (reset_camera_sync)
+    {
+      SendResetToDefaultCommand();
+    }
     XR_LOG_WARN(
-        "CameraFrameSync: state %s -> OBSERVING reason=%s detail=%s image_period_us=%u imu_period_us=%u",
+        "CameraFrameSync: state %s -> OBSERVING reason=%s detail=%s reset_camera_sync=%u image_period_us=%u imu_period_us=%u",
         StateName(old_state), reason, detail,
+        reset_camera_sync ? 1U : 0U,
         static_cast<unsigned>(periods_.image_us),
         static_cast<unsigned>(periods_.imu_us));
   }
@@ -698,6 +719,10 @@ template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ResetRuntimeState()
 {
   monitor_reset_count_.fetch_add(1, std::memory_order_relaxed);
+  if (sync_mode_ == SyncMode::RAW_PROBE)
+  {
+    SendResetToDefaultCommand();
+  }
   pending_gyros_.Clear();
   pending_accls_.Clear();
   pending_quats_.Clear();

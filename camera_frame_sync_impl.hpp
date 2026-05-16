@@ -61,6 +61,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   topics_.accl.RegisterCallback(callbacks_.accl);
   topics_.quat.RegisterCallback(callbacks_.quat);
   topics_.sync_result.RegisterCallback(callbacks_.sync_result);
+  SendResetToDefaultCommand();
 
   XR_LOG_INFO(
       "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s target_trigger_hz=%.3f",
@@ -391,7 +392,7 @@ void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
     bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
     const CameraSync::SyncEvent& event)
 {
-  if (event.version != 1 || event.run_trigger_div == 0)
+  if (event.run_trigger_div == 0)
   {
     return;
   }

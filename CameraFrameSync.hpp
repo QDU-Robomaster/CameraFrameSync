@@ -571,6 +571,14 @@ class CameraFrameSync : public LibXR::Application
   void MaybeStartProbe();
 
   /**
+   * @brief 让 MCU 恢复默认触发分频。
+   *
+   * Host 重启时 MCU 可能还保留上一次同步后的运行分频。构造阶段先发 reset，
+   * 让 MCU 回到默认触发状态，再由 RAW_PROBE 重新下发本次运行分频。
+   */
+  void SendResetToDefaultCommand();
+
+  /**
    * @brief 处理探针图像，等待对应 CameraSync 回执和 IMU 样本到达。
    */
   ImageDecision TryProbeImage(PendingFrame& frame);

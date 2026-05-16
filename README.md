@@ -84,16 +84,26 @@ IMU 组装以 gyro 为主轴：
 1. `OBSERVING` 中观察到稳定图像周期 `T` 和稳定 IMU 周期 `t`
 2. 计算 `N = round(T / t)`，同步 IMU 周期为 `N * t`
 3. 根据 IMU 周期和 `target_trigger_hz` 计算 `run_trigger_div`
-4. 发送 `CameraSync::SyncCommand{sync_probe_div, run_trigger_div, active_level, seq}`
+4. 发送 `CameraSync::SyncCommand{flags, active_level, seq, sync_probe_div, run_trigger_div}`
 5. MCU 制造一次可预测的 probe 图像 gap，并在同步点发布 `CameraSync::SyncEvent{seq, run_trigger_div}`
 6. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
 7. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
 8. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
 
-如果首个 `SyncCommand` 在启动阶段被串口转发层丢掉，或 MCU 未返回匹配
+构造时会先发送 `RESET_TO_DEFAULT` 命令，让 MCU 恢复默认触发分频；该命令不产生
+`SyncEvent`。
+
+如果首个普通 `SyncCommand` 在启动阶段被串口转发层丢掉，或 MCU 未返回匹配
 `SyncEvent`，状态机不会永久停在 `PROBE_SENT`。模块按 IMU 时间轴等待
 `max(100ms, probe_gap + 4 * image_period)`，超时后清掉当前 probe 并重新观察、
 重新发送下一次 probe。
+
+如果 `PROBE_SENT` 或 `SYNCED` 退回 `OBSERVING`，Host 会先发送一次
+`RESET_TO_DEFAULT`，让 MCU 恢复默认触发分频，然后再重新观察周期并发送新的普通
+`SyncCommand`。`LATEST_IMU` 模式不会发送 CameraSync reset。
+
+入口队列溢出、raw IMU 时间轴重启等需要清空运行状态的情况，也会在 `RAW_PROBE`
+模式下发送 `RESET_TO_DEFAULT`。
 
 `sync_probe_div = 3` 时，期望 probe 图像 gap 为 `3T`。通用公式是 `T * sync_probe_div`。
 
