@@ -10,7 +10,7 @@ namespace CameraFrameSyncCore
 {
 
 /**
- * @brief 固定容量短历史，满时丢弃最旧样本。
+ * @brief 固定容量样本缓存，满时丢弃最旧样本。
  */
 template <typename T, size_t Capacity>
 class SampleHistory
@@ -329,7 +329,7 @@ inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us
 }
 
 /**
- * @brief 在 IMU 历史中查找 sensor timestamp 最接近期望值的样本。
+ * @brief 在 IMU 样本缓存中查找 sensor timestamp 最接近期望值的样本。
  *
  * @return 找到且误差不超过 tolerance_us 时返回样本指针，否则返回 nullptr。
  */

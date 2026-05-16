@@ -32,7 +32,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   ASSERT(sync_probe_div_ <= UINT8_MAX);
   ASSERT(target_trigger_hz_ > 0.0F);
 
-  // 共享图像 topic 是后续 Detector/Preview 的图像唯一来源，创建失败直接中止。
+  // 共享图像 topic 是 Detector/Preview 的图像来源，创建失败直接中止。
   if (!topics_.image.Valid())
   {
     XR_LOG_ERROR("CameraFrameSync: image topic creation failed err=%d",
@@ -40,7 +40,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
     ASSERT(false);
     return;
   }
-  // CameraBase 写入的是当前租约；拿不到初始槽位时不能注册 sink。
+  // CameraBase 写入当前共享槽位；拿不到初始槽位时不能注册 sink。
   if (!AcquireInitialWritableImage())
   {
     XR_LOG_ERROR("CameraFrameSync: initial image slot acquisition failed");
@@ -300,7 +300,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
   if (topics_.image.CreateData(next_image) != LibXR::ErrorCode::OK ||
       next_image.GetData() == nullptr)
   {
-    // 没有新槽位时当前图像无法交给下游，但仍是一次真实相机帧到达。
+    // 没有新槽位时当前图像无法发布，但仍是一次真实相机帧到达。
     monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
     ProcessDroppedImage(image_timestamp_us);
     return committed_image;
@@ -319,7 +319,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
   {
     XR_LOG_WARN("CameraFrameSync: image publish failed err=%d",
                 static_cast<int>(publish_ans));
-    // 发布失败时不能制造不存在的图像事件，但要把该图像计入同步时间基线。
+    // 发布失败时不能制造不存在的图像事件，但要把该图像计入同步时间点。
     monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
     ProcessDroppedImage(image_timestamp_us);
   }
@@ -327,7 +327,7 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
 }
 
 /**
- * @brief gyro topic 回调：规整 payload 后写入无锁入口队列。
+ * @brief gyro topic 回调：转换数据后写入无锁入口队列。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::OnGyroStatic(
@@ -346,7 +346,7 @@ void CameraFrameSync<CameraInfoV>::OnGyroStatic(
 }
 
 /**
- * @brief accl topic 回调：规整 payload 后写入无锁入口队列。
+ * @brief accl topic 回调：转换数据后写入无锁入口队列。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::OnAcclStatic(
@@ -365,7 +365,7 @@ void CameraFrameSync<CameraInfoV>::OnAcclStatic(
 }
 
 /**
- * @brief quat topic 回调：规整 payload 后写入无锁入口队列。
+ * @brief quat topic 回调：转换数据后写入无锁入口队列。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::OnQuatStatic(
@@ -443,7 +443,7 @@ void CameraFrameSync<CameraInfoV>::ProcessSyncWorkWithoutImage()
 }
 
 /**
- * @brief 图像未发布给下游时，维护内部时间基线但不发布同步 IMU。
+ * @brief 图像未发布时，维护内部时间点但不发布同步 IMU。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ProcessDroppedImage(uint64_t image_timestamp_us)
@@ -466,7 +466,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
   {
     if (pending_gyros_.PushBackDropOldest(gyro))
     {
-      // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      // pending 队列丢旧样本后，同步关系已经不可信，交给统一恢复处理。
       monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -477,7 +477,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
   {
     if (pending_accls_.PushBackDropOldest(accl))
     {
-      // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      // pending 队列丢旧样本后，同步关系已经不可信，交给统一恢复处理。
       monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -488,7 +488,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
   {
     if (pending_quats_.PushBackDropOldest(quat))
     {
-      // pending 队列丢旧样本后，同步关系不再可信，交给统一恢复处理。
+      // pending 队列丢旧样本后，同步关系已经不可信，交给统一恢复处理。
       monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
       overflowed_.store(true, std::memory_order_relaxed);
     }
@@ -498,7 +498,7 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
 }
 
 /**
- * @brief 连续组装所有当前可闭合的 IMU 三路样本。
+ * @brief 连续组装所有当前可闭合的 IMU 样本。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
@@ -554,7 +554,7 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
   {
     // 当前 gyro 对应的辅通道样本已经错过或尚未出现在相同 timestamp；
     // 丢这一个 raw 点即可。
-    // 是否影响相机同步由后续所需同步时间戳是否仍能在历史中找到决定。
+    // 是否影响相机同步由后续所需同步时间戳是否仍能在样本缓存中找到决定。
     pending_gyros_.PopFront();
     return true;
   }

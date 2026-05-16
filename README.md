@@ -1,32 +1,33 @@
 # CameraFrameSync
 
-`CameraFrameSync` 是相机帧和 IMU 的同步桥：
+`CameraFrameSync` 负责把相机图像和原始 IMU 对齐：
 
 - 从 `CameraBase<Info>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
 - 按相机名订阅原始 `gyro / accl / quat`
 - 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
 
-模块不创建线程。原始 IMU 只在 Topic 回调里入队；`CameraSync` 回执只记录当前 probe 的命中结果。状态机只在图像提交时推进。
+模块不创建线程。原始 IMU 只在 Topic 回调里入队；`CameraSync` 回执只记录当前 probe
+的命中结果。状态机只在图像提交时推进。
 
 ## Topic
 
 输入：
 
 - 图像：`CameraBase<Info>::RegisterImageSink(...)`
-- 原始陀螺：`<camera_name>_gyro`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
-- 原始加速度：`<camera_name>_accl`，payload 为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
-- 原始姿态：`<camera_name>_quat`，payload 为 `LibXR::Quaternion<float>`
-- 同步回执：`camera_sync_result`，payload 为 `CameraSync::SyncEvent`
+- 原始陀螺：`<camera_name>_gyro`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
+- 原始加速度：`<camera_name>_accl`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
+- 原始姿态：`<camera_name>_quat`，消息类型为 `LibXR::Quaternion<float>`
+- 同步回执：`camera_sync_result`，消息类型为 `CameraSync::SyncEvent`
 
 输出：
 
 - 图像共享 topic：`camera.ImageTopicName()`
 - 同步 IMU topic：`camera.ImuTopicName()`
-- 同步命令：`camera_sync_command`，payload 为 `CameraSync::SyncCommand`
+- 同步命令：`camera_sync_command`，消息类型为 `CameraSync::SyncCommand`
 
 ## 数据采集
 
-完整同步图像/IMU 采集由 `CameraFrameSync` 后级的 `VisionCapture` 负责。
+完整同步图像/IMU 采集由 `VisionCapture` 负责。
 `CameraFrameSync` 只维护同步状态并发布同步后的图像/IMU topic，不写离线记录文件。
 
 实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。原始 IMU topic 由 `camera.Name()` 派生；实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，相机运行配置里的 `camera_name` 应设为 `gimbal`，图像 topic 和同步后 IMU topic 仍可单独配置。
@@ -45,15 +46,15 @@
 
 IMU 组装以 gyro 为主轴：
 
-1. gyro/accl/quat 三路回调分别把样本放进固定长度队列
+1. gyro/accl/quat 回调分别把样本放进固定长度队列
 2. 图像提交时，把队列推进到能确定为止
 3. 取 gyro 队首时间戳
 4. 丢掉所有早于该 gyro 的 accl / quat
 5. 如果 accl / quat 缺失，先停住，不丢 gyro
 6. 如果 accl / quat 已经晚于该 gyro，说明这条 gyro 缺帧，丢 gyro 并回到观察态
-7. 三路 timestamp 完全一致时，组装一条完整 IMU 历史
+7. 三个 timestamp 完全一致时，组装一条完整 IMU 样本
 
-这里不再做半周期近邻匹配。当前协议要求同一帧 IMU 的 `gyro / accl / quat` envelope timestamp 完全一致。
+当前协议要求同一帧 IMU 的 `gyro / accl / quat` envelope timestamp 完全一致。
 
 ## 同步模式
 
@@ -126,7 +127,7 @@ constructor_args:
   camera: '@camera'
 ```
 
-内录或已经同步的数据源使用 `LATEST_IMU`：
+已经同步的数据源使用 `LATEST_IMU`：
 
 ```yaml
 constructor_args:
@@ -160,7 +161,7 @@ constructor_args:
 
 ## 日志
 
-模块只在状态边界打日志：
+模块只在状态变化和异常恢复时打日志：
 
 - 启动时打印图像、IMU、原始 topic 和模式
 - 发送 `CameraSync::SyncCommand`

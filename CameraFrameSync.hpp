@@ -62,16 +62,16 @@ class CameraFrameSync : public LibXR::Application
 {
  public:
   using Self = CameraFrameSync<CameraInfoV>;        ///< 当前模板实例类型。
-  using Base = CameraBase<CameraInfoV>;             ///< 上游相机基类类型。
+  using Base = CameraBase<CameraInfoV>;             ///< 相机基类类型。
   using CameraInfo = typename Base::CameraInfo;     ///< 相机静态标定信息类型。
   using ImageFrame = typename Base::ImageFrame;     ///< 共享图像帧类型。
   using ImuStamped = typename Base::ImuStamped;     ///< 同步后 IMU 输出类型。
-  using ImuVector = std::array<float, 3>;           ///< Host 侧三轴平铺 ABI。
-  using QuatSample = std::array<float, 4>;          ///< Host 侧 wxyz 四元数 ABI。
-  using RawImuVector = Eigen::Matrix<float, 3, 1>;  ///< MCU 侧三轴 topic ABI。
-  using RawQuatSample = LibXR::Quaternion<float>;   ///< MCU 侧四元数 topic ABI。
+  using ImuVector = std::array<float, 3>;           ///< Host 侧三轴数组。
+  using QuatSample = std::array<float, 4>;          ///< Host 侧 wxyz 四元数。
+  using RawImuVector = Eigen::Matrix<float, 3, 1>;  ///< MCU 侧三轴 topic 数据。
+  using RawQuatSample = LibXR::Quaternion<float>;   ///< MCU 侧四元数 topic 数据。
   using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;  ///< 图像共享 topic 类型。
-  using ImageData = typename ImageTopic::Data;             ///< 图像槽位租约类型。
+  using ImageData = typename ImageTopic::Data;             ///< 共享图像槽位句柄。
   using ImageCommitCallback =
       typename Base::ImageCommitCallback;  ///< CameraBase 图像提交回调类型。
   using SyncedFrame = CameraFrameSyncSyncedFrame<ImageTopic, ImuStamped>;
@@ -96,7 +96,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 运行时配置。
    *
-   * Topic 名称只决定 Host 侧订阅/发布边界；图像和 IMU 的同步关系只由各自
+   * Topic 名称只决定 Host 侧订阅/发布位置；图像和 IMU 的同步关系只由各自
    * sensor timestamp、CameraSync 回执和 offset_us 决定。
    */
   struct RuntimeParam
@@ -333,7 +333,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 已提交图像的传感器时间戳。
    *
-   * 大图像数据本身已经交给 LinuxSharedTopic，这里只保留同步需要的时间基线。
+   * 大图像数据本身已经交给 LinuxSharedTopic，这里只保留同步需要的时间点。
    */
   struct ImageSample
   {
@@ -418,7 +418,7 @@ class CameraFrameSync : public LibXR::Application
   static constexpr size_t imu_ingress_length = 1024;   ///< topic 回调入口队列长度。
   static constexpr size_t pending_limit = 1024;        ///< 状态机待处理队列长度。
   static constexpr size_t image_event_limit = 64;      ///< 图像时间戳待处理队列长度。
-  static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 历史长度。
+  static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 样本数。
   static constexpr uint32_t cadence_stable_gaps = 2;   ///< 判定周期稳定所需连续 gap 数。
   static constexpr uint32_t max_synced_image_gap_stride = 8;  ///< 同步态可接受的连续丢图数量。
   static constexpr uint32_t max_raw_imu_gap_stride = 8;  ///< 稳定后可接受的连续 raw IMU 缺样数量。
@@ -440,12 +440,12 @@ class CameraFrameSync : public LibXR::Application
   static const char* StateName(SyncState state);
 
   /**
-   * @brief 将 MCU 侧 IMU 向量 payload 规整为 Host 侧平铺数组。
+   * @brief 将 MCU 侧 IMU 向量转换为 Host 侧数组。
    */
   static ImuVector ToImuVector(const RawImuVector& data);
 
   /**
-   * @brief 将 MCU 侧四元数 payload 规整为 Host 侧 wxyz 顺序。
+   * @brief 将 MCU 侧四元数转换为 Host 侧 wxyz 顺序。
    */
   static QuatSample ToQuatSample(const RawQuatSample& data);
 
@@ -505,7 +505,7 @@ class CameraFrameSync : public LibXR::Application
   void ProcessSyncWorkWithoutImage();
 
   /**
-   * @brief 图像共享 topic 发布失败后，只推进同步时间基线。
+   * @brief 图像共享 topic 发布失败后，只推进同步时间点。
    */
   void ProcessDroppedImage(uint64_t image_timestamp_us);
 
@@ -515,7 +515,7 @@ class CameraFrameSync : public LibXR::Application
   void CollectIncomingTopics();
 
   /**
-   * @brief 尽可能把 pending gyro/accl/quat 组装为完整 IMU 历史。
+   * @brief 尽可能把 pending gyro/accl/quat 组装为完整 IMU 样本。
    */
   void AssembleImuHistory();
 
@@ -525,12 +525,12 @@ class CameraFrameSync : public LibXR::Application
   bool TryAssembleOneImu();
 
   /**
-   * @brief 将一帧完整 IMU 写入历史并更新周期观察。
+   * @brief 将一帧完整 IMU 写入样本缓存并更新周期观察。
    */
   void AcceptAssembledImu(const AssembledImu& imu);
 
   /**
-   * @brief raw IMU 时间轴重启后清空旧历史，并接受新 epoch 第一帧。
+   * @brief raw IMU 时间轴重启后清空旧样本，并接受新 epoch 第一帧。
    */
   void ResetRawImuEpoch(uint64_t previous_timestamp_us,
                         const AssembledImu& first_imu);
@@ -561,7 +561,7 @@ class CameraFrameSync : public LibXR::Application
   CameraFrameSyncCore::CadenceUpdate ObserveNormalImageCadence(uint64_t image_ts);
 
   /**
-   * @brief 图像未发布给下游时，按丢帧维护 RAW_PROBE 时间基线。
+   * @brief 图像未发布时，按丢帧维护 RAW_PROBE 时间点。
    */
   void ObserveDroppedImage(uint64_t image_ts);
 
@@ -571,7 +571,7 @@ class CameraFrameSync : public LibXR::Application
   void MaybeStartProbe();
 
   /**
-   * @brief 处理探针图像，等待对应 CameraSync 回执和 IMU 历史到达。
+   * @brief 处理探针图像，等待对应 CameraSync 回执和 IMU 样本到达。
    */
   ImageDecision TryProbeImage(PendingFrame& frame);
 
@@ -642,7 +642,7 @@ class CameraFrameSync : public LibXR::Application
   bool IsProbeImageGap(uint64_t image_gap_us) const;
 
   /**
-   * @brief 判断 IMU 历史是否已经覆盖到目标时间戳。
+   * @brief 判断 IMU 样本是否已经覆盖到目标时间戳。
    */
   bool ImuHistoryReached(uint64_t target_timestamp_us) const;
 
@@ -652,7 +652,7 @@ class CameraFrameSync : public LibXR::Application
   void RememberImage(uint64_t image_timestamp_us);
 
   /**
-   * @brief 清空图像周期观察，不清空 IMU 历史。
+   * @brief 清空图像周期观察，不清空 IMU 样本缓存。
    */
   void ResetImageObservation();
 
@@ -672,7 +672,7 @@ class CameraFrameSync : public LibXR::Application
   void ResetLock(const char* reason, const char* detail);
 
   /**
-   * @brief 清空全部运行时队列、历史和状态。
+   * @brief 清空全部运行时队列、样本和状态。
    */
   void ResetRuntimeState();
 
@@ -720,7 +720,7 @@ class CameraFrameSync : public LibXR::Application
   std::atomic<uint64_t> monitor_overflow_count_{0};
 
   /**
-   * @brief 状态机私有 pending 队列和短 IMU 历史。
+   * @brief 状态机私有 pending 队列和短 IMU 样本缓存。
    */
   DropOldestQueue<GyroSample> pending_gyros_{pending_limit};
   DropOldestQueue<AcclSample> pending_accls_{pending_limit};

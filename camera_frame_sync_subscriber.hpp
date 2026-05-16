@@ -12,15 +12,15 @@
 /**
  * @brief 一组已同步的图像共享槽位和 IMU 数据。
  *
- * image 持有 LinuxSharedTopic 的共享槽位租约；使用方处理完 out 后释放或覆盖
- * SyncedFrame，槽位才会回到共享图像池。
+ * image 持有 LinuxSharedTopic 的共享槽位；使用方处理完 out 后释放或覆盖 SyncedFrame，
+ * 槽位才会回到共享图像池。
  */
 template <typename ImageTopicT, typename ImuStampedT>
 struct CameraFrameSyncSyncedFrame
 {
   using ImageData = typename ImageTopicT::Data;
 
-  ImageData image{};  ///< 共享图像槽位租约。
+  ImageData image{};  ///< 共享图像槽位。
   ImuStampedT imu{};  ///< 与图像 timestamp_us 相同的同步 IMU。
 
   /**
@@ -45,7 +45,7 @@ class CameraFrameSyncSubscriber
   /**
    * @brief 图像订阅使用丢旧语义，避免启动同步或消费滞后时反压相机。
    *
-   * 图像是同步基线但不是积压队列；如果当前图像等不到同 timestamp 的 IMU，
+   * 图像是同步参考但不是积压队列；如果当前图像等不到同 timestamp 的 IMU，
    * 后续更近的图像应覆盖旧描述符，不能让共享图像 publish 返回 FULL。
    */
   static constexpr LibXR::LinuxSharedSubscriberMode image_subscriber_mode =
@@ -180,7 +180,7 @@ class CameraFrameSyncSubscriber
           static_cast<uint64_t>(latest_imu_.timestamp_us);
       if (last_imu_valid_ && imu_timestamp_us <= last_imu_timestamp_us_)
       {
-        // SyncSubscriber 可能留下旧信号量计数；payload 是最新值，旧计数直接吃掉。
+        // SyncSubscriber 可能留下旧信号量计数；消息内容是最新值，旧计数直接吃掉。
         continue;
       }
 

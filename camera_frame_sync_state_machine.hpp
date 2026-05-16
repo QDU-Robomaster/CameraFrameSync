@@ -23,7 +23,7 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
                                            : ProcessRawProbeImage(pending_frame_);
     if (decision == ImageDecision::WAIT)
     {
-      // 当前图像已经成为同步基线，不能越过它消费下一帧。
+      // 当前图像已经用于同步匹配，不能越过它消费下一帧。
       break;
     }
     if (decision == ImageDecision::RESET)
@@ -74,7 +74,7 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
 
   if (!last_image_valid_)
   {
-    // 第一帧只能建立图像时间基线；是否发 probe 取决于 IMU 周期是否也稳定。
+    // 第一帧只能建立图像时间点；是否发 probe 取决于 IMU 周期是否也稳定。
     if (!frame.cadence_consumed)
     {
       ObserveNormalImageCadence(frame.image.sensor_timestamp_us);
