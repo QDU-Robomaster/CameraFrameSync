@@ -514,10 +514,6 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
     return ImageDecision::RESET;
   }
 
-  recording_.Record(image.sensor_timestamp_us, match.imu->sensor_timestamp_us,
-                    final_imu->sensor_timestamp_us, final_imu->rotation_wxyz,
-                    final_imu->angular_velocity_xyz,
-                    final_imu->linear_acceleration_xyz, SyncModeName(sync_mode_));
   PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
 
   const SyncState old_state = state_;
