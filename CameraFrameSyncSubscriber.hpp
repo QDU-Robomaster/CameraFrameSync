@@ -57,7 +57,8 @@ class CameraFrameSyncSubscriber
   template <typename SyncT>
   explicit CameraFrameSyncSubscriber(const SyncT& sync)
       : CameraFrameSyncSubscriber(sync.ImageTopicName(), sync.ImuTopicName(),
-                                  sync.HostTopicDomainName())
+                                  sync.HostTopicDomainName(),
+                                  sync.GetSyncMode() == SyncT::SyncMode::LATEST_IMU)
   {
   }
 
@@ -66,7 +67,8 @@ class CameraFrameSyncSubscriber
    */
   CameraFrameSyncSubscriber(std::string_view image_topic_name,
                             std::string_view imu_topic_name)
-      : CameraFrameSyncSubscriber(image_topic_name, imu_topic_name, "host")
+      : CameraFrameSyncSubscriber(image_topic_name, imu_topic_name, "host",
+                                  false)
   {
   }
 
@@ -75,10 +77,12 @@ class CameraFrameSyncSubscriber
    */
   CameraFrameSyncSubscriber(std::string_view image_topic_name,
                             std::string_view imu_topic_name,
-                            std::string_view host_topic_domain_name)
+                            std::string_view host_topic_domain_name,
+                            bool latest_image_mode)
       : image_topic_name_(image_topic_name),
         imu_topic_name_(imu_topic_name),
         host_topic_domain_name_(host_topic_domain_name),
+        latest_image_mode_(latest_image_mode),
         host_topic_domain_(host_topic_domain_name_.c_str()),
         image_sub_(image_topic_name_.c_str(), image_subscriber_mode),
         imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(
@@ -116,9 +120,11 @@ class CameraFrameSyncSubscriber
       }
 
       ImageData image;
-      const auto image_ans =
-          WaitForMatchingImage(static_cast<uint64_t>(imu.timestamp_us),
-                               deadline_ms, timeout_ms, image);
+      const auto image_ans = latest_image_mode_
+                                 ? WaitForLatestImage(deadline_ms, timeout_ms, image)
+                                 : WaitForMatchingImage(
+                                       static_cast<uint64_t>(imu.timestamp_us),
+                                       deadline_ms, timeout_ms, image);
       if (image_ans == LibXR::ErrorCode::OK)
       {
         out.imu = imu;
@@ -238,10 +244,39 @@ class CameraFrameSyncSubscriber
     }
   }
 
+  LibXR::ErrorCode WaitForLatestImage(uint64_t deadline_ms,
+                                      uint32_t timeout_ms,
+                                      ImageData& image)
+  {
+    while (true)
+    {
+      if (pending_image_.Empty())
+      {
+        const auto wait_ans = image_sub_.Wait(
+            pending_image_, RemainingMs(deadline_ms, timeout_ms));
+        if (wait_ans != LibXR::ErrorCode::OK)
+        {
+          return wait_ans;
+        }
+      }
+
+      const auto* frame = pending_image_.GetData();
+      if (frame == nullptr)
+      {
+        pending_image_.Reset();
+        continue;
+      }
+
+      image = std::move(pending_image_);
+      return LibXR::ErrorCode::OK;
+    }
+  }
+
  private:
   std::string image_topic_name_{};
   std::string imu_topic_name_{};
   std::string host_topic_domain_name_{};
+  bool latest_image_mode_{false};
   LibXR::Topic::Domain host_topic_domain_;
   typename ImageTopicT::Subscriber image_sub_;
   ImuStampedT latest_imu_{};

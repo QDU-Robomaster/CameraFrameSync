@@ -27,6 +27,7 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   sync_probe_div_ = runtime.sync_probe_div;
   sync_active_level_ = runtime.sync_active_level == 0 ? 0U : 1U;
   target_trigger_hz_ = runtime.target_trigger_hz;
+  raw_imu_frame_ = runtime.raw_imu_frame;
 
   ASSERT(sync_probe_div_ != 0);
   ASSERT(sync_probe_div_ <= UINT8_MAX);
@@ -64,11 +65,12 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   SendResetToDefaultCommand();
 
   XR_LOG_INFO(
-      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s target_trigger_hz=%.3f",
+      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s raw_imu_frame=%s target_trigger_hz=%.3f",
       topics_.raw_imu_prefix.c_str(), topics_.host_domain_name.c_str(),
       topics_.image_name.c_str(), topics_.imu_name.c_str(),
       topics_.gyro_name.c_str(), topics_.accl_name.c_str(),
       topics_.quat_name.c_str(), SyncModeName(sync_mode_),
+      RawImuFrameName(raw_imu_frame_),
       static_cast<double>(target_trigger_hz_));
   app.Register(*this);
 }
@@ -235,13 +237,38 @@ const char* CameraFrameSync<CameraInfoV>::StateName(
 }
 
 /**
+ * @brief 将原始 IMU 坐标系转成日志字符串。
+ */
+template <CameraTypes::CameraInfo CameraInfoV>
+const char* CameraFrameSync<CameraInfoV>::RawImuFrameName(
+    typename CameraFrameSync<CameraInfoV>::RawImuFrame frame)
+{
+  switch (frame)
+  {
+    case RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP:
+      return "BODY_X_RIGHT_Y_FORWARD_Z_UP";
+    case RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY:
+      return "X_FORWARD_Y_LEFT_Z_UP_TO_BODY";
+  }
+  return "UNKNOWN";
+}
+
+/**
  * @brief 把 MCU 侧三轴向量规整成 Host 侧平铺数组。
  */
 template <CameraTypes::CameraInfo CameraInfoV>
 typename CameraFrameSync<CameraInfoV>::ImuVector
 CameraFrameSync<CameraInfoV>::ToImuVector(
-    const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
+    const typename CameraFrameSync<CameraInfoV>::RawImuVector& data,
+    typename CameraFrameSync<CameraInfoV>::RawImuFrame raw_imu_frame)
 {
+  switch (raw_imu_frame)
+  {
+    case RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP:
+      return {data.x(), data.y(), data.z()};
+    case RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY:
+      return {-data.y(), data.x(), data.z()};
+  }
   return {data.x(), data.y(), data.z()};
 }
 
@@ -251,8 +278,16 @@ CameraFrameSync<CameraInfoV>::ToImuVector(
 template <CameraTypes::CameraInfo CameraInfoV>
 typename CameraFrameSync<CameraInfoV>::QuatSample
 CameraFrameSync<CameraInfoV>::ToQuatSample(
-    const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data)
+    const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data,
+    typename CameraFrameSync<CameraInfoV>::RawImuFrame raw_imu_frame)
 {
+  switch (raw_imu_frame)
+  {
+    case RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP:
+      return {data.w(), data.x(), data.y(), data.z()};
+    case RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY:
+      return {data.w(), -data.y(), data.x(), data.z()};
+  }
   return {data.w(), data.x(), data.y(), data.z()};
 }
 
@@ -336,7 +371,8 @@ void CameraFrameSync<CameraInfoV>::OnGyroStatic(
     const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
 {
   const GyroSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                          .angular_velocity_xyz = ToImuVector(data)};
+                          .angular_velocity_xyz =
+                              ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_gyro_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->gyro_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -355,7 +391,8 @@ void CameraFrameSync<CameraInfoV>::OnAcclStatic(
     const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
 {
   const AcclSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                          .linear_acceleration_xyz = ToImuVector(data)};
+                          .linear_acceleration_xyz =
+                              ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_accl_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->accl_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -374,7 +411,8 @@ void CameraFrameSync<CameraInfoV>::OnQuatStatic(
     const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data)
 {
   const QuatReading sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                           .rotation_wxyz = ToQuatSample(data)};
+                           .rotation_wxyz =
+                               ToQuatSample(data, self->raw_imu_frame_)};
   self->monitor_raw_quat_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->quat_ingress_.Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -515,6 +553,43 @@ void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
 template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 {
+  if (sync_mode_ == SyncMode::LATEST_IMU)
+  {
+    QuatReading queued_quat{};
+    if (!pending_quats_.Front(queued_quat))
+    {
+      return false;
+    }
+
+    const AssembledImu imu{
+        .sensor_timestamp_us = queued_quat.sensor_timestamp_us,
+        .rotation_wxyz = queued_quat.rotation_wxyz,
+        .angular_velocity_xyz = {0.0F, 0.0F, 0.0F},
+        .linear_acceleration_xyz = {0.0F, 0.0F, 0.0F},
+    };
+
+    pending_quats_.PopFront();
+
+    if (!imu_history_.Empty() &&
+        imu.sensor_timestamp_us <= imu_history_.Back().sensor_timestamp_us)
+    {
+      const uint64_t previous_timestamp_us = imu_history_.Back().sensor_timestamp_us;
+      if (imu.sensor_timestamp_us < previous_timestamp_us &&
+          previous_timestamp_us - imu.sensor_timestamp_us >=
+              raw_imu_epoch_reset_backward_us)
+      {
+        ResetRawImuEpoch(previous_timestamp_us, imu);
+        return true;
+      }
+
+      ResetLock("raw-imu-out-of-order", "quat-only assembled imu timestamp");
+      return true;
+    }
+
+    AcceptAssembledImu(imu);
+    return true;
+  }
+
   GyroSample queued_gyro{};
   if (!pending_gyros_.Front(queued_gyro))
   {
@@ -624,6 +699,25 @@ void CameraFrameSync<CameraInfoV>::ResetRawImuEpoch(
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_us)
 {
+  if (sync_mode_ == SyncMode::LATEST_IMU)
+  {
+    if (!imu_cadence_.has_last_timestamp)
+    {
+      imu_cadence_.has_last_timestamp = true;
+      imu_cadence_.last_timestamp_us = sensor_timestamp_us;
+      return;
+    }
+
+    if (sensor_timestamp_us > imu_cadence_.last_timestamp_us)
+    {
+      periods_.imu_us = sensor_timestamp_us - imu_cadence_.last_timestamp_us;
+      imu_cadence_.last_timestamp_us = sensor_timestamp_us;
+      imu_cadence_.period_us = periods_.imu_us;
+      imu_cadence_.stable = true;
+    }
+    return;
+  }
+
   if (imu_cadence_.stable && imu_cadence_.has_last_timestamp &&
       imu_cadence_.period_us != 0 &&
       sensor_timestamp_us > imu_cadence_.last_timestamp_us)

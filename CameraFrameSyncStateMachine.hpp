@@ -8,6 +8,14 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
 {
   while (pending_frame_.valid || !image_events_.Empty())
   {
+    if (sync_mode_ == SyncMode::LATEST_IMU && pending_frame_.valid &&
+        !image_events_.Empty())
+    {
+      // LATEST_IMU prioritizes getting the newest image downstream; stale
+      // pending images are dropped instead of blocking newer frames.
+      ClearPendingFrame();
+    }
+
     if (!pending_frame_.valid)
     {
       if (!image_events_.Front(pending_frame_.image))
@@ -512,7 +520,8 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
     return ImageDecision::RESET;
   }
 
-  const int32_t offset_us = offset_us_;
+  const int32_t offset_us =
+      sync_mode_ == SyncMode::LATEST_IMU ? 0 : offset_us_;
   const uint64_t final_ts =
       CameraFrameSyncCore::ApplyOffsetUs(match.imu->sensor_timestamp_us, offset_us);
   if (!ImuHistoryReached(final_ts))

@@ -51,6 +51,15 @@ enum class CameraFrameSyncMode : uint8_t
 };
 
 /**
+ * @brief 原始 IMU topic 的坐标系约定。
+ */
+enum class CameraFrameSyncRawImuFrame : uint8_t
+{
+  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,  ///< 已经是公开本体系 B：x 右、y 前、z 上。
+  X_FORWARD_Y_LEFT_Z_UP_TO_BODY = 1,  ///< 原始 x 前、y 左、z 上，转换到公开本体系 B。
+};
+
+/**
  * @brief 图像共享发布与 IMU 同步模块。
  *
  * 原始 gyro/accl/quat 回调只入队；同步回执只记录当前 probe 的命中结果。
@@ -76,6 +85,7 @@ class CameraFrameSync : public LibXR::Application
       typename Base::ImageCommitCallback;  ///< CameraBase 图像提交回调类型。
   using SyncedFrame = CameraFrameSyncSyncedFrame<ImageTopic, ImuStamped>;
   using Subscriber = CameraFrameSyncSubscriber<ImageTopic, ImuStamped>;
+  using RawImuFrame = CameraFrameSyncRawImuFrame;  ///< 原始 IMU 坐标系选择。
 
   /**
    * @brief 当前模块实例使用的相机静态信息。
@@ -111,6 +121,9 @@ class CameraFrameSync : public LibXR::Application
     uint32_t sync_probe_div = 3;         ///< CameraSync 探针分频倍率。
     uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
     float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
+    RawImuFrame raw_imu_frame =
+        RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP;  ///< 原始 IMU 坐标系。
+    std::string_view raw_quat_topic_name = {};  ///< 显式四元数 topic 名；空则沿用 `<camera>_quat`。
   };
 
   /**
@@ -246,7 +259,9 @@ class CameraFrameSync : public LibXR::Application
           raw_imu_prefix(camera.NameView()),
           gyro_name(raw_imu_prefix + "_gyro"),
           accl_name(raw_imu_prefix + "_accl"),
-          quat_name(raw_imu_prefix + "_quat"),
+          quat_name(runtime.raw_quat_topic_name.empty()
+                        ? (raw_imu_prefix + "_quat")
+                        : std::string(runtime.raw_quat_topic_name)),
           host_domain(host_domain_name.c_str()),
           image(image_name.c_str(), image_topic_config),
           synced_imu(LibXR::Topic::FindOrCreate<ImuStamped>(
@@ -440,14 +455,21 @@ class CameraFrameSync : public LibXR::Application
   static const char* StateName(SyncState state);
 
   /**
+   * @brief 返回原始 IMU 坐标系的日志名称。
+   */
+  static const char* RawImuFrameName(RawImuFrame frame);
+
+  /**
    * @brief 将 MCU 侧 IMU 向量转换为 Host 侧数组。
    */
-  static ImuVector ToImuVector(const RawImuVector& data);
+  static ImuVector ToImuVector(const RawImuVector& data,
+                               RawImuFrame raw_imu_frame);
 
   /**
    * @brief 将 MCU 侧四元数转换为 Host 侧 wxyz 顺序。
    */
-  static QuatSample ToQuatSample(const RawQuatSample& data);
+  static QuatSample ToQuatSample(const RawQuatSample& data,
+                                 RawImuFrame raw_imu_frame);
 
   /**
    * @brief 启动时从共享图像 topic 租用第一块可写图像槽位。
@@ -749,6 +771,7 @@ class CameraFrameSync : public LibXR::Application
   uint32_t sync_probe_div_{3};
   uint32_t sync_active_level_{1};
   float target_trigger_hz_{50.0F};
+  RawImuFrame raw_imu_frame_{RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP};
   uint8_t next_sync_seq_{1};
 
   /**
