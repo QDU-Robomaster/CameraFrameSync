@@ -41,6 +41,9 @@ class CameraFrameSyncSubscriber
  public:
   using SyncedFrame = CameraFrameSyncSyncedFrame<ImageTopicT, ImuStampedT>;
   using ImageData = typename ImageTopicT::Data;
+  using ImuMessage = typename LibXR::Topic::template Message<ImuStampedT>;
+
+  static constexpr std::size_t imu_queue_capacity = 256;
 
   /**
    * @brief 图像订阅使用丢旧语义，避免启动同步或消费滞后时反压相机。
@@ -87,7 +90,11 @@ class CameraFrameSyncSubscriber
         image_sub_(image_topic_name_.c_str(), image_subscriber_mode),
         imu_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(
                      imu_topic_name_.c_str(), UINT32_MAX, &host_topic_domain_)),
-                 latest_imu_)
+                 latest_imu_),
+        imu_queue_sub_(LibXR::Topic(LibXR::Topic::WaitTopic(
+                           imu_topic_name_.c_str(), UINT32_MAX,
+                           &host_topic_domain_)),
+                       imu_queue_)
   {
   }
 
@@ -109,6 +116,35 @@ class CameraFrameSyncSubscriber
   LibXR::ErrorCode Wait(SyncedFrame& out, uint32_t timeout_ms)
   {
     const uint64_t deadline_ms = MakeDeadline(timeout_ms);
+
+    if (latest_image_mode_)
+    {
+      while (true)
+      {
+        ImuStampedT imu{};
+        const auto imu_ans =
+            WaitForLatestQueuedImu(deadline_ms, timeout_ms, imu);
+        if (imu_ans == LibXR::ErrorCode::OK)
+        {
+          ImageData image;
+          const auto image_ans = WaitForMatchingImage(
+              static_cast<uint64_t>(imu.timestamp_us), deadline_ms, timeout_ms,
+              image);
+          if (image_ans == LibXR::ErrorCode::OK)
+          {
+            out.imu = imu;
+            out.image = std::move(image);
+            return LibXR::ErrorCode::OK;
+          }
+          if (image_ans == LibXR::ErrorCode::EMPTY)
+          {
+            continue;
+          }
+          return image_ans;
+        }
+        return imu_ans;
+      }
+    }
 
     while (true)
     {
@@ -272,6 +308,54 @@ class CameraFrameSyncSubscriber
     }
   }
 
+  LibXR::ErrorCode WaitForLatestQueuedImu(uint64_t deadline_ms,
+                                          uint32_t timeout_ms,
+                                          ImuStampedT& imu)
+  {
+    while (true)
+    {
+      if (!TryDrainLatestQueuedImu(imu))
+      {
+        const auto wait_ans =
+            imu_sub_.Wait(RemainingMs(deadline_ms, timeout_ms));
+        if (wait_ans != LibXR::ErrorCode::OK)
+        {
+          return wait_ans;
+        }
+        continue;
+      }
+      return LibXR::ErrorCode::OK;
+    }
+  }
+
+  bool TryDrainLatestQueuedImu(ImuStampedT& imu)
+  {
+    bool updated = false;
+    ImuMessage msg{};
+    while (imu_queue_.Pop(msg) == LibXR::ErrorCode::OK)
+    {
+      const uint64_t timestamp_us =
+          static_cast<uint64_t>(msg.data.timestamp_us);
+      if (last_imu_valid_ && timestamp_us <= last_imu_timestamp_us_)
+      {
+        continue;
+      }
+      latest_queued_imu_ = msg.data;
+      latest_queued_timestamp_us_ = timestamp_us;
+      have_latest_queued_imu_ = true;
+      updated = true;
+    }
+
+    if (updated || have_latest_queued_imu_)
+    {
+      imu = latest_queued_imu_;
+      last_imu_valid_ = true;
+      last_imu_timestamp_us_ = latest_queued_timestamp_us_;
+      return true;
+    }
+    return false;
+  }
+
  private:
   std::string image_topic_name_{};
   std::string imu_topic_name_{};
@@ -281,6 +365,11 @@ class CameraFrameSyncSubscriber
   typename ImageTopicT::Subscriber image_sub_;
   ImuStampedT latest_imu_{};
   LibXR::Topic::SyncSubscriber<ImuStampedT> imu_sub_;
+  LibXR::LockFreeQueue<ImuMessage> imu_queue_{imu_queue_capacity};
+  LibXR::Topic::QueuedSubscriber imu_queue_sub_;
+  ImuStampedT latest_queued_imu_{};
+  uint64_t latest_queued_timestamp_us_{0};
+  bool have_latest_queued_imu_{false};
   bool last_imu_valid_{false};
   uint64_t last_imu_timestamp_us_{0};
   ImageData pending_image_{};
