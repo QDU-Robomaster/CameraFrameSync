@@ -98,7 +98,7 @@ class CameraFrameSync : public LibXR::Application
   static constexpr LibXR::LinuxSharedTopicConfig image_topic_config{
       .slot_num = 8,
       .subscriber_num = 8,
-      .queue_num = 2,
+      .queue_num = 8,
   };
 
   using SyncMode = CameraFrameSyncMode;  ///< 图像与 IMU 的同步模式。
