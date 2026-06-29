@@ -187,7 +187,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 状态机侧使用的定长 FIFO，满时丢弃最旧样本。
    *
-   * 回调入口仍然直接写 LibXR::LockFreeQueue；这个包装只用于图像提交路径内的
+   * 回调入口仍然直接写无锁入口队列；这个包装只用于图像提交路径内的
    * 待处理队列，保证消费不及时不会让后续同步永远卡在旧数据上。
    */
   template <typename T>
@@ -239,7 +239,7 @@ class CameraFrameSync : public LibXR::Application
     }
 
    private:
-    LibXR::LockFreeQueue<T> queue_;
+    LibXR::Queue<T> queue_;
   };
 
   /**
@@ -726,9 +726,9 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief topic 回调写入的无锁入口队列。
    */
-  LibXR::LockFreeQueue<GyroSample> gyro_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<AcclSample> accl_ingress_{imu_ingress_length};
-  LibXR::LockFreeQueue<QuatReading> quat_ingress_{imu_ingress_length};
+  LibXR::SPSCQueue<GyroSample> gyro_ingress_{imu_ingress_length};
+  LibXR::SPSCQueue<AcclSample> accl_ingress_{imu_ingress_length};
+  LibXR::SPSCQueue<QuatReading> quat_ingress_{imu_ingress_length};
 
   /**
    * @brief 任一路队列溢出都会置位，随后在图像提交路径统一重置。

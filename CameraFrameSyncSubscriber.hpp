@@ -365,7 +365,7 @@ class CameraFrameSyncSubscriber
   typename ImageTopicT::Subscriber image_sub_;
   ImuStampedT latest_imu_{};
   LibXR::Topic::SyncSubscriber<ImuStampedT> imu_sub_;
-  LibXR::LockFreeQueue<ImuMessage> imu_queue_{imu_queue_capacity};
+  LibXR::SPSCQueue<ImuMessage> imu_queue_{imu_queue_capacity};
   LibXR::Topic::QueuedSubscriber imu_queue_sub_;
   ImuStampedT latest_queued_imu_{};
   uint64_t latest_queued_timestamp_us_{0};
