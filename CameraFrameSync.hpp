@@ -4,7 +4,7 @@
 /* === MODULE MANIFEST V2 ===
 module_description: 相机共享图像桥与原始 IMU 同步器
 constructor_args:
-  camera: '@camera'
+  camera: '@nullptr'
 template_args:
   - Info:
       width: 1280
@@ -27,6 +27,7 @@ depends:
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -130,6 +131,9 @@ class CameraFrameSync : public LibXR::Application
    * @brief 使用默认 RAW_PROBE 配置创建同步桥。
    */
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+                  Base* camera);
+
+  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera);
 
   /**
@@ -138,6 +142,9 @@ class CameraFrameSync : public LibXR::Application
    * 构造函数会注册 CameraBase 图像 sink、订阅原始 IMU topic，并创建图像共享
    * topic。模块本身不创建线程；图像提交回调是同步状态机的推进点。
    */
+  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
+                  Base* camera, RuntimeParam runtime);
+
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
                   Base& camera, RuntimeParam runtime);
 
@@ -715,8 +722,8 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief topic 句柄与回调对象必须先于运行时状态存在。
    */
-  Topics topics_;
-  TopicCallbacks callbacks_;
+  std::optional<Topics> topics_{};
+  std::optional<TopicCallbacks> callbacks_{};
 
   /**
    * @brief 当前交给 CameraBase 写入的共享图像槽位。
@@ -726,9 +733,9 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief topic 回调写入的无锁入口队列。
    */
-  LibXR::SPSCQueue<GyroSample> gyro_ingress_{imu_ingress_length};
-  LibXR::SPSCQueue<AcclSample> accl_ingress_{imu_ingress_length};
-  LibXR::SPSCQueue<QuatReading> quat_ingress_{imu_ingress_length};
+  std::optional<LibXR::SPSCQueue<GyroSample>> gyro_ingress_{};
+  std::optional<LibXR::SPSCQueue<AcclSample>> accl_ingress_{};
+  std::optional<LibXR::SPSCQueue<QuatReading>> quat_ingress_{};
 
   /**
    * @brief 任一路队列溢出都会置位，随后在图像提交路径统一重置。
@@ -752,11 +759,11 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 状态机私有 pending 队列和短 IMU 样本缓存。
    */
-  DropOldestQueue<GyroSample> pending_gyros_{pending_limit};
-  DropOldestQueue<AcclSample> pending_accls_{pending_limit};
-  DropOldestQueue<QuatReading> pending_quats_{pending_limit};
-  DropOldestQueue<ImageSample> image_events_{image_event_limit};
-  SampleHistory<AssembledImu, history_limit> imu_history_{};
+  std::optional<DropOldestQueue<GyroSample>> pending_gyros_{};
+  std::optional<DropOldestQueue<AcclSample>> pending_accls_{};
+  std::optional<DropOldestQueue<QuatReading>> pending_quats_{};
+  std::optional<DropOldestQueue<ImageSample>> image_events_{};
+  std::optional<SampleHistory<AssembledImu, history_limit>> imu_history_{};
 
   /**
    * @brief 保护图像提交路径、参数切换和 pending 队列消费。

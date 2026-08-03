@@ -6,10 +6,10 @@
 template <CameraTypes::CameraInfo CameraInfoV>
 void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
 {
-  while (pending_frame_.valid || !image_events_.Empty())
+  while (pending_frame_.valid || !image_events_->Empty())
   {
     if (sync_mode_ == SyncMode::LATEST_IMU && pending_frame_.valid &&
-        !image_events_.Empty())
+        !image_events_->Empty())
     {
       // LATEST_IMU prioritizes getting the newest image downstream; stale
       // pending images are dropped instead of blocking newer frames.
@@ -18,12 +18,12 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
 
     if (!pending_frame_.valid)
     {
-      if (!image_events_.Front(pending_frame_.image))
+      if (!image_events_->Front(pending_frame_.image))
       {
         break;
       }
       pending_frame_.valid = true;
-      image_events_.PopFront();
+      image_events_->PopFront();
     }
 
     const ImageDecision decision =
@@ -290,14 +290,14 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   pending_probe_imu_timestamp_us_ = 0;
   pending_run_period_us_ = periods_.imu_us * static_cast<uint64_t>(cmd.run_trigger_div);
   pending_probe_start_imu_timestamp_us_ =
-      imu_history_.Empty() ? 0 : imu_history_.Back().sensor_timestamp_us;
+      imu_history_->Empty() ? 0 : imu_history_->Back().sensor_timestamp_us;
   // 回环很短时回执可能早于 Publish 返回，因此先打开当前 probe 邮箱。
   probe_ack_timestamp_us_.store(0);
   probe_ack_seq_.store(0);
   probe_ack_run_div_.store(0);
   active_probe_seq_.store(cmd.seq);
 
-  topics_.sync_command.Publish(cmd);
+  topics_->sync_command.Publish(cmd);
 
   XR_LOG_INFO(
       "CameraFrameSync: sync command sent seq=%u probe_div=%u run_div=%u active=%u target_hz=%.3f image_period_us=%u imu_period_us=%u sync_period_us=%u",
@@ -319,7 +319,7 @@ void CameraFrameSync<CameraInfoV>::SendResetToDefaultCommand()
   cmd.seq = 0;
   cmd.sync_probe_div = 0;
   cmd.run_trigger_div = 0;
-  topics_.sync_command.Publish(cmd);
+  topics_->sync_command.Publish(cmd);
   XR_LOG_INFO("CameraFrameSync: reset CameraSync to default trigger divider active=%u",
               static_cast<unsigned>(cmd.active_level));
 }
@@ -362,7 +362,7 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
   }
 
   const AssembledImu* sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
-      imu_history_, ack_ts,
+      *imu_history_, ack_ts,
       CameraFrameSyncCore::ImuTimestampToleranceUs(periods_.imu_us));
   if (sync_imu == nullptr)
   {
@@ -403,19 +403,20 @@ template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::ProbeTimedOut() const
 {
   if (state_ != SyncState::PROBE_SENT ||
-      pending_probe_start_imu_timestamp_us_ == 0 || imu_history_.Empty())
+      pending_probe_start_imu_timestamp_us_ == 0 || imu_history_->Empty())
   {
     return false;
   }
 
   const uint64_t timeout_us = ProbeTimeoutUs();
   if (timeout_us == 0 ||
-      imu_history_.Back().sensor_timestamp_us <= pending_probe_start_imu_timestamp_us_)
+      imu_history_->Back().sensor_timestamp_us <=
+          pending_probe_start_imu_timestamp_us_)
   {
     return false;
   }
 
-  return imu_history_.Back().sensor_timestamp_us -
+  return imu_history_->Back().sensor_timestamp_us -
              pending_probe_start_imu_timestamp_us_ >=
          timeout_us;
 }
@@ -425,14 +426,14 @@ typename CameraFrameSync<CameraInfoV>::ImageDecision
 CameraFrameSync<CameraInfoV>::TryLatestImuMatch(
     typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
 {
-  if (imu_history_.Empty())
+  if (imu_history_->Empty())
   {
     return ImageDecision::WAIT;
   }
 
   const uint64_t period = periods_.imu_us != 0 ? periods_.imu_us : 1ULL;
   return PublishOrRememberMatch(
-      frame, SyncMatch{.imu = &imu_history_.Back(), .period_us = period});
+      frame, SyncMatch{.imu = &imu_history_->Back(), .period_us = period});
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -457,7 +458,7 @@ CameraFrameSync<CameraInfoV>::TrySyncedImage(
   }
 
   const AssembledImu* sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
-      imu_history_, expected_sync_ts,
+      *imu_history_, expected_sync_ts,
       CameraFrameSyncCore::ImuTimestampToleranceUs(periods_.imu_us));
   if (sync_imu == nullptr)
   {
@@ -479,7 +480,7 @@ CameraFrameSync<CameraInfoV>::ResumePendingMatch(
   }
 
   const AssembledImu* sync_imu = CameraFrameSyncCore::FindBySensorTimestamp(
-      imu_history_, frame.match.imu_timestamp_us, 0);
+      *imu_history_, frame.match.imu_timestamp_us, 0);
   if (sync_imu == nullptr)
   {
     return ImageDecision::RESET;
@@ -531,7 +532,7 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
   }
 
   const AssembledImu* final_imu = CameraFrameSyncCore::FindBySensorTimestamp(
-      imu_history_, final_ts,
+      *imu_history_, final_ts,
       CameraFrameSyncCore::ImuTimestampToleranceUs(periods_.imu_us));
   if (final_imu == nullptr)
   {
@@ -579,7 +580,7 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
       .angular_velocity_xyz = imu.angular_velocity_xyz,
       .linear_acceleration_xyz = imu.linear_acceleration_xyz,
   };
-  topics_.synced_imu.Publish(synced);
+  topics_->synced_imu.Publish(synced);
   monitor_synced_output_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -659,8 +660,8 @@ template <CameraTypes::CameraInfo CameraInfoV>
 bool CameraFrameSync<CameraInfoV>::ImuHistoryReached(
     uint64_t target_timestamp_us) const
 {
-  return !imu_history_.Empty() &&
-         imu_history_.Back().sensor_timestamp_us >= target_timestamp_us;
+  return !imu_history_->Empty() &&
+         imu_history_->Back().sensor_timestamp_us >= target_timestamp_us;
 }
 
 template <CameraTypes::CameraInfo CameraInfoV>
@@ -732,11 +733,11 @@ void CameraFrameSync<CameraInfoV>::ResetRuntimeState()
   {
     SendResetToDefaultCommand();
   }
-  pending_gyros_.Clear();
-  pending_accls_.Clear();
-  pending_quats_.Clear();
-  image_events_.Clear();
-  imu_history_.Clear();
+  pending_gyros_->Clear();
+  pending_accls_->Clear();
+  pending_quats_->Clear();
+  image_events_->Clear();
+  imu_history_->Clear();
   pending_frame_ = {};
   image_cadence_ = {};
   imu_cadence_ = {};
