@@ -256,7 +256,7 @@ jobs:
           cd build
           cmake .. -DBUILD_TESTING=ON -DXR_LOG_MESSAGE_MAX_LEN=256 -DLIBXR_PRINT_INTEGER_ENABLE_64BIT=1
           make
-          ctest --output-on-failure --no-tests=error
+          ctest --test-dir libxr --output-on-failure --no-tests=error
 
       - name: Create Tag via GitHub API
         if: ${{ success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
