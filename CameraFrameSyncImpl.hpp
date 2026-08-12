@@ -660,7 +660,8 @@ bool CameraFrameSync<FrameLayoutV>::TryAssembleOneImu()
         return true;
       }
 
-      ResetLock("raw-imu-out-of-order", "quat-only assembled imu timestamp");
+      ResetImuTimelineObservation("raw-imu-out-of-order",
+                                  "quat-only assembled imu timestamp");
       return true;
     }
 
@@ -735,7 +736,7 @@ bool CameraFrameSync<FrameLayoutV>::TryAssembleOneImu()
     }
 
     // 小幅乱序或重复仍按坏样本处理；只有大幅回退才视为 USB/设备流重启。
-    ResetLock("raw-imu-out-of-order", "assembled imu timestamp");
+    ResetImuTimelineObservation("raw-imu-out-of-order", "assembled imu timestamp");
     return true;
   }
 
@@ -808,11 +809,12 @@ void CameraFrameSync<FrameLayoutV>::ObserveImuCadence(uint64_t sensor_timestamp_
   }
 
   const auto update = CameraFrameSyncCore::ObserveCadence(
-      imu_cadence_, sensor_timestamp_us, cadence_stable_gaps, imu_cadence_tolerance_us);
+      imu_cadence_, sensor_timestamp_us, imu_cadence_stable_gaps,
+      imu_cadence_tolerance_us, imu_period_window_size);
   if (update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
   {
     // IMU 周期破坏会使 RAW_PROBE 的递推周期失效，必须回到观察状态。
-    ResetLock("imu-cadence-broken", "gyro/accl/quat");
+    ResetImuTimelineObservation("imu-cadence-broken", "gyro/accl/quat");
     return;
   }
   if (imu_cadence_.stable)

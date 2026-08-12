@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -171,11 +172,17 @@ enum class CadenceUpdate : uint8_t
  */
 struct CadenceState
 {
+  static constexpr size_t max_period_window_size = 5;
+
   bool has_last_timestamp{false};  ///< 是否已经收到上一条时间戳。
   bool stable{false};              ///< 当前周期是否稳定。
   uint64_t last_timestamp_us{0};   ///< 最近一次时间戳。
   uint64_t period_us{0};           ///< 当前估计周期。
   uint32_t stable_count{0};        ///< 连续满足容差的 gap 数量。
+  std::array<uint64_t, max_period_window_size> period_gaps_us{};  ///< 周期估计窗口。
+  size_t period_gap_count{0};       ///< 窗口内有效 gap 数量。
+  size_t period_gap_next_index{0};  ///< 下一个 gap 的写入位置。
+  size_t period_window_size{0};     ///< 当前周期估计窗口大小。
 };
 
 /**
@@ -212,6 +219,32 @@ inline uint32_t EstimateStrideSamples(uint64_t image_period_us, uint64_t imu_per
 
   const uint64_t rounded = (image_period_us + imu_period_us / 2ULL) / imu_period_us;
   return static_cast<uint32_t>(std::max<uint64_t>(1ULL, rounded));
+}
+
+/**
+ * @brief 根据 IMU 周期和目标触发频率计算 CameraSync 运行分频。
+ */
+inline uint8_t TargetRunTriggerDiv(uint64_t imu_period_us, float target_trigger_hz)
+{
+  if (imu_period_us == 0 || !std::isfinite(target_trigger_hz) ||
+      target_trigger_hz <= 0.0F)
+  {
+    return 1;
+  }
+
+  const double imu_hz = 1000000.0 / static_cast<double>(imu_period_us);
+  const double rounded_div = imu_hz / static_cast<double>(target_trigger_hz) + 0.5;
+  if (rounded_div <= 1.0)
+  {
+    return 1;
+  }
+
+  constexpr uint8_t maximum_div = std::numeric_limits<uint8_t>::max();
+  if (rounded_div >= static_cast<double>(maximum_div))
+  {
+    return maximum_div;
+  }
+  return static_cast<uint8_t>(rounded_div);
 }
 
 /**
@@ -311,11 +344,128 @@ inline uint64_t ImuTimestampToleranceUs(uint64_t imu_period_us)
 }
 
 /**
+ * @brief 清空周期估计，但保留最近时间戳作为下一条 gap 的起点。
+ */
+inline void ResetCadenceEstimate(CadenceState& cadence)
+{
+  cadence.stable = false;
+  cadence.period_us = 0;
+  cadence.stable_count = 0;
+  cadence.period_gap_count = 0;
+  cadence.period_gap_next_index = 0;
+  cadence.period_window_size = 0;
+}
+
+/**
+ * @brief 将一个 gap 写入固定窗口，并用窗口中位数更新周期估计。
+ */
+inline void AddCadenceGap(CadenceState& cadence, uint64_t gap_us,
+                          size_t period_window_size)
+{
+  period_window_size =
+      std::clamp<size_t>(period_window_size, 1, CadenceState::max_period_window_size);
+  if (cadence.period_window_size != period_window_size)
+  {
+    cadence.stable = false;
+    cadence.stable_count = 0;
+    cadence.period_gap_count = 0;
+    cadence.period_gap_next_index = 0;
+    cadence.period_window_size = period_window_size;
+  }
+
+  cadence.period_gaps_us[cadence.period_gap_next_index] = gap_us;
+  cadence.period_gap_next_index =
+      (cadence.period_gap_next_index + 1) % period_window_size;
+  cadence.period_gap_count = std::min(cadence.period_gap_count + 1, period_window_size);
+
+  auto sorted_gaps = cadence.period_gaps_us;
+  constexpr uint64_t unused_gap = std::numeric_limits<uint64_t>::max();
+  switch (cadence.period_gap_count)
+  {
+    case 1:
+      sorted_gaps[1] = unused_gap;
+      [[fallthrough]];
+    case 2:
+      sorted_gaps[2] = unused_gap;
+      [[fallthrough]];
+    case 3:
+      sorted_gaps[3] = unused_gap;
+      [[fallthrough]];
+    case 4:
+      sorted_gaps[4] = unused_gap;
+      [[fallthrough]];
+    case 5:
+      break;
+    default:
+      cadence.period_us = gap_us;
+      return;
+  }
+
+  const auto sort_pair = [](uint64_t& first, uint64_t& second)
+  {
+    if (first > second)
+    {
+      const uint64_t temporary = first;
+      first = second;
+      second = temporary;
+    }
+  };
+  sort_pair(sorted_gaps[0], sorted_gaps[1]);
+  sort_pair(sorted_gaps[1], sorted_gaps[2]);
+  sort_pair(sorted_gaps[2], sorted_gaps[3]);
+  sort_pair(sorted_gaps[3], sorted_gaps[4]);
+  sort_pair(sorted_gaps[0], sorted_gaps[1]);
+  sort_pair(sorted_gaps[1], sorted_gaps[2]);
+  sort_pair(sorted_gaps[2], sorted_gaps[3]);
+  sort_pair(sorted_gaps[0], sorted_gaps[1]);
+  sort_pair(sorted_gaps[1], sorted_gaps[2]);
+  sort_pair(sorted_gaps[0], sorted_gaps[1]);
+
+  switch (cadence.period_gap_count)
+  {
+    case 1:
+      cadence.period_us = sorted_gaps[0];
+      break;
+    case 2:
+      cadence.period_us = sorted_gaps[0] + (sorted_gaps[1] - sorted_gaps[0]) / 2ULL;
+      break;
+    case 3:
+      cadence.period_us = sorted_gaps[1];
+      break;
+    case 4:
+      cadence.period_us = sorted_gaps[1] + (sorted_gaps[2] - sorted_gaps[1]) / 2ULL;
+      break;
+    case 5:
+      cadence.period_us = sorted_gaps[2];
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * @brief 锁定一个已知的单 gap 周期，并初始化后续滚动估计所需的元数据。
+ */
+inline void LockSingleGapCadence(CadenceState& cadence, uint64_t timestamp_us,
+                                 uint64_t period_us, uint32_t stable_count)
+{
+  cadence.has_last_timestamp = true;
+  cadence.last_timestamp_us = timestamp_us;
+  ResetCadenceEstimate(cadence);
+  AddCadenceGap(cadence, period_us, 1);
+  cadence.stable_count = stable_count;
+  cadence.stable = true;
+}
+
+/**
  * @brief 观察一条新时间戳并更新周期稳定性。
+ *
+ * period_window_size 为 1 时保持末次 gap 语义；大于 1 时使用滚动中位数。
  */
 inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us,
                                     uint32_t required_stable_gaps,
-                                    uint64_t min_tolerance_us)
+                                    uint64_t min_tolerance_us,
+                                    size_t period_window_size = 1)
 {
   if (!cadence.has_last_timestamp)
   {
@@ -329,20 +479,26 @@ inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us
     const bool was_stable = cadence.stable;
     cadence.has_last_timestamp = true;
     cadence.last_timestamp_us = timestamp_us;
-    cadence.stable = false;
-    cadence.period_us = 0;
-    cadence.stable_count = 0;
+    ResetCadenceEstimate(cadence);
     return was_stable ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
   }
 
   const uint64_t gap_us = timestamp_us - cadence.last_timestamp_us;
   cadence.last_timestamp_us = timestamp_us;
 
+  const size_t effective_window_size =
+      std::clamp<size_t>(period_window_size, 1, CadenceState::max_period_window_size);
+  if (cadence.period_window_size != effective_window_size)
+  {
+    ResetCadenceEstimate(cadence);
+  }
+
   if (cadence.period_us == 0)
   {
-    cadence.period_us = gap_us;
+    AddCadenceGap(cadence, gap_us, effective_window_size);
     cadence.stable_count = 1;
-    cadence.stable = required_stable_gaps <= 1;
+    cadence.stable = required_stable_gaps <= 1 &&
+                     cadence.period_gap_count >= cadence.period_window_size;
     return cadence.stable ? CadenceUpdate::STABLE : CadenceUpdate::WARMING;
   }
 
@@ -350,19 +506,18 @@ inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us
       std::max<uint64_t>(min_tolerance_us, cadence.period_us / 4ULL);
   if (AbsDiffUs(gap_us, cadence.period_us) <= tolerance_us)
   {
-    cadence.period_us = gap_us;
+    AddCadenceGap(cadence, gap_us, effective_window_size);
     if (cadence.stable_count < required_stable_gaps)
     {
       ++cadence.stable_count;
     }
-    cadence.stable = cadence.stable_count >= required_stable_gaps;
+    cadence.stable = cadence.stable_count >= required_stable_gaps &&
+                     cadence.period_gap_count >= cadence.period_window_size;
     return cadence.stable ? CadenceUpdate::STABLE : CadenceUpdate::WARMING;
   }
 
   const bool was_stable = cadence.stable;
-  cadence.stable = false;
-  cadence.period_us = 0;
-  cadence.stable_count = 0;
+  ResetCadenceEstimate(cadence);
   return was_stable ? CadenceUpdate::BROKEN : CadenceUpdate::WARMING;
 }
 

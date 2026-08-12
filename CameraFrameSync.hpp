@@ -441,7 +441,11 @@ class CameraFrameSync : public LibXR::Application
   static constexpr size_t pending_limit = 1024;       ///< 状态机待处理队列长度。
   static constexpr size_t image_event_limit = 64;     ///< 图像时间戳待处理队列长度。
   static constexpr size_t history_limit = 1024;       ///< 可供 offset 查找的 IMU 样本数。
-  static constexpr uint32_t cadence_stable_gaps = 2;  ///< 判定周期稳定所需连续 gap 数。
+  static constexpr uint32_t image_cadence_stable_gaps =
+      2;  ///< 判定图像周期稳定所需连续 gap 数。
+  static constexpr uint32_t imu_cadence_stable_gaps =
+      5;  ///< 判定 IMU 周期稳定所需连续 gap 数。
+  static constexpr size_t imu_period_window_size = 5;  ///< IMU 周期中位数窗口大小。
   static constexpr uint32_t max_synced_image_gap_stride =
       8;  ///< 同步态可接受的连续丢图数量。
   static constexpr uint32_t max_raw_imu_gap_stride =
@@ -566,6 +570,11 @@ class CameraFrameSync : public LibXR::Application
    * @brief 更新 IMU 发布周期观察，并在周期破坏时触发重同步。
    */
   void ObserveImuCadence(uint64_t sensor_timestamp_us);
+
+  /**
+   * @brief IMU 时间轴失效后重置同步、周期估计和待完成匹配。
+   */
+  void ResetImuTimelineObservation(const char* reason, const char* detail);
 
   /**
    * @brief 按图像时间顺序推进同步状态机。
