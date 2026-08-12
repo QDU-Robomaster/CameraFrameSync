@@ -9,6 +9,50 @@
 namespace CameraFrameSyncCore
 {
 
+/** @brief Result of validating a frame geometry against the process-lifetime lock. */
+enum class GeometryLockOutcome : uint8_t
+{
+  LOCKED = 0,
+  MATCHED = 1,
+  REJECT_INVALID = 2,
+  REJECT_CHANGED = 3,
+};
+
+/** @brief First accepted geometry retained independently from synchronization resets. */
+template <typename Geometry>
+struct GeometryLockState
+{
+  bool locked{false};
+  Geometry geometry{};
+};
+
+/**
+ * @brief Validate and compare a geometry candidate, locking the first valid value.
+ *
+ * Rejected candidates never mutate an existing lock.
+ */
+template <typename Geometry, typename SameGeometry>
+[[nodiscard]] constexpr GeometryLockOutcome CheckAndLockGeometry(
+    GeometryLockState<Geometry>& lock, const Geometry& candidate, bool valid,
+    SameGeometry same_geometry)
+{
+  if (!valid)
+  {
+    return GeometryLockOutcome::REJECT_INVALID;
+  }
+  if (!lock.locked)
+  {
+    lock.geometry = candidate;
+    lock.locked = true;
+    return GeometryLockOutcome::LOCKED;
+  }
+  if (!same_geometry(candidate, lock.geometry))
+  {
+    return GeometryLockOutcome::REJECT_CHANGED;
+  }
+  return GeometryLockOutcome::MATCHED;
+}
+
 /**
  * @brief 固定容量样本缓存，满时丢弃最旧样本。
  */
@@ -55,10 +99,7 @@ class SampleHistory
   /**
    * @brief 清空缓存。
    */
-  void Clear()
-  {
-    size_ = 0;
-  }
+  void Clear() { size_ = 0; }
 
   /**
    * @brief 追加元素，容量满时丢弃最旧元素。
@@ -119,10 +160,10 @@ enum class SyncState : uint8_t
  */
 enum class CadenceUpdate : uint8_t
 {
-  NO_GAP = 0,  ///< 第一条样本，还没有周期信息。
+  NO_GAP = 0,   ///< 第一条样本，还没有周期信息。
   WARMING = 1,  ///< 周期尚未稳定。
-  STABLE = 2,  ///< 周期稳定。
-  BROKEN = 3,  ///< 已稳定周期被新样本打破。
+  STABLE = 2,   ///< 周期稳定。
+  BROKEN = 3,   ///< 已稳定周期被新样本打破。
 };
 
 /**
@@ -236,8 +277,7 @@ inline uint32_t MatchImageGapStride(uint64_t gap_us, uint64_t image_period_us,
  * tolerance_us 由调用者按数据源类型提供；IMU 不能复用图像的大容差。
  */
 inline uint32_t MatchPeriodGapStride(uint64_t gap_us, uint64_t period_us,
-                                     uint64_t tolerance_us,
-                                     uint32_t max_stride)
+                                     uint64_t tolerance_us, uint32_t max_stride)
 {
   if (period_us == 0 || max_stride == 0)
   {
@@ -255,9 +295,7 @@ inline uint32_t MatchPeriodGapStride(uint64_t gap_us, uint64_t period_us,
   }
 
   const uint64_t expected = period_us * stride;
-  return AbsDiffUs(gap_us, expected) <= tolerance_us
-             ? static_cast<uint32_t>(stride)
-             : 0;
+  return AbsDiffUs(gap_us, expected) <= tolerance_us ? static_cast<uint32_t>(stride) : 0;
 }
 
 /**
@@ -308,8 +346,8 @@ inline CadenceUpdate ObserveCadence(CadenceState& cadence, uint64_t timestamp_us
     return cadence.stable ? CadenceUpdate::STABLE : CadenceUpdate::WARMING;
   }
 
-  const uint64_t tolerance_us = std::max<uint64_t>(min_tolerance_us,
-                                                   cadence.period_us / 4ULL);
+  const uint64_t tolerance_us =
+      std::max<uint64_t>(min_tolerance_us, cadence.period_us / 4ULL);
   if (AbsDiffUs(gap_us, cadence.period_us) <= tolerance_us)
   {
     cadence.period_us = gap_us;

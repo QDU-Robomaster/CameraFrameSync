@@ -2,7 +2,7 @@
 
 `CameraFrameSync` 负责把相机图像和原始 IMU 对齐：
 
-- 从 `CameraBase<Info>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
+- 从 `CameraBase<FrameLayoutV>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
 - 按相机名订阅原始 `gyro / accl / quat`
 - 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
 
@@ -13,7 +13,7 @@
 
 输入：
 
-- 图像：`CameraBase<Info>::RegisterImageSink(...)`
+- 图像：`CameraBase<FrameLayoutV>::RegisterImageSink(...)`
 - 原始陀螺：`<camera_name>_gyro`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
 - 原始加速度：`<camera_name>_accl`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
 - 原始姿态：`<camera_name>_quat`，消息类型为 `LibXR::Quaternion<float>`
@@ -41,6 +41,15 @@
 - `CameraSync::SyncEvent` 的同步点时间来自 result topic 的 envelope timestamp
 
 相机时间和 IMU 时间不做绝对值比较。相机侧只看相邻图像的时间差，IMU 侧只看相邻 IMU 的时间差和 `CameraSync` 回传的 IMU 时间戳。
+
+## 相机几何契约
+
+构造时，模块从相机复制不可变的原生 `CameraCalibration`。每次提交图像时先用同一
+`FrameLayoutV` 和该标定验证 `ImageFrame::geometry`；非法几何不会发布到共享 topic。
+
+首个有效帧的非零 `epoch` 会被锁存。当前运行期间如果后续帧切换到其它 `epoch`，该帧会被
+拒绝并计入 drop；改变 ROI 或下采样配置前必须先实现显式的 epoch 切换协议，当前固定 wide
+路径不支持运行中切换。
 
 ## 原始 IMU 组装
 
@@ -130,9 +139,14 @@ IMU 组装以 gyro 为主轴：
 
 ## 配置
 
+以下示例假设 `constexpr_namespace: ProjectConstexpr`，并已定义
+`CameraTypes::FrameLayout MainFrameLayout`。相机、同步桥和消费者必须引用同一个布局常量。
+
 默认配置走实机 `RAW_PROBE`：
 
 ```yaml
+template_args:
+  Layout: {constexpr: MainFrameLayout}
 constructor_args:
   camera: '@camera'
 ```
@@ -140,10 +154,12 @@ constructor_args:
 已经同步的数据源使用 `LATEST_IMU`：
 
 ```yaml
+template_args:
+  Layout: {constexpr: MainFrameLayout}
 constructor_args:
   camera: '@camera'
   runtime:
-    mode: {expr: "CameraFrameSync<Info>::SyncMode::LATEST_IMU"}
+    mode: {expr: "CameraFrameSync<ProjectConstexpr::MainFrameLayout>::SyncMode::LATEST_IMU"}
     offset_us: 0
     host_topic_domain_name: libxr_def_domain
     sync_command_topic_name: camera_sync_command
@@ -156,10 +172,12 @@ constructor_args:
 Webots / 实机可显式配置同步 topic：
 
 ```yaml
+template_args:
+  Layout: {constexpr: MainFrameLayout}
 constructor_args:
   camera: '@camera'
   runtime:
-    mode: {expr: "CameraFrameSync<Info>::SyncMode::RAW_PROBE"}
+    mode: {expr: "CameraFrameSync<ProjectConstexpr::MainFrameLayout>::SyncMode::RAW_PROBE"}
     offset_us: 0
     host_topic_domain_name: host
     sync_command_topic_name: camera_sync_command
