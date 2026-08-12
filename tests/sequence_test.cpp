@@ -1,6 +1,8 @@
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -65,6 +67,10 @@ class SequenceHarness
   }
 
   void SetOffsetUs(int32_t offset_us) { offset_us_ = offset_us; }
+  void SetTargetTriggerHz(float target_trigger_hz)
+  {
+    target_trigger_hz_ = target_trigger_hz;
+  }
 
   void PushGyro(uint64_t timestamp_us) { gyros_.PushBackDropOldest({timestamp_us}); }
   void PushAccl(uint64_t timestamp_us) { accls_.PushBackDropOldest({timestamp_us}); }
@@ -112,8 +118,13 @@ class SequenceHarness
   SyncState State() const { return state_; }
   uint32_t ProbeSentCount() const { return probe_sent_count_; }
   uint32_t LastProbeSeq() const { return last_probe_seq_; }
+  uint8_t LastRunTriggerDiv() const { return last_run_trigger_div_; }
   uint64_t ImagePeriodUs() const { return periods_.image_us; }
   uint64_t ImuPeriodUs() const { return periods_.imu_us; }
+  bool HasPendingMatch() const
+  {
+    return pending_frame_.valid && pending_frame_.match.valid;
+  }
 
   const std::vector<uint32_t>& PublishedTags() const { return published_tags_; }
   const std::vector<uint64_t>& SyncImuTimestamps() const { return sync_imu_timestamps_; }
@@ -166,7 +177,9 @@ class SequenceHarness
   };
 
   static constexpr size_t limit = 64;
-  static constexpr uint32_t stable_gaps = 2;
+  static constexpr uint32_t image_stable_gaps = 2;
+  static constexpr uint32_t imu_stable_gaps = 5;
+  static constexpr size_t imu_period_window_size = 5;
   static constexpr uint64_t imu_tolerance_us = 300;
   static constexpr uint64_t image_tolerance_us = 1500;
   static constexpr uint32_t max_raw_imu_gap_stride = 8;
@@ -197,6 +210,7 @@ class SequenceHarness
   {
     ClearRuntimeState();
     last_probe_seq_ = 0;
+    last_run_trigger_div_ = 0;
     probe_sent_count_ = 0;
   }
 
@@ -228,6 +242,14 @@ class SequenceHarness
     periods_.image_us = 0;
     last_image_valid_ = false;
     last_image_timestamp_us_ = 0;
+  }
+
+  void ResetImuTimelineObservation()
+  {
+    ResetLock();
+    imu_cadence_ = {};
+    periods_.imu_us = 0;
+    pending_frame_.match = {};
   }
 
   void AssembleImuHistory()
@@ -281,7 +303,7 @@ class SequenceHarness
         ResetRawEpoch(imu);
         return true;
       }
-      ResetLock();
+      ResetImuTimelineObservation();
       return true;
     }
 
@@ -308,11 +330,12 @@ class SequenceHarness
       }
     }
 
-    const auto update = ObserveCadence(imu_cadence_, imu.sensor_timestamp_us, stable_gaps,
-                                       imu_tolerance_us);
+    const auto update =
+        ObserveCadence(imu_cadence_, imu.sensor_timestamp_us, imu_stable_gaps,
+                       imu_tolerance_us, imu_period_window_size);
     if (update == CadenceUpdate::BROKEN)
     {
-      ResetLock();
+      ResetImuTimelineObservation();
     }
     if (imu_cadence_.stable)
     {
@@ -458,7 +481,7 @@ class SequenceHarness
   {
     image.cadence_observed = true;
     const auto update = ObserveCadence(image_cadence_, image.event.sensor_timestamp_us,
-                                       stable_gaps, image_tolerance_us);
+                                       image_stable_gaps, image_tolerance_us);
     if (image_cadence_.stable)
     {
       periods_.image_us = image_cadence_.period_us;
@@ -470,7 +493,7 @@ class SequenceHarness
   {
     if (!last_image_valid_)
     {
-      ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+      ObserveCadence(image_cadence_, image_ts, image_stable_gaps, image_tolerance_us);
       RememberImage(image_ts);
       return;
     }
@@ -478,7 +501,7 @@ class SequenceHarness
     if (image_ts <= last_image_timestamp_us_)
     {
       ResetImageObservation();
-      ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+      ObserveCadence(image_cadence_, image_ts, image_stable_gaps, image_tolerance_us);
       RememberImage(image_ts);
       return;
     }
@@ -496,7 +519,7 @@ class SequenceHarness
     {
       ResetLock();
       ResetImageObservation();
-      ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+      ObserveCadence(image_cadence_, image_ts, image_stable_gaps, image_tolerance_us);
       RememberImage(image_ts);
       return;
     }
@@ -508,7 +531,8 @@ class SequenceHarness
     }
     else
     {
-      update = ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+      update =
+          ObserveCadence(image_cadence_, image_ts, image_stable_gaps, image_tolerance_us);
     }
     if (image_cadence_.stable)
     {
@@ -549,6 +573,7 @@ class SequenceHarness
     {
       next_seq_ = 1;
     }
+    last_run_trigger_div_ = TargetRunTriggerDiv(periods_.imu_us, target_trigger_hz_);
     probe_sent_count_++;
     probe_ack_valid_ = false;
     probe_ack_seq_ = 0;
@@ -750,6 +775,7 @@ class SequenceHarness
 
   SyncMode mode_{SyncMode::RAW_PROBE};
   int32_t offset_us_{0};
+  float target_trigger_hz_{50.0F};
   SyncState state_{SyncState::OBSERVING};
   CadenceState image_cadence_{};
   CadenceState imu_cadence_{};
@@ -761,6 +787,7 @@ class SequenceHarness
   uint64_t last_image_timestamp_us_{0};
   uint32_t next_seq_{1};
   uint32_t last_probe_seq_{0};
+  uint8_t last_run_trigger_div_{0};
   uint32_t probe_sent_count_{0};
   uint32_t active_probe_seq_{0};
   uint32_t probe_ack_seq_{0};
@@ -935,6 +962,260 @@ void EmitWarmup(StreamDriver& driver, size_t image_count, uint32_t imu_after_cou
   {
     driver.EmitImage(imu_after_count);
   }
+}
+
+void TestCadenceUsesMedianOfFiveRealJitter()
+{
+  constexpr std::array<std::array<uint64_t, 5>, 2> patterns_us{
+      std::array<uint64_t, 5>{951, 953, 999, 1000, 999},
+      std::array<uint64_t, 5>{1047, 951, 999, 999, 1000},
+  };
+
+  for (const auto& gaps_us : patterns_us)
+  {
+    for (size_t phase = 0; phase < gaps_us.size(); ++phase)
+    {
+      CadenceState cadence{};
+      uint64_t timestamp_us = 100000;
+      ExpectEqual(ObserveCadence(cadence, timestamp_us, 5, 300, 5), CadenceUpdate::NO_GAP,
+                  "first cadence sample must not produce a gap");
+
+      for (size_t i = 0; i < gaps_us.size(); ++i)
+      {
+        timestamp_us += gaps_us[(phase + i) % gaps_us.size()];
+        const auto update = ObserveCadence(cadence, timestamp_us, 5, 300, 5);
+        if (i + 1 < gaps_us.size())
+        {
+          ExpectEqual(update, CadenceUpdate::WARMING,
+                      "five-gap estimator must not lock before its window is full");
+          Expect(!cadence.stable,
+                 "cadence must remain unstable before five accepted gaps");
+        }
+      }
+
+      Expect(cadence.stable, "five accepted gaps must establish a stable cadence");
+      ExpectEqual(cadence.period_us, 999ULL,
+                  "real compensated jitter must estimate the 999 us center");
+    }
+  }
+}
+
+void TestCadenceMedianWindowBoundaries()
+{
+  CadenceState cadence{};
+  constexpr std::array<uint64_t, 5> gaps_us{5, 1, 4, 2, 3};
+  constexpr std::array<uint64_t, 5> expected_us{5, 3, 4, 3, 3};
+  for (size_t i = 0; i < gaps_us.size(); ++i)
+  {
+    AddCadenceGap(cadence, gaps_us[i], 5);
+    ExpectEqual(cadence.period_us, expected_us[i],
+                "partial median window must match reference sorting");
+  }
+
+  AddCadenceGap(cadence, 6, 5);
+  ExpectEqual(cadence.period_us, 3ULL, "first ring overwrite must evict the oldest gap");
+  AddCadenceGap(cadence, 7, 5);
+  ExpectEqual(cadence.period_us, 4ULL,
+              "second ring overwrite must preserve median ordering");
+
+  AddCadenceGap(cadence, 9, 1);
+  ExpectEqual(cadence.period_gap_count, 1ULL,
+              "switching from five gaps to one must reset the window");
+  ExpectEqual(cadence.period_us, 9ULL,
+              "single-gap window must retain last-gap semantics");
+
+  CadenceState zero_clamped{};
+  AddCadenceGap(zero_clamped, 42, 0);
+  ExpectEqual(zero_clamped.period_window_size, 1ULL,
+              "zero-sized window must clamp to one");
+  ExpectEqual(zero_clamped.period_us, 42ULL,
+              "clamped single-gap window must retain its sample");
+
+  CadenceState high_clamped{};
+  for (const uint64_t gap_us : gaps_us)
+  {
+    AddCadenceGap(high_clamped, gap_us, 6);
+  }
+  ExpectEqual(high_clamped.period_window_size, 5ULL,
+              "oversized window must clamp to five");
+  ExpectEqual(high_clamped.period_us, 3ULL,
+              "clamped five-gap window must preserve its median");
+
+  constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+  CadenceState sentinel_boundary{};
+  AddCadenceGap(sentinel_boundary, maximum, 2);
+  ExpectEqual(sentinel_boundary.period_us, maximum,
+              "maximum gap must remain a valid sample");
+  AddCadenceGap(sentinel_boundary, 0, 2);
+  ExpectEqual(sentinel_boundary.period_us, maximum / 2ULL,
+              "even median must avoid overflow for zero and maximum");
+
+  CadenceState adjacent_maximum{};
+  AddCadenceGap(adjacent_maximum, maximum - 1ULL, 2);
+  AddCadenceGap(adjacent_maximum, maximum, 2);
+  ExpectEqual(adjacent_maximum.period_us, maximum - 1ULL,
+              "even median must floor safely near maximum");
+}
+
+void TestCadenceWindowSwitchAndBrokenReset()
+{
+  CadenceState cadence{};
+  uint64_t timestamp_us = 100000;
+  ObserveCadence(cadence, timestamp_us, 2, 300, 1);
+  timestamp_us += 1000;
+  ObserveCadence(cadence, timestamp_us, 2, 300, 1);
+  timestamp_us += 1000;
+  ExpectEqual(ObserveCadence(cadence, timestamp_us, 2, 300, 1), CadenceUpdate::STABLE,
+              "single-gap estimator should reach stable");
+
+  timestamp_us += 2000;
+  ExpectEqual(ObserveCadence(cadence, timestamp_us, 5, 300, 5), CadenceUpdate::WARMING,
+              "switching estimator windows must restart cadence warmup");
+  Expect(!cadence.stable, "window switch must clear the previous stable state");
+  ExpectEqual(cadence.period_gap_count, 1ULL,
+              "new estimator window must contain only its first gap");
+  ExpectEqual(cadence.period_us, 2000ULL,
+              "window switch must evaluate the current gap under the new estimator");
+
+  for (size_t i = 0; i < 4; ++i)
+  {
+    timestamp_us += 2000;
+    ObserveCadence(cadence, timestamp_us, 5, 300, 5);
+  }
+  Expect(cadence.stable, "new estimator window must stabilize after five gaps");
+
+  timestamp_us += 4000;
+  ExpectEqual(ObserveCadence(cadence, timestamp_us, 5, 300, 5), CadenceUpdate::BROKEN,
+              "out-of-tolerance gap must break cadence");
+  ExpectEqual(cadence.period_us, 0ULL, "broken cadence must clear its period");
+  ExpectEqual(cadence.period_gap_count, 0ULL,
+              "broken cadence must clear its estimator samples");
+  ExpectEqual(cadence.period_window_size, 0ULL,
+              "broken cadence must clear its estimator window identity");
+}
+
+void TestLockedSingleGapCadenceStaysStable()
+{
+  CadenceState cadence{};
+  LockSingleGapCadence(cadence, 100000, 10000, 2);
+  Expect(cadence.stable, "explicit cadence lock must be stable");
+  ExpectEqual(cadence.period_window_size, 1ULL,
+              "explicit cadence lock must initialize the single-gap window");
+  ExpectEqual(cadence.period_gap_count, 1ULL,
+              "explicit cadence lock must retain one period sample");
+
+  ExpectEqual(ObserveCadence(cadence, 110000, 2, 1500), CadenceUpdate::STABLE,
+              "first frame after an explicit cadence lock must stay stable");
+  Expect(cadence.stable, "matching frame must not reopen cadence warmup");
+  ExpectEqual(cadence.period_us, 10000ULL,
+              "matching frame must preserve the locked image period");
+}
+
+void TestCadenceNonMonotonicTimestampResetsEstimator()
+{
+  for (const uint64_t non_monotonic_timestamp_us : {105000ULL, 104000ULL})
+  {
+    CadenceState cadence{};
+    uint64_t timestamp_us = 100000;
+    ObserveCadence(cadence, timestamp_us, 5, 300, 5);
+    for (size_t i = 0; i < 5; ++i)
+    {
+      timestamp_us += 1000;
+      ObserveCadence(cadence, timestamp_us, 5, 300, 5);
+    }
+    Expect(cadence.stable, "test precondition must establish stable cadence");
+
+    ExpectEqual(ObserveCadence(cadence, non_monotonic_timestamp_us, 5, 300, 5),
+                CadenceUpdate::BROKEN,
+                "equal or backward timestamps must break stable cadence");
+    Expect(cadence.has_last_timestamp, "reset must retain a timestamp baseline");
+    ExpectEqual(cadence.last_timestamp_us, non_monotonic_timestamp_us,
+                "reset baseline must be the non-monotonic sample");
+    Expect(!cadence.stable, "reset cadence must be unstable");
+    ExpectEqual(cadence.period_us, 0ULL, "reset must clear the period");
+    ExpectEqual(cadence.stable_count, 0U, "reset must clear the stable count");
+    ExpectEqual(cadence.period_gap_count, 0ULL, "reset must clear estimator samples");
+    ExpectEqual(cadence.period_gap_next_index, 0ULL,
+                "reset must rewind the estimator write index");
+    ExpectEqual(cadence.period_window_size, 0ULL,
+                "reset must clear the estimator window identity");
+
+    ExpectEqual(ObserveCadence(cadence, non_monotonic_timestamp_us + 1000, 5, 300, 5),
+                CadenceUpdate::WARMING,
+                "the next gap must warm up from the replacement baseline");
+    ExpectEqual(cadence.period_us, 1000ULL,
+                "warmup must measure from the replacement baseline");
+    ExpectEqual(cadence.period_gap_count, 1ULL,
+                "warmup must retain exactly its first new gap");
+  }
+}
+
+void TestRunTriggerDividerBoundaries()
+{
+  ExpectEqual(TargetRunTriggerDiv(999, 100.0F), static_cast<uint8_t>(10),
+              "999 us cadence must select the 100 Hz divider used by hardware");
+  ExpectEqual(TargetRunTriggerDiv(1000, 400.0F), static_cast<uint8_t>(3),
+              "half dividers must round upward");
+  ExpectEqual(TargetRunTriggerDiv(1000, 500.0F), static_cast<uint8_t>(2),
+              "integral dividers must remain exact");
+  ExpectEqual(TargetRunTriggerDiv(1, 2000000.0F), static_cast<uint8_t>(1),
+              "sub-unit dividers must clamp to one");
+  ExpectEqual(TargetRunTriggerDiv(1, 1.0F), std::numeric_limits<uint8_t>::max(),
+              "large dividers must clamp to uint8 max");
+  ExpectEqual(TargetRunTriggerDiv(0, 100.0F), static_cast<uint8_t>(1),
+              "missing IMU cadence must use the safe divider");
+  ExpectEqual(TargetRunTriggerDiv(1000, 0.0F), static_cast<uint8_t>(1),
+              "zero target frequency must use the safe divider");
+  ExpectEqual(TargetRunTriggerDiv(1000, -1.0F), static_cast<uint8_t>(1),
+              "negative target frequency must use the safe divider");
+  ExpectEqual(TargetRunTriggerDiv(1000, std::numeric_limits<float>::quiet_NaN()),
+              static_cast<uint8_t>(1),
+              "NaN target frequency must not reach float-to-integer conversion");
+  ExpectEqual(TargetRunTriggerDiv(1000, std::numeric_limits<float>::infinity()),
+              static_cast<uint8_t>(1),
+              "infinite target frequency must use the safe divider");
+}
+
+void TestRawProbeWaitsForRobustImuCadence()
+{
+  SequenceHarness harness;
+  harness.SetTargetTriggerHz(100.0F);
+  constexpr std::array<uint64_t, 5> gaps_us{951, 953, 999, 1000, 999};
+  uint64_t imu_timestamp_us = 100000;
+  harness.PushRawImu(imu_timestamp_us);
+
+  for (size_t i = 0; i < 2; ++i)
+  {
+    imu_timestamp_us += gaps_us[i];
+    harness.PushRawImu(imu_timestamp_us);
+  }
+  harness.PushImage(110000, 1);
+  harness.PushImage(120000, 2);
+  harness.PushImage(130000, 3);
+  harness.Drain();
+  ExpectEqual(harness.ProbeSentCount(), 0U, "951/953 us prefix must not start RAW_PROBE");
+
+  for (size_t i = 2; i < gaps_us.size() - 1; ++i)
+  {
+    imu_timestamp_us += gaps_us[i];
+    harness.PushRawImu(imu_timestamp_us);
+  }
+  harness.PushImage(140000, 4);
+  harness.Drain();
+  ExpectEqual(harness.ProbeSentCount(), 0U,
+              "RAW_PROBE must wait until the five-gap IMU window is full");
+
+  imu_timestamp_us += gaps_us.back();
+  harness.PushRawImu(imu_timestamp_us);
+  harness.PushImage(150000, 5);
+  harness.Drain();
+
+  ExpectEqual(harness.ImuPeriodUs(), 999ULL,
+              "RAW_PROBE must use the robust IMU cadence estimate");
+  ExpectEqual(harness.LastRunTriggerDiv(), static_cast<uint8_t>(10),
+              "robust IMU cadence must produce the 100 Hz run divider");
+  ExpectEqual(harness.ProbeSentCount(), 1U,
+              "RAW_PROBE should start after both cadence gates are stable");
 }
 
 void TestRawJoinWaitsForAllChannels()
@@ -1353,16 +1634,112 @@ void TestRawImuEpochResetClearsHistoryAndRelocks()
 void TestRawImuSmallRollbackDoesNotResetEpoch()
 {
   SequenceHarness harness;
+  StreamDriver driver(harness);
 
-  harness.PushRawImu(100000);
-  harness.PushRawImu(102000);
+  EmitWarmup(driver, 8);
+  ExpectEqual(harness.State(), SyncState::SYNCED, "test precondition must synchronize");
+  ExpectEqual(harness.ProbeSentCount(), 1U,
+              "test precondition must send exactly one probe");
+
+  const auto history_before_rollback = harness.HistoryTimestamps();
+  const uint64_t last_timestamp_us = history_before_rollback.back();
+  harness.PushRawImu(last_timestamp_us - 500);
   harness.Drain();
 
-  harness.PushRawImu(101500);
+  ExpectVectorEqual(
+      harness.HistoryTimestamps(), history_before_rollback,
+      "small rollback must not clear or append to the accepted epoch history");
+  ExpectEqual(harness.State(), SyncState::OBSERVING,
+              "small rollback must release the stale synchronization lock");
+  ExpectEqual(harness.ImuPeriodUs(), 0ULL,
+              "small rollback must discard the stale IMU cadence estimate");
+
+  uint64_t timestamp_us = last_timestamp_us + driver.ImuPeriodUs();
+  harness.PushRawImu(timestamp_us);
+  for (size_t gap = 0; gap < 4; ++gap)
+  {
+    timestamp_us += driver.ImuPeriodUs();
+    harness.PushRawImu(timestamp_us);
+  }
+  harness.PushImage(driver.NextImageTimestamp(), 101);
+  harness.Drain();
+  ExpectEqual(harness.ProbeSentCount(), 1U,
+              "four new gaps after rollback must not reuse the stale median window");
+
+  timestamp_us += driver.ImuPeriodUs();
+  harness.PushRawImu(timestamp_us);
+  harness.PushImage(driver.NextImageTimestamp() + driver.ImagePeriodUs(), 102);
+  harness.Drain();
+  ExpectEqual(
+      harness.ProbeSentCount(), 2U,
+      "five new monotonic gaps after rollback may establish a fresh probe cadence");
+}
+
+void TestRawImuRollbackInvalidatesPendingOffsetMatch()
+{
+  SequenceHarness harness;
+  StreamDriver driver(harness);
+
+  EmitWarmup(driver, 8);
+  ExpectEqual(harness.State(), SyncState::SYNCED, "test precondition must synchronize");
+
+  harness.SetOffsetUs(static_cast<int32_t>(2 * driver.ImuPeriodUs()));
+  const size_t published_before_pending = harness.PublishedTags().size();
+  driver.EmitImage(0);
+  Expect(harness.HasPendingMatch(),
+         "positive offset must retain the matched image while waiting for future IMU");
+  ExpectEqual(harness.PublishedTags().size(), published_before_pending,
+              "pending offset image must not publish before its final IMU arrives");
+
+  const auto history_before_rollback = harness.HistoryTimestamps();
+  const uint64_t last_timestamp_us = history_before_rollback.back();
+  harness.PushRawImu(last_timestamp_us - 500);
   harness.Drain();
 
-  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{100000, 102000},
-                    "小幅乱序不能当作设备 epoch 重启清空历史");
+  Expect(!harness.HasPendingMatch(),
+         "IMU rollback must invalidate a match derived from the old timeline");
+  ExpectEqual(harness.State(), SyncState::OBSERVING,
+              "invalidating a pending match must leave synchronization observing");
+  ExpectEqual(harness.PublishedTags().size(), published_before_pending,
+              "invalidated pending image must not publish from the old timeline");
+
+  harness.PushRawImu(last_timestamp_us + driver.ImuPeriodUs());
+  harness.PushRawImu(last_timestamp_us + 2 * driver.ImuPeriodUs());
+  harness.Drain();
+  ExpectEqual(harness.State(), SyncState::OBSERVING,
+              "future IMU that satisfied the old offset must not restore stale sync");
+  ExpectEqual(harness.PublishedTags().size(), published_before_pending,
+              "old pending match must stay invalid after its former target arrives");
+  ExpectEqual(harness.ProbeSentCount(), 1U,
+              "two new gaps after rollback must not bypass five-gap warmup");
+}
+
+void TestRawImuForwardGapInvalidatesPendingOffsetMatch()
+{
+  SequenceHarness harness;
+  StreamDriver driver(harness);
+
+  EmitWarmup(driver, 8);
+  ExpectEqual(harness.State(), SyncState::SYNCED, "test precondition must synchronize");
+
+  harness.SetOffsetUs(static_cast<int32_t>(2 * driver.ImuPeriodUs()));
+  const size_t published_before_pending = harness.PublishedTags().size();
+  driver.EmitImage(0);
+  Expect(harness.HasPendingMatch(),
+         "positive offset must retain the matched image while waiting for future IMU");
+
+  driver.InjectRawGap(3500);
+
+  Expect(!harness.HasPendingMatch(),
+         "forward cadence break must invalidate a match from the old timeline");
+  ExpectEqual(harness.State(), SyncState::OBSERVING,
+              "forward cadence break must leave synchronization observing");
+  ExpectEqual(harness.ImuPeriodUs(), 0ULL,
+              "forward cadence break must clear the public IMU period");
+  ExpectEqual(harness.PublishedTags().size(), published_before_pending,
+              "forward cadence break must not publish the old pending match");
+  ExpectEqual(harness.ProbeSentCount(), 1U,
+              "forward cadence break must not bypass a fresh five-gap warmup");
 }
 
 void TestCompositeResetAndRelock()
@@ -1456,6 +1833,13 @@ struct NamedTest
 int main()
 {
   const std::vector<NamedTest> tests = {
+      {"cadence/median-five-real-jitter", TestCadenceUsesMedianOfFiveRealJitter},
+      {"cadence/median-window-boundaries", TestCadenceMedianWindowBoundaries},
+      {"cadence/window-switch-broken-reset", TestCadenceWindowSwitchAndBrokenReset},
+      {"cadence/locked-single-gap-stays-stable", TestLockedSingleGapCadenceStaysStable},
+      {"cadence/non-monotonic-reset", TestCadenceNonMonotonicTimestampResetsEstimator},
+      {"camera-sync/run-divider-boundaries", TestRunTriggerDividerBoundaries},
+      {"raw-probe/wait-robust-imu-cadence", TestRawProbeWaitsForRobustImuCadence},
       {"raw-join/等待三路齐全", TestRawJoinWaitsForAllChannels},
       {"raw-join/要求gyro精确时间戳", TestRawJoinRequiresExactGyroTimestamp},
       {"latest/无需probe直接发布", TestLatestModePublishesWithoutProbe},
@@ -1473,6 +1857,10 @@ int main()
       {"synced/raw imu单点缺样保持同步", TestRawImuChannelMissDoesNotDropSyncLock},
       {"raw-imu/epoch重启后重锁", TestRawImuEpochResetClearsHistoryAndRelocks},
       {"raw-imu/小幅乱序不清epoch", TestRawImuSmallRollbackDoesNotResetEpoch},
+      {"raw-imu/乱序清除待完成offset匹配",
+       TestRawImuRollbackInvalidatesPendingOffsetMatch},
+      {"raw-imu/前向坏gap清除待完成offset匹配",
+       TestRawImuForwardGapInvalidatesPendingOffsetMatch},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
       {"geometry/锁定与拒绝顺序", TestGeometryLockSequence},
   };

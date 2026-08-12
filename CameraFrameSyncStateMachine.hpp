@@ -179,7 +179,7 @@ CameraFrameSyncCore::CadenceUpdate
 CameraFrameSync<FrameLayoutV>::ObserveNormalImageCadence(uint64_t image_ts)
 {
   const auto update = CameraFrameSyncCore::ObserveCadence(
-      image_cadence_, image_ts, cadence_stable_gaps, image_cadence_tolerance_us);
+      image_cadence_, image_ts, image_cadence_stable_gaps, image_cadence_tolerance_us);
   if (image_cadence_.stable)
   {
     periods_.image_us = image_cadence_.period_us;
@@ -582,11 +582,8 @@ template <CameraTypes::FrameLayout FrameLayoutV>
 void CameraFrameSync<FrameLayoutV>::LockImageCadence(uint64_t image_timestamp_us,
                                                      uint64_t image_period_us)
 {
-  image_cadence_.has_last_timestamp = true;
-  image_cadence_.stable = true;
-  image_cadence_.last_timestamp_us = image_timestamp_us;
-  image_cadence_.period_us = image_period_us;
-  image_cadence_.stable_count = cadence_stable_gaps;
+  CameraFrameSyncCore::LockSingleGapCadence(image_cadence_, image_timestamp_us,
+                                            image_period_us, image_cadence_stable_gaps);
   periods_.image_us = image_period_us;
   RememberImage(image_timestamp_us);
 }
@@ -606,23 +603,7 @@ uint64_t CameraFrameSync<FrameLayoutV>::EstimatedSyncPeriodUs() const
 template <CameraTypes::FrameLayout FrameLayoutV>
 uint8_t CameraFrameSync<FrameLayoutV>::TargetRunTriggerDiv() const
 {
-  if (periods_.imu_us == 0 || target_trigger_hz_ <= 0.0F)
-  {
-    return 1;
-  }
-
-  const double imu_hz = 1000000.0 / static_cast<double>(periods_.imu_us);
-  const double raw_div = imu_hz / static_cast<double>(target_trigger_hz_);
-  uint32_t div = static_cast<uint32_t>(raw_div + 0.5);
-  if (div == 0)
-  {
-    div = 1;
-  }
-  if (div > UINT8_MAX)
-  {
-    div = UINT8_MAX;
-  }
-  return static_cast<uint8_t>(div);
+  return CameraFrameSyncCore::TargetRunTriggerDiv(periods_.imu_us, target_trigger_hz_);
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
@@ -671,6 +652,16 @@ void CameraFrameSync<FrameLayoutV>::ResetImageObservation()
   periods_.image_us = 0;
   last_image_valid_ = false;
   last_image_timestamp_us_ = 0;
+}
+
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetImuTimelineObservation(const char* reason,
+                                                                const char* detail)
+{
+  ResetLock(reason, detail);
+  imu_cadence_ = {};
+  periods_.imu_us = 0;
+  pending_frame_.match = {};
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
