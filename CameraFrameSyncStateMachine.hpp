@@ -3,8 +3,8 @@
 // 图像提交是唯一的状态机时钟。IMU 回调和 CameraSync 回执回调只搬运数据，
 // 所有跨队列匹配、等待和重同步都在这里串行完成。
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ProcessImageEvents()
 {
   while (pending_frame_.valid || !image_events_->Empty())
   {
@@ -26,9 +26,9 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
       image_events_->PopFront();
     }
 
-    const ImageDecision decision =
-        sync_mode_ == SyncMode::LATEST_IMU ? ProcessLatestImage(pending_frame_)
-                                           : ProcessRawProbeImage(pending_frame_);
+    const ImageDecision decision = sync_mode_ == SyncMode::LATEST_IMU
+                                       ? ProcessLatestImage(pending_frame_)
+                                       : ProcessRawProbeImage(pending_frame_);
     if (decision == ImageDecision::WAIT)
     {
       // 当前图像已经用于同步匹配，不能越过它消费下一帧。
@@ -45,21 +45,19 @@ void CameraFrameSync<CameraInfoV>::ProcessImageEvents()
   }
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::ProcessLatestImage(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::ProcessLatestImage(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame)
 {
-  if (last_image_valid_ &&
-      frame.image.sensor_timestamp_us <= last_image_timestamp_us_)
+  if (last_image_valid_ && frame.image.sensor_timestamp_us <= last_image_timestamp_us_)
   {
     ResetImageObservation();
     return ImageDecision::DONE;
   }
 
-  const ImageDecision decision = frame.match.valid
-                                     ? ResumePendingMatch(frame)
-                                     : TryLatestImuMatch(frame);
+  const ImageDecision decision =
+      frame.match.valid ? ResumePendingMatch(frame) : TryLatestImuMatch(frame);
   if (decision == ImageDecision::WAIT)
   {
     return decision;
@@ -69,10 +67,10 @@ CameraFrameSync<CameraInfoV>::ProcessLatestImage(
   return decision;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::ProcessRawProbeImage(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame)
 {
   if (frame.match.valid)
   {
@@ -118,9 +116,8 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
     return TryProbeImage(frame);
   }
 
-  const uint32_t image_gap_stride = state_ == SyncState::SYNCED
-                                        ? MatchImageGapStride(image_gap_us)
-                                        : 0;
+  const uint32_t image_gap_stride =
+      state_ == SyncState::SYNCED ? MatchImageGapStride(image_gap_us) : 0;
   auto cadence_update = CameraFrameSyncCore::CadenceUpdate::STABLE;
   if (!frame.cadence_consumed)
   {
@@ -177,9 +174,9 @@ CameraFrameSync<CameraInfoV>::ProcessRawProbeImage(
   return ImageDecision::RESET;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
+template <CameraTypes::FrameLayout FrameLayoutV>
 CameraFrameSyncCore::CadenceUpdate
-CameraFrameSync<CameraInfoV>::ObserveNormalImageCadence(uint64_t image_ts)
+CameraFrameSync<FrameLayoutV>::ObserveNormalImageCadence(uint64_t image_ts)
 {
   const auto update = CameraFrameSyncCore::ObserveCadence(
       image_cadence_, image_ts, cadence_stable_gaps, image_cadence_tolerance_us);
@@ -190,8 +187,8 @@ CameraFrameSync<CameraInfoV>::ObserveNormalImageCadence(uint64_t image_ts)
   return update;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ObserveDroppedImage(uint64_t image_ts)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ObserveDroppedImage(uint64_t image_ts)
 {
   if (!last_image_valid_)
   {
@@ -255,8 +252,8 @@ void CameraFrameSync<CameraInfoV>::ObserveDroppedImage(uint64_t image_ts)
   RememberImage(image_ts);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::MaybeStartProbe()
 {
   if (sync_mode_ != SyncMode::RAW_PROBE || state_ != SyncState::OBSERVING)
   {
@@ -300,17 +297,16 @@ void CameraFrameSync<CameraInfoV>::MaybeStartProbe()
   topics_->sync_command.Publish(cmd);
 
   XR_LOG_INFO(
-      "CameraFrameSync: sync command sent seq=%u probe_div=%u run_div=%u active=%u target_hz=%.3f image_period_us=%u imu_period_us=%u sync_period_us=%u",
+      "CameraFrameSync: sync command sent seq=%u probe_div=%u run_div=%u active=%u "
+      "target_hz=%.3f image_period_us=%u imu_period_us=%u sync_period_us=%u",
       static_cast<unsigned>(cmd.seq), static_cast<unsigned>(cmd.sync_probe_div),
-      static_cast<unsigned>(cmd.run_trigger_div),
-      static_cast<unsigned>(cmd.active_level), static_cast<double>(target_trigger_hz_),
-      static_cast<unsigned>(periods_.image_us),
-      static_cast<unsigned>(periods_.imu_us),
-      static_cast<unsigned>(sync_period_us));
+      static_cast<unsigned>(cmd.run_trigger_div), static_cast<unsigned>(cmd.active_level),
+      static_cast<double>(target_trigger_hz_), static_cast<unsigned>(periods_.image_us),
+      static_cast<unsigned>(periods_.imu_us), static_cast<unsigned>(sync_period_us));
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::SendResetToDefaultCommand()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::SendResetToDefaultCommand()
 {
   CameraSync::SyncCommand cmd{};
   // reset 命令不参与同步，所以 seq 和两个分频字段都保持 0。
@@ -324,10 +320,10 @@ void CameraFrameSync<CameraInfoV>::SendResetToDefaultCommand()
               static_cast<unsigned>(cmd.active_level));
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::TryProbeImage(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::TryProbeImage(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame)
 {
   const uint64_t sync_period_us = EstimatedSyncPeriodUs();
   if (!pending_probe_ack_valid_ && probe_ack_seq_.load() == pending_probe_seq_)
@@ -366,8 +362,8 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
       CameraFrameSyncCore::ImuTimestampToleranceUs(periods_.imu_us));
   if (sync_imu == nullptr)
   {
-    return ImuHistoryReached(ack_ts + CameraFrameSyncCore::ImuTimestampToleranceUs(
-                                          periods_.imu_us))
+    return ImuHistoryReached(
+               ack_ts + CameraFrameSyncCore::ImuTimestampToleranceUs(periods_.imu_us))
                ? ImageDecision::RESET
                : ImageDecision::WAIT;
   }
@@ -376,8 +372,8 @@ CameraFrameSync<CameraInfoV>::TryProbeImage(
                                 SyncMatch{.imu = sync_imu, .period_us = sync_period_us});
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-uint64_t CameraFrameSync<CameraInfoV>::ProbeTimeoutUs() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+uint64_t CameraFrameSync<FrameLayoutV>::ProbeTimeoutUs() const
 {
   uint64_t image_period_us = periods_.image_us;
   if (image_period_us == 0)
@@ -399,19 +395,18 @@ uint64_t CameraFrameSync<CameraInfoV>::ProbeTimeoutUs() const
   return timeout_us;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::ProbeTimedOut() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::ProbeTimedOut() const
 {
-  if (state_ != SyncState::PROBE_SENT ||
-      pending_probe_start_imu_timestamp_us_ == 0 || imu_history_->Empty())
+  if (state_ != SyncState::PROBE_SENT || pending_probe_start_imu_timestamp_us_ == 0 ||
+      imu_history_->Empty())
   {
     return false;
   }
 
   const uint64_t timeout_us = ProbeTimeoutUs();
   if (timeout_us == 0 ||
-      imu_history_->Back().sensor_timestamp_us <=
-          pending_probe_start_imu_timestamp_us_)
+      imu_history_->Back().sensor_timestamp_us <= pending_probe_start_imu_timestamp_us_)
   {
     return false;
   }
@@ -421,10 +416,10 @@ bool CameraFrameSync<CameraInfoV>::ProbeTimedOut() const
          timeout_us;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::TryLatestImuMatch(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::TryLatestImuMatch(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame)
 {
   if (imu_history_->Empty())
   {
@@ -436,10 +431,10 @@ CameraFrameSync<CameraInfoV>::TryLatestImuMatch(
       frame, SyncMatch{.imu = &imu_history_->Back(), .period_us = period});
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::TrySyncedImage(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame,
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::TrySyncedImage(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame,
     uint32_t image_gap_stride)
 {
   if (locked_sync_.last_imu_timestamp_us == 0 || locked_sync_.period_us == 0 ||
@@ -469,10 +464,10 @@ CameraFrameSync<CameraInfoV>::TrySyncedImage(
       frame, SyncMatch{.imu = sync_imu, .period_us = locked_sync_.period_us});
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::ResumePendingMatch(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::ResumePendingMatch(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame)
 {
   if (!frame.match.valid)
   {
@@ -487,15 +482,14 @@ CameraFrameSync<CameraInfoV>::ResumePendingMatch(
   }
 
   return PublishOrRememberMatch(
-      frame,
-      SyncMatch{.imu = sync_imu, .period_us = frame.match.period_us});
+      frame, SyncMatch{.imu = sync_imu, .period_us = frame.match.period_us});
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::PublishOrRememberMatch(
-    typename CameraFrameSync<CameraInfoV>::PendingFrame& frame,
-    const typename CameraFrameSync<CameraInfoV>::SyncMatch& match)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::PublishOrRememberMatch(
+    typename CameraFrameSync<FrameLayoutV>::PendingFrame& frame,
+    const typename CameraFrameSync<FrameLayoutV>::SyncMatch& match)
 {
   const ImageDecision decision = PublishMatchedImage(frame.image, match);
   if (decision == ImageDecision::WAIT)
@@ -510,19 +504,18 @@ CameraFrameSync<CameraInfoV>::PublishOrRememberMatch(
   return decision;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageDecision
-CameraFrameSync<CameraInfoV>::PublishMatchedImage(
-    const typename CameraFrameSync<CameraInfoV>::ImageSample& image,
-    const typename CameraFrameSync<CameraInfoV>::SyncMatch& match)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageDecision
+CameraFrameSync<FrameLayoutV>::PublishMatchedImage(
+    const typename CameraFrameSync<FrameLayoutV>::ImageSample& image,
+    const typename CameraFrameSync<FrameLayoutV>::SyncMatch& match)
 {
   if (match.imu == nullptr || match.period_us == 0)
   {
     return ImageDecision::RESET;
   }
 
-  const int32_t offset_us =
-      sync_mode_ == SyncMode::LATEST_IMU ? 0 : offset_us_;
+  const int32_t offset_us = sync_mode_ == SyncMode::LATEST_IMU ? 0 : offset_us_;
   const uint64_t final_ts =
       CameraFrameSyncCore::ApplyOffsetUs(match.imu->sensor_timestamp_us, offset_us);
   if (!ImuHistoryReached(final_ts))
@@ -540,6 +533,7 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
   }
 
   PublishSyncedImu(image.sensor_timestamp_us, *final_imu);
+  AutoAimReplayBenchmark::RecordSync(image.sensor_timestamp_us);
 
   const SyncState old_state = state_;
   state_ = SyncState::SYNCED;
@@ -559,19 +553,19 @@ CameraFrameSync<CameraInfoV>::PublishMatchedImage(
   if (old_state != SyncState::SYNCED)
   {
     XR_LOG_PASS(
-        "CameraFrameSync: state %s -> SYNCED mode=%s image_period_us=%u imu_period_us=%u sync_period_us=%u offset_us=%d",
+        "CameraFrameSync: state %s -> SYNCED mode=%s image_period_us=%u imu_period_us=%u "
+        "sync_period_us=%u offset_us=%d",
         StateName(old_state), SyncModeName(sync_mode_),
-        static_cast<unsigned>(periods_.image_us),
-        static_cast<unsigned>(periods_.imu_us),
+        static_cast<unsigned>(periods_.image_us), static_cast<unsigned>(periods_.imu_us),
         static_cast<unsigned>(locked_sync_.period_us), static_cast<int>(offset_us));
   }
   return ImageDecision::DONE;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::PublishSyncedImu(
     uint64_t image_timestamp_us,
-    const typename CameraFrameSync<CameraInfoV>::AssembledImu& imu)
+    const typename CameraFrameSync<FrameLayoutV>::AssembledImu& imu)
 {
   ImuStamped synced{
       .timestamp_us = image_timestamp_us,
@@ -584,9 +578,9 @@ void CameraFrameSync<CameraInfoV>::PublishSyncedImu(
   monitor_synced_output_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::LockImageCadence(uint64_t image_timestamp_us,
-                                                    uint64_t image_period_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::LockImageCadence(uint64_t image_timestamp_us,
+                                                     uint64_t image_period_us)
 {
   image_cadence_.has_last_timestamp = true;
   image_cadence_.stable = true;
@@ -597,20 +591,20 @@ void CameraFrameSync<CameraInfoV>::LockImageCadence(uint64_t image_timestamp_us,
   RememberImage(image_timestamp_us);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-uint64_t CameraFrameSync<CameraInfoV>::EstimatedSyncPeriodUs() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+uint64_t CameraFrameSync<FrameLayoutV>::EstimatedSyncPeriodUs() const
 {
   if (periods_.image_us == 0 || periods_.imu_us == 0)
   {
     return 0;
   }
-  const uint32_t stride = CameraFrameSyncCore::EstimateStrideSamples(
-      periods_.image_us, periods_.imu_us);
+  const uint32_t stride =
+      CameraFrameSyncCore::EstimateStrideSamples(periods_.image_us, periods_.imu_us);
   return stride == 0 ? 0 : periods_.imu_us * static_cast<uint64_t>(stride);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-uint8_t CameraFrameSync<CameraInfoV>::TargetRunTriggerDiv() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+uint8_t CameraFrameSync<FrameLayoutV>::TargetRunTriggerDiv() const
 {
   if (periods_.imu_us == 0 || target_trigger_hz_ <= 0.0F)
   {
@@ -631,23 +625,23 @@ uint8_t CameraFrameSync<CameraInfoV>::TargetRunTriggerDiv() const
   return static_cast<uint8_t>(div);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::IsNormalImageGap(uint64_t image_gap_us) const
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::IsNormalImageGap(uint64_t image_gap_us) const
 {
   return periods_.image_us != 0 &&
          CameraFrameSyncCore::AbsDiffUs(image_gap_us, periods_.image_us) <=
              CameraFrameSyncCore::ImageGapToleranceUs(periods_.image_us);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-uint32_t CameraFrameSync<CameraInfoV>::MatchImageGapStride(uint64_t image_gap_us) const
+template <CameraTypes::FrameLayout FrameLayoutV>
+uint32_t CameraFrameSync<FrameLayoutV>::MatchImageGapStride(uint64_t image_gap_us) const
 {
-  return CameraFrameSyncCore::MatchImageGapStride(
-      image_gap_us, periods_.image_us, max_synced_image_gap_stride);
+  return CameraFrameSyncCore::MatchImageGapStride(image_gap_us, periods_.image_us,
+                                                  max_synced_image_gap_stride);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::IsProbeImageGap(uint64_t image_gap_us) const
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::IsProbeImageGap(uint64_t image_gap_us) const
 {
   const uint64_t expected_gap =
       CameraFrameSyncCore::ProbeImageGapUs(periods_.image_us, sync_probe_div_);
@@ -656,23 +650,22 @@ bool CameraFrameSync<CameraInfoV>::IsProbeImageGap(uint64_t image_gap_us) const
              CameraFrameSyncCore::ImageGapToleranceUs(periods_.image_us);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::ImuHistoryReached(
-    uint64_t target_timestamp_us) const
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::ImuHistoryReached(uint64_t target_timestamp_us) const
 {
   return !imu_history_->Empty() &&
          imu_history_->Back().sensor_timestamp_us >= target_timestamp_us;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::RememberImage(uint64_t image_timestamp_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::RememberImage(uint64_t image_timestamp_us)
 {
   last_image_valid_ = true;
   last_image_timestamp_us_ = image_timestamp_us;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ResetImageObservation()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetImageObservation()
 {
   image_cadence_ = {};
   periods_.image_us = 0;
@@ -680,8 +673,8 @@ void CameraFrameSync<CameraInfoV>::ResetImageObservation()
   last_image_timestamp_us_ = 0;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ClearPendingProbe()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ClearPendingProbe()
 {
   active_probe_seq_.store(0);
   probe_ack_seq_.store(0);
@@ -694,14 +687,14 @@ void CameraFrameSync<CameraInfoV>::ClearPendingProbe()
   pending_probe_start_imu_timestamp_us_ = 0;
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ClearPendingFrame()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ClearPendingFrame()
 {
   pending_frame_ = {};
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ResetLock(const char* reason, const char* detail)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetLock(const char* reason, const char* detail)
 {
   const SyncState old_state = state_;
   state_ = SyncState::OBSERVING;
@@ -717,16 +710,15 @@ void CameraFrameSync<CameraInfoV>::ResetLock(const char* reason, const char* det
       SendResetToDefaultCommand();
     }
     XR_LOG_WARN(
-        "CameraFrameSync: state %s -> OBSERVING reason=%s detail=%s reset_camera_sync=%u image_period_us=%u imu_period_us=%u",
-        StateName(old_state), reason, detail,
-        reset_camera_sync ? 1U : 0U,
-        static_cast<unsigned>(periods_.image_us),
-        static_cast<unsigned>(periods_.imu_us));
+        "CameraFrameSync: state %s -> OBSERVING reason=%s detail=%s reset_camera_sync=%u "
+        "image_period_us=%u imu_period_us=%u",
+        StateName(old_state), reason, detail, reset_camera_sync ? 1U : 0U,
+        static_cast<unsigned>(periods_.image_us), static_cast<unsigned>(periods_.imu_us));
   }
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ResetRuntimeState()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetRuntimeState()
 {
   monitor_reset_count_.fetch_add(1, std::memory_order_relaxed);
   if (sync_mode_ == SyncMode::RAW_PROBE)
@@ -750,8 +742,8 @@ void CameraFrameSync<CameraInfoV>::ResetRuntimeState()
   overflowed_.store(false, std::memory_order_relaxed);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::HandleOverflowRecovery()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::HandleOverflowRecovery()
 {
   if (!overflowed_.exchange(false, std::memory_order_relaxed))
   {

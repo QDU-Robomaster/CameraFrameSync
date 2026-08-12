@@ -35,6 +35,17 @@ struct Imu
   uint64_t quat_timestamp_us{};
 };
 
+struct TestGeometry
+{
+  uint32_t epoch{};
+  uint32_t roi_offset_x_native{};
+};
+
+constexpr bool SameTestGeometry(const TestGeometry& lhs, const TestGeometry& rhs)
+{
+  return lhs.epoch == rhs.epoch && lhs.roi_offset_x_native == rhs.roi_offset_x_native;
+}
+
 enum class SyncMode : uint8_t
 {
   RAW_PROBE = 0,
@@ -106,7 +117,10 @@ class SequenceHarness
 
   const std::vector<uint32_t>& PublishedTags() const { return published_tags_; }
   const std::vector<uint64_t>& SyncImuTimestamps() const { return sync_imu_timestamps_; }
-  const std::vector<uint64_t>& FinalImuTimestamps() const { return final_imu_timestamps_; }
+  const std::vector<uint64_t>& FinalImuTimestamps() const
+  {
+    return final_imu_timestamps_;
+  }
   const std::vector<uint32_t>& ResetTags() const { return reset_tags_; }
   const std::vector<uint64_t>& HistoryTimestamps() const { return history_timestamps_; }
 
@@ -256,7 +270,8 @@ class SequenceHarness
     accls_.PopFront();
     quats_.PopFront();
 
-    if (!history_.Empty() && imu.sensor_timestamp_us <= history_.Back().sensor_timestamp_us)
+    if (!history_.Empty() &&
+        imu.sensor_timestamp_us <= history_.Back().sensor_timestamp_us)
     {
       const uint64_t previous_timestamp_us = history_.Back().sensor_timestamp_us;
       if (imu.sensor_timestamp_us < previous_timestamp_us &&
@@ -282,11 +297,9 @@ class SequenceHarness
         imu_cadence_.period_us != 0 &&
         imu.sensor_timestamp_us > imu_cadence_.last_timestamp_us)
     {
-      const uint64_t gap_us =
-          imu.sensor_timestamp_us - imu_cadence_.last_timestamp_us;
+      const uint64_t gap_us = imu.sensor_timestamp_us - imu_cadence_.last_timestamp_us;
       const uint32_t stride = MatchPeriodGapStride(
-          gap_us, imu_cadence_.period_us, imu_tolerance_us,
-          max_raw_imu_gap_stride);
+          gap_us, imu_cadence_.period_us, imu_tolerance_us, max_raw_imu_gap_stride);
       if (stride > 1)
       {
         imu_cadence_.last_timestamp_us = imu.sensor_timestamp_us;
@@ -295,8 +308,8 @@ class SequenceHarness
       }
     }
 
-    const auto update = ObserveCadence(imu_cadence_, imu.sensor_timestamp_us,
-                                       stable_gaps, imu_tolerance_us);
+    const auto update = ObserveCadence(imu_cadence_, imu.sensor_timestamp_us, stable_gaps,
+                                       imu_tolerance_us);
     if (update == CadenceUpdate::BROKEN)
     {
       ResetLock();
@@ -318,9 +331,9 @@ class SequenceHarness
         images_.PopFront();
       }
 
-      const Decision decision =
-          mode_ == SyncMode::LATEST_IMU ? ProcessLatest(pending_frame_)
-                                        : ProcessRawProbe(pending_frame_);
+      const Decision decision = mode_ == SyncMode::LATEST_IMU
+                                    ? ProcessLatest(pending_frame_)
+                                    : ProcessRawProbe(pending_frame_);
       if (decision == Decision::WAIT)
       {
         break;
@@ -344,9 +357,8 @@ class SequenceHarness
       return Decision::DONE;
     }
 
-    const Decision decision = image.match.valid
-                                  ? Resume(image)
-                                  : PublishOrRemember(image, LatestMatch());
+    const Decision decision =
+        image.match.valid ? Resume(image) : PublishOrRemember(image, LatestMatch());
     if (decision != Decision::WAIT)
     {
       RememberImage(image.event.sensor_timestamp_us);
@@ -478,8 +490,7 @@ class SequenceHarness
     const bool normal_gap = image_gap_stride == 1;
     const bool dropped_probe_gap =
         old_state == SyncState::PROBE_SENT &&
-        (IsProbeGap(image_gap) ||
-         (probe_ack_seq_ == last_probe_seq_ && !normal_gap));
+        (IsProbeGap(image_gap) || (probe_ack_seq_ == last_probe_seq_ && !normal_gap));
 
     if (dropped_probe_gap)
     {
@@ -497,8 +508,7 @@ class SequenceHarness
     }
     else
     {
-      update =
-          ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
+      update = ObserveCadence(image_cadence_, image_ts, stable_gaps, image_tolerance_us);
     }
     if (image_cadence_.stable)
     {
@@ -571,8 +581,8 @@ class SequenceHarness
       return Decision::WAIT;
     }
 
-    const Imu* sync_imu = FindBySensorTimestamp(
-        history_, probe_ack_timestamp_us_, ImuTimestampToleranceUs(periods_.imu_us));
+    const Imu* sync_imu = FindBySensorTimestamp(history_, probe_ack_timestamp_us_,
+                                                ImuTimestampToleranceUs(periods_.imu_us));
     if (sync_imu == nullptr)
     {
       return Decision::RESET;
@@ -603,8 +613,8 @@ class SequenceHarness
     {
       return Decision::WAIT;
     }
-    const Imu* sync_imu =
-        FindBySensorTimestamp(history_, expected, ImuTimestampToleranceUs(periods_.imu_us));
+    const Imu* sync_imu = FindBySensorTimestamp(history_, expected,
+                                                ImuTimestampToleranceUs(periods_.imu_us));
     if (sync_imu == nullptr)
     {
       return Decision::RESET;
@@ -639,8 +649,8 @@ class SequenceHarness
       return Decision::WAIT;
     }
 
-    const Imu* final_imu =
-        FindBySensorTimestamp(history_, final_ts, ImuTimestampToleranceUs(periods_.imu_us));
+    const Imu* final_imu = FindBySensorTimestamp(
+        history_, final_ts, ImuTimestampToleranceUs(periods_.imu_us));
     if (final_imu == nullptr)
     {
       return Decision::RESET;
@@ -659,8 +669,7 @@ class SequenceHarness
 
   uint64_t EstimatedSyncPeriod() const
   {
-    const uint32_t stride =
-        EstimateStrideSamples(periods_.image_us, periods_.imu_us);
+    const uint32_t stride = EstimateStrideSamples(periods_.image_us, periods_.imu_us);
     return stride == 0 ? 0 : periods_.imu_us * static_cast<uint64_t>(stride);
   }
 
@@ -710,8 +719,8 @@ class SequenceHarness
 
   bool IsNormalGap(uint64_t gap_us) const
   {
-    return periods_.image_us != 0 && AbsDiffUs(gap_us, periods_.image_us) <=
-                                         ImageGapToleranceUs(periods_.image_us);
+    return periods_.image_us != 0 &&
+           AbsDiffUs(gap_us, periods_.image_us) <= ImageGapToleranceUs(periods_.image_us);
   }
 
   uint32_t MatchNormalGapStride(uint64_t gap_us) const
@@ -722,8 +731,8 @@ class SequenceHarness
   bool IsProbeGap(uint64_t gap_us) const
   {
     const uint64_t expected = ProbeImageGapUs(periods_.image_us, probe_div);
-    return expected != 0 && AbsDiffUs(gap_us, expected) <=
-                                ImageGapToleranceUs(periods_.image_us);
+    return expected != 0 &&
+           AbsDiffUs(gap_us, expected) <= ImageGapToleranceUs(periods_.image_us);
   }
 
   void RememberImage(uint64_t timestamp_us)
@@ -801,8 +810,8 @@ class StreamDriver
     const uint32_t probe_count = harness_.ProbeSentCount();
     probe_gap_armed_ = probe_count != last_probe_count_;
     last_probe_count_ = probe_count;
-    next_gap_us_ = probe_gap_armed_ ? ProbeImageGapUs(image_period_us_, 3)
-                                    : image_period_us_;
+    next_gap_us_ =
+        probe_gap_armed_ ? ProbeImageGapUs(image_period_us_, 3) : image_period_us_;
     next_image_timestamp_us_ = image_ts + next_gap_us_;
   }
 
@@ -812,7 +821,10 @@ class StreamDriver
     next_gap_us_ = gap_us;
   }
 
-  void RememberLastImage(uint64_t timestamp_us) { last_image_timestamp_us_ = timestamp_us; }
+  void RememberLastImage(uint64_t timestamp_us)
+  {
+    last_image_timestamp_us_ = timestamp_us;
+  }
   uint64_t NextImageTimestamp() const { return next_image_timestamp_us_; }
   uint64_t NextImuTimestamp() const { return next_imu_timestamp_us_; }
   uint64_t ImuPeriodUs() const { return imu_period_us_; }
@@ -852,10 +864,7 @@ class StreamDriver
   bool probe_gap_armed_{false};
 };
 
-[[noreturn]] void Fail(const std::string& message)
-{
-  throw std::runtime_error(message);
-}
+[[noreturn]] void Fail(const std::string& message) { throw std::runtime_error(message); }
 
 void Expect(bool condition, const std::string& message)
 {
@@ -866,7 +875,8 @@ void Expect(bool condition, const std::string& message)
 }
 
 template <typename Actual, typename Expected>
-void ExpectEqual(const Actual& actual, const Expected& expected, const std::string& message)
+void ExpectEqual(const Actual& actual, const Expected& expected,
+                 const std::string& message)
 {
   if (!(actual == expected))
   {
@@ -1052,7 +1062,8 @@ void TestLostProbeCommandRetriesAndLocks()
 {
   SequenceHarness harness;
   uint64_t next_raw = 2000;
-  auto push_raw_until = [&](uint64_t timestamp_us) {
+  auto push_raw_until = [&](uint64_t timestamp_us)
+  {
     while (next_raw <= timestamp_us)
     {
       harness.PushRawImu(next_raw);
@@ -1075,8 +1086,7 @@ void TestLostProbeCommandRetriesAndLocks()
     harness.PushImage(image_ts, static_cast<uint32_t>(image_ts / 10000));
     harness.Drain();
   }
-  ExpectEqual(harness.ProbeSentCount(), 2U,
-              "probe 命令或回执丢失后应超时重发");
+  ExpectEqual(harness.ProbeSentCount(), 2U, "probe 命令或回执丢失后应超时重发");
   ExpectEqual(harness.State(), SyncState::PROBE_SENT, "重发后应等待新的回执");
 
   push_raw_until(160000);
@@ -1084,8 +1094,7 @@ void TestLostProbeCommandRetriesAndLocks()
   harness.PushImage(160000, 16);
   harness.Drain();
 
-  ExpectEqual(harness.State(), SyncState::SYNCED,
-              "重发 probe 收到回执后应重新锁定同步");
+  ExpectEqual(harness.State(), SyncState::SYNCED, "重发 probe 收到回执后应重新锁定同步");
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{16},
                     "重发 probe 的图像应正常发布");
 }
@@ -1159,8 +1168,7 @@ void TestAckedTransitionGapLocks()
   harness.PushImage(50000, 4);
   harness.Drain();
 
-  ExpectEqual(harness.State(), SyncState::SYNCED,
-              "带回执的分频切换过渡 gap 应完成同步");
+  ExpectEqual(harness.State(), SyncState::SYNCED, "带回执的分频切换过渡 gap 应完成同步");
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4},
                     "过渡 gap 对应图像应作为 probe 图像发布");
 }
@@ -1209,12 +1217,10 @@ void TestDroppedPublishedImageKeepsSync()
   harness.PushImage(80000, 5);
   harness.Drain();
 
-  ExpectEqual(harness.State(), SyncState::SYNCED,
-              "发布失败的单帧不应打断同步");
+  ExpectEqual(harness.State(), SyncState::SYNCED, "发布失败的单帧不应打断同步");
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4, 5},
                     "丢帧不发布，但下一帧应正常发布");
-  ExpectVectorEqual(harness.SyncImuTimestamps(),
-                    std::vector<uint64_t>{60000, 80000},
+  ExpectVectorEqual(harness.SyncImuTimestamps(), std::vector<uint64_t>{60000, 80000},
                     "丢帧后锁定 IMU 基线应跳过被丢弃的一帧");
 }
 
@@ -1241,12 +1247,10 @@ void TestConsecutiveDroppedImagesKeepSync()
   harness.PushImage(90000, 5);
   harness.Drain();
 
-  ExpectEqual(harness.State(), SyncState::SYNCED,
-              "连续发布失败的图像不应打断同步");
+  ExpectEqual(harness.State(), SyncState::SYNCED, "连续发布失败的图像不应打断同步");
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4, 5},
                     "连续丢帧不发布，但恢复后的图像应正常发布");
-  ExpectVectorEqual(harness.SyncImuTimestamps(),
-                    std::vector<uint64_t>{60000, 90000},
+  ExpectVectorEqual(harness.SyncImuTimestamps(), std::vector<uint64_t>{60000, 90000},
                     "连续丢帧后锁定 IMU 基线应逐帧跳过");
 }
 
@@ -1271,12 +1275,10 @@ void TestSkippedPublishedImageGapKeepsSync()
   harness.PushImage(80000, 5);
   harness.Drain();
 
-  ExpectEqual(harness.State(), SyncState::SYNCED,
-              "同步态整数倍图像 gap 不应打断同步");
+  ExpectEqual(harness.State(), SyncState::SYNCED, "同步态整数倍图像 gap 不应打断同步");
   ExpectVectorEqual(harness.PublishedTags(), std::vector<uint32_t>{4, 5},
                     "跳过一帧后下一张成功图像应正常发布");
-  ExpectVectorEqual(harness.SyncImuTimestamps(),
-                    std::vector<uint64_t>{60000, 80000},
+  ExpectVectorEqual(harness.SyncImuTimestamps(), std::vector<uint64_t>{60000, 80000},
                     "整数倍图像 gap 应按倍数推进 IMU 同步点");
 }
 
@@ -1359,8 +1361,7 @@ void TestRawImuSmallRollbackDoesNotResetEpoch()
   harness.PushRawImu(101500);
   harness.Drain();
 
-  ExpectVectorEqual(harness.HistoryTimestamps(),
-                    std::vector<uint64_t>{100000, 102000},
+  ExpectVectorEqual(harness.HistoryTimestamps(), std::vector<uint64_t>{100000, 102000},
                     "小幅乱序不能当作设备 epoch 重启清空历史");
 }
 
@@ -1378,6 +1379,68 @@ void TestCompositeResetAndRelock()
   EmitWarmup(driver, 8);
   ExpectEqual(harness.State(), SyncState::SYNCED, "恢复稳定后应重新同步");
   ExpectEqual(harness.ProbeSentCount(), 2U, "复合同步场景应发第二次 probe");
+}
+
+void TestGeometryLockSequence()
+{
+  GeometryLockState<TestGeometry> lock;
+  const TestGeometry original{.epoch = 7, .roi_offset_x_native = 20};
+
+  auto outcome = CheckAndLockGeometry(lock, TestGeometry{}, false, SameTestGeometry);
+  ExpectEqual(outcome, GeometryLockOutcome::REJECT_INVALID,
+              "invalid first geometry must be rejected");
+  ExpectEqual(lock.locked, false, "invalid first geometry must not acquire the lock");
+
+  outcome = CheckAndLockGeometry(lock, original, true, SameTestGeometry);
+  ExpectEqual(outcome, GeometryLockOutcome::LOCKED,
+              "first valid geometry must acquire the lock");
+  ExpectEqual(lock.locked, true, "valid first geometry must leave the lock active");
+  ExpectEqual(lock.geometry.epoch, original.epoch,
+              "the lock must retain the original epoch");
+  ExpectEqual(lock.geometry.roi_offset_x_native, original.roi_offset_x_native,
+              "the lock must retain the original fields");
+
+  outcome = CheckAndLockGeometry(lock, original, true, SameTestGeometry);
+  ExpectEqual(outcome, GeometryLockOutcome::MATCHED,
+              "an exact geometry match must be accepted");
+
+  const auto expect_rejected_without_changing_lock =
+      [&](const TestGeometry& candidate, bool valid, GeometryLockOutcome expected,
+          const char* message)
+  {
+    const auto rejected = CheckAndLockGeometry(lock, candidate, valid, SameTestGeometry);
+    ExpectEqual(rejected, expected, message);
+    ExpectEqual(lock.locked, true, "a rejection must not release the original lock");
+    ExpectEqual(lock.geometry.epoch, original.epoch,
+                "a rejection must not replace the original epoch");
+    ExpectEqual(lock.geometry.roi_offset_x_native, original.roi_offset_x_native,
+                "a rejection must not replace the original fields");
+    ExpectEqual(CheckAndLockGeometry(lock, original, true, SameTestGeometry),
+                GeometryLockOutcome::MATCHED,
+                "the original geometry must remain valid after a rejection");
+  };
+
+  expect_rejected_without_changing_lock(
+      TestGeometry{}, false, GeometryLockOutcome::REJECT_INVALID,
+      "an invalid geometry must not replace an existing lock");
+
+  auto changed_same_epoch = original;
+  changed_same_epoch.roi_offset_x_native += 1;
+  expect_rejected_without_changing_lock(changed_same_epoch, true,
+                                        GeometryLockOutcome::REJECT_CHANGED,
+                                        "a same-epoch field mutation must be rejected");
+
+  auto older_epoch = original;
+  older_epoch.epoch -= 1;
+  expect_rejected_without_changing_lock(older_epoch, true,
+                                        GeometryLockOutcome::REJECT_CHANGED,
+                                        "an older epoch must be rejected");
+
+  auto newer_epoch = original;
+  newer_epoch.epoch += 1;
+  expect_rejected_without_changing_lock(newer_epoch, true,
+                                        GeometryLockOutcome::REJECT_CHANGED,
+                                        "a newer epoch must be rejected");
 }
 
 using TestFn = void (*)();
@@ -1411,6 +1474,7 @@ int main()
       {"raw-imu/epoch重启后重锁", TestRawImuEpochResetClearsHistoryAndRelocks},
       {"raw-imu/小幅乱序不清epoch", TestRawImuSmallRollbackDoesNotResetEpoch},
       {"composite/断裂后重锁", TestCompositeResetAndRelock},
+      {"geometry/锁定与拒绝顺序", TestGeometryLockSequence},
   };
 
   try

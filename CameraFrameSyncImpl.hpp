@@ -3,18 +3,18 @@
 /**
  * @brief 使用默认 RAW_PROBE 运行参数构造同步模块。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-CameraFrameSync<CameraInfoV>::CameraFrameSync(
+template <CameraTypes::FrameLayout FrameLayoutV>
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
     LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-    typename CameraFrameSync<CameraInfoV>::Base* camera)
+    typename CameraFrameSync<FrameLayoutV>::Base* camera)
     : CameraFrameSync(hw, app, camera, RuntimeParam{})
 {
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-CameraFrameSync<CameraInfoV>::CameraFrameSync(
+template <CameraTypes::FrameLayout FrameLayoutV>
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
     LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-    typename CameraFrameSync<CameraInfoV>::Base& camera)
+    typename CameraFrameSync<FrameLayoutV>::Base& camera)
     : CameraFrameSync(hw, app, &camera, RuntimeParam{})
 {
 }
@@ -22,14 +22,15 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
 /**
  * @brief 完成 topic、图像槽位、CameraBase sink 与原始 IMU 回调绑定。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-CameraFrameSync<CameraInfoV>::CameraFrameSync(
+template <CameraTypes::FrameLayout FrameLayoutV>
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
     LibXR::HardwareContainer&, LibXR::ApplicationManager& app,
-    typename CameraFrameSync<CameraInfoV>::Base* camera,
-    typename CameraFrameSync<CameraInfoV>::RuntimeParam runtime)
+    typename CameraFrameSync<FrameLayoutV>::Base* camera,
+    typename CameraFrameSync<FrameLayoutV>::RuntimeParam runtime)
 {
   ASSERT(camera != nullptr);
 
+  calibration_ = camera->Calibration();
   topics_.emplace(*camera, runtime);
   callbacks_.emplace(this);
   gyro_ingress_.emplace(imu_ingress_length);
@@ -84,21 +85,20 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
   SendResetToDefaultCommand();
 
   XR_LOG_INFO(
-      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s mode=%s raw_imu_frame=%s target_trigger_hz=%.3f",
+      "CameraFrameSync: enabled raw_prefix=%s domain=%s image=%s imu=%s raw=%s/%s/%s "
+      "mode=%s raw_imu_frame=%s target_trigger_hz=%.3f",
       topics_->raw_imu_prefix.c_str(), topics_->host_domain_name.c_str(),
-      topics_->image_name.c_str(), topics_->imu_name.c_str(),
-      topics_->gyro_name.c_str(), topics_->accl_name.c_str(),
-      topics_->quat_name.c_str(), SyncModeName(sync_mode_),
-      RawImuFrameName(raw_imu_frame_),
-      static_cast<double>(target_trigger_hz_));
+      topics_->image_name.c_str(), topics_->imu_name.c_str(), topics_->gyro_name.c_str(),
+      topics_->accl_name.c_str(), topics_->quat_name.c_str(), SyncModeName(sync_mode_),
+      RawImuFrameName(raw_imu_frame_), static_cast<double>(target_trigger_hz_));
   app.Register(*this);
 }
 
-template <CameraTypes::CameraInfo CameraInfoV>
-CameraFrameSync<CameraInfoV>::CameraFrameSync(
+template <CameraTypes::FrameLayout FrameLayoutV>
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
     LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-    typename CameraFrameSync<CameraInfoV>::Base& camera,
-    typename CameraFrameSync<CameraInfoV>::RuntimeParam runtime)
+    typename CameraFrameSync<FrameLayoutV>::Base& camera,
+    typename CameraFrameSync<FrameLayoutV>::RuntimeParam runtime)
     : CameraFrameSync(hw, app, &camera, runtime)
 {
 }
@@ -106,8 +106,8 @@ CameraFrameSync<CameraInfoV>::CameraFrameSync(
 /**
  * @brief 输出上一监控周期内的相机、IMU 和同步帧统计。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::OnMonitor()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::OnMonitor()
 {
   const uint64_t raw_gyro =
       monitor_raw_gyro_count_.exchange(0, std::memory_order_relaxed);
@@ -145,9 +145,10 @@ void CameraFrameSync<CameraInfoV>::OnMonitor()
   }
 
   XR_LOG_INFO(
-      "CameraFrameSync monitor: mode=%s state=%s raw_imu=%llu/%llu/%llu assembled=%llu image=%llu pub=%llu drop=%llu synced=%llu reset=%llu overflow=%llu image_period_us=%llu imu_period_us=%llu sync_period_us=%llu",
-      SyncModeName(mode), StateName(state),
-      static_cast<unsigned long long>(raw_gyro),
+      "CameraFrameSync monitor: mode=%s state=%s raw_imu=%llu/%llu/%llu assembled=%llu "
+      "image=%llu pub=%llu drop=%llu synced=%llu reset=%llu overflow=%llu "
+      "image_period_us=%llu imu_period_us=%llu sync_period_us=%llu",
+      SyncModeName(mode), StateName(state), static_cast<unsigned long long>(raw_gyro),
       static_cast<unsigned long long>(raw_accl),
       static_cast<unsigned long long>(raw_quat),
       static_cast<unsigned long long>(assembled_imu),
@@ -165,8 +166,8 @@ void CameraFrameSync<CameraInfoV>::OnMonitor()
 /**
  * @brief 返回共享图像 topic 名称。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::ImageTopicName() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::ImageTopicName() const
 {
   return topics_.has_value() ? topics_->image_name.c_str() : "";
 }
@@ -174,8 +175,8 @@ const char* CameraFrameSync<CameraInfoV>::ImageTopicName() const
 /**
  * @brief 返回同步后 IMU topic 名称。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::ImuTopicName() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::ImuTopicName() const
 {
   return topics_.has_value() ? topics_->imu_name.c_str() : "";
 }
@@ -183,8 +184,8 @@ const char* CameraFrameSync<CameraInfoV>::ImuTopicName() const
 /**
  * @brief 返回 Host topic domain 名称。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::HostTopicDomainName() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::HostTopicDomainName() const
 {
   return topics_.has_value() ? topics_->host_domain_name.c_str() : "";
 }
@@ -192,9 +193,9 @@ const char* CameraFrameSync<CameraInfoV>::HostTopicDomainName() const
 /**
  * @brief 读取当前同步模式。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::SyncMode
-CameraFrameSync<CameraInfoV>::GetSyncMode() const
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::SyncMode
+CameraFrameSync<FrameLayoutV>::GetSyncMode() const
 {
   return sync_mode_;
 }
@@ -202,8 +203,8 @@ CameraFrameSync<CameraInfoV>::GetSyncMode() const
 /**
  * @brief 设置最终 IMU 选择 offset。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::SetOffsetUs(int32_t offset_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::SetOffsetUs(int32_t offset_us)
 {
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   offset_us_ = offset_us;
@@ -212,9 +213,9 @@ void CameraFrameSync<CameraInfoV>::SetOffsetUs(int32_t offset_us)
 /**
  * @brief 切换同步模式并清空旧模式留下的运行时关系。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::SetSyncMode(
-    typename CameraFrameSync<CameraInfoV>::SyncMode mode)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::SetSyncMode(
+    typename CameraFrameSync<FrameLayoutV>::SyncMode mode)
 {
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   if (!topics_.has_value())
@@ -237,9 +238,9 @@ void CameraFrameSync<CameraInfoV>::SetSyncMode(
 /**
  * @brief 将同步模式转成日志字符串。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::SyncModeName(
-    typename CameraFrameSync<CameraInfoV>::SyncMode mode)
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::SyncModeName(
+    typename CameraFrameSync<FrameLayoutV>::SyncMode mode)
 {
   switch (mode)
   {
@@ -254,9 +255,9 @@ const char* CameraFrameSync<CameraInfoV>::SyncModeName(
 /**
  * @brief 将 RAW_PROBE 状态转成日志字符串。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::StateName(
-    typename CameraFrameSync<CameraInfoV>::SyncState state)
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::StateName(
+    typename CameraFrameSync<FrameLayoutV>::SyncState state)
 {
   switch (state)
   {
@@ -273,9 +274,9 @@ const char* CameraFrameSync<CameraInfoV>::StateName(
 /**
  * @brief 将原始 IMU 坐标系转成日志字符串。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-const char* CameraFrameSync<CameraInfoV>::RawImuFrameName(
-    typename CameraFrameSync<CameraInfoV>::RawImuFrame frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+const char* CameraFrameSync<FrameLayoutV>::RawImuFrameName(
+    typename CameraFrameSync<FrameLayoutV>::RawImuFrame frame)
 {
   switch (frame)
   {
@@ -290,11 +291,11 @@ const char* CameraFrameSync<CameraInfoV>::RawImuFrameName(
 /**
  * @brief 把 MCU 侧三轴向量规整成 Host 侧平铺数组。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImuVector
-CameraFrameSync<CameraInfoV>::ToImuVector(
-    const typename CameraFrameSync<CameraInfoV>::RawImuVector& data,
-    typename CameraFrameSync<CameraInfoV>::RawImuFrame raw_imu_frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImuVector
+CameraFrameSync<FrameLayoutV>::ToImuVector(
+    const typename CameraFrameSync<FrameLayoutV>::RawImuVector& data,
+    typename CameraFrameSync<FrameLayoutV>::RawImuFrame raw_imu_frame)
 {
   switch (raw_imu_frame)
   {
@@ -309,11 +310,11 @@ CameraFrameSync<CameraInfoV>::ToImuVector(
 /**
  * @brief 把 MCU 侧四元数规整成 Host 侧 wxyz 数组。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::QuatSample
-CameraFrameSync<CameraInfoV>::ToQuatSample(
-    const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data,
-    typename CameraFrameSync<CameraInfoV>::RawImuFrame raw_imu_frame)
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::QuatSample
+CameraFrameSync<FrameLayoutV>::ToQuatSample(
+    const typename CameraFrameSync<FrameLayoutV>::RawQuatSample& data,
+    typename CameraFrameSync<FrameLayoutV>::RawImuFrame raw_imu_frame)
 {
   switch (raw_imu_frame)
   {
@@ -328,8 +329,8 @@ CameraFrameSync<CameraInfoV>::ToQuatSample(
 /**
  * @brief 从共享图像 topic 获取第一块 CameraBase 可写槽位。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::AcquireInitialWritableImage()
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::AcquireInitialWritableImage()
 {
   if (topics_->image.CreateData(current_image_) != LibXR::ErrorCode::OK)
   {
@@ -341,10 +342,10 @@ bool CameraFrameSync<CameraInfoV>::AcquireInitialWritableImage()
 /**
  * @brief CameraBase sink 回调适配层。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::CommitImageAdapter(
-    bool, CameraFrameSync<CameraInfoV>* self,
-    typename CameraFrameSync<CameraInfoV>::ImageFrame*& next_image)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::CommitImageAdapter(
+    bool, CameraFrameSync<FrameLayoutV>* self,
+    typename CameraFrameSync<FrameLayoutV>::ImageFrame*& next_image)
 {
   next_image = self->CommitImageAndLeaseNext();
 }
@@ -352,9 +353,9 @@ void CameraFrameSync<CameraInfoV>::CommitImageAdapter(
 /**
  * @brief 发布当前槽位图像，并把下一块槽位交给 CameraBase 继续写。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-typename CameraFrameSync<CameraInfoV>::ImageFrame*
-CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
+template <CameraTypes::FrameLayout FrameLayoutV>
+typename CameraFrameSync<FrameLayoutV>::ImageFrame*
+CameraFrameSync<FrameLayoutV>::CommitImageAndLeaseNext()
 {
   ImageFrame* committed_image = current_image_.GetData();
   if (committed_image == nullptr)
@@ -366,12 +367,45 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
       static_cast<uint64_t>(committed_image->timestamp_us);
   monitor_image_input_count_.fetch_add(1, std::memory_order_relaxed);
 
+  const auto& geometry = committed_image->geometry;
+  const bool geometry_valid =
+      CameraTypes::ValidateFrameGeometry(frame_layout, calibration_, geometry);
+  const auto geometry_outcome = CameraFrameSyncCore::CheckAndLockGeometry(
+      geometry_lock_, geometry, geometry_valid,
+      [](const FrameGeometry& lhs, const FrameGeometry& rhs)
+      { return CameraTypes::SameFrameGeometry(lhs, rhs); });
+  if (geometry_outcome == CameraFrameSyncCore::GeometryLockOutcome::REJECT_INVALID ||
+      geometry_outcome == CameraFrameSyncCore::GeometryLockOutcome::REJECT_CHANGED)
+  {
+    if (!geometry_reject_logged_)
+    {
+      XR_LOG_ERROR(
+          "CameraFrameSync: rejected frame geometry valid=%d epoch=%u expected_epoch=%u "
+          "size=%ux%u step=%u offset=%u,%u decimation=%u,%u flags=0x%x",
+          geometry_valid ? 1 : 0, static_cast<unsigned>(geometry.epoch),
+          static_cast<unsigned>(geometry_lock_.geometry.epoch),
+          static_cast<unsigned>(geometry.width), static_cast<unsigned>(geometry.height),
+          static_cast<unsigned>(geometry.step),
+          static_cast<unsigned>(geometry.roi_offset_x_native),
+          static_cast<unsigned>(geometry.roi_offset_y_native),
+          static_cast<unsigned>(geometry.decimation_x),
+          static_cast<unsigned>(geometry.decimation_y),
+          static_cast<unsigned>(geometry.flags));
+      geometry_reject_logged_ = true;
+    }
+    monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
+    AutoAimReplayBenchmark::RecordSyncDrop();
+    ProcessDroppedImage(image_timestamp_us);
+    return committed_image;
+  }
+
   ImageData next_image;
   if (topics_->image.CreateData(next_image) != LibXR::ErrorCode::OK ||
       next_image.GetData() == nullptr)
   {
     // 没有新槽位时当前图像无法发布，但仍是一次真实相机帧到达。
     monitor_image_drop_count_.fetch_add(1, std::memory_order_relaxed);
+    AutoAimReplayBenchmark::RecordSyncDrop();
     ProcessDroppedImage(image_timestamp_us);
     return committed_image;
   }
@@ -399,14 +433,14 @@ CameraFrameSync<CameraInfoV>::CommitImageAndLeaseNext()
 /**
  * @brief gyro topic 回调：转换数据后写入无锁入口队列。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::OnGyroStatic(
-    bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
-    const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::OnGyroStatic(
+    bool, CameraFrameSync<FrameLayoutV>* self, LibXR::MicrosecondTimestamp timestamp,
+    const typename CameraFrameSync<FrameLayoutV>::RawImuVector& data)
 {
-  const GyroSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                          .angular_velocity_xyz =
-                              ToImuVector(data, self->raw_imu_frame_)};
+  const GyroSample sample{
+      .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+      .angular_velocity_xyz = ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_gyro_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->gyro_ingress_->Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -419,14 +453,14 @@ void CameraFrameSync<CameraInfoV>::OnGyroStatic(
 /**
  * @brief accl topic 回调：转换数据后写入无锁入口队列。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::OnAcclStatic(
-    bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
-    const typename CameraFrameSync<CameraInfoV>::RawImuVector& data)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::OnAcclStatic(
+    bool, CameraFrameSync<FrameLayoutV>* self, LibXR::MicrosecondTimestamp timestamp,
+    const typename CameraFrameSync<FrameLayoutV>::RawImuVector& data)
 {
-  const AcclSample sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                          .linear_acceleration_xyz =
-                              ToImuVector(data, self->raw_imu_frame_)};
+  const AcclSample sample{
+      .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
+      .linear_acceleration_xyz = ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_accl_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->accl_ingress_->Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -439,14 +473,13 @@ void CameraFrameSync<CameraInfoV>::OnAcclStatic(
 /**
  * @brief quat topic 回调：转换数据后写入无锁入口队列。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::OnQuatStatic(
-    bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
-    const typename CameraFrameSync<CameraInfoV>::RawQuatSample& data)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::OnQuatStatic(
+    bool, CameraFrameSync<FrameLayoutV>* self, LibXR::MicrosecondTimestamp timestamp,
+    const typename CameraFrameSync<FrameLayoutV>::RawQuatSample& data)
 {
   const QuatReading sample{.sensor_timestamp_us = static_cast<uint64_t>(timestamp),
-                           .rotation_wxyz =
-                               ToQuatSample(data, self->raw_imu_frame_)};
+                           .rotation_wxyz = ToQuatSample(data, self->raw_imu_frame_)};
   self->monitor_raw_quat_count_.fetch_add(1, std::memory_order_relaxed);
   if (self->quat_ingress_->Push(sample) != LibXR::ErrorCode::OK)
   {
@@ -459,9 +492,9 @@ void CameraFrameSync<CameraInfoV>::OnQuatStatic(
 /**
  * @brief CameraSync 回执回调：只记录当前 active probe 的匹配 timestamp。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
-    bool, CameraFrameSync<CameraInfoV>* self, LibXR::MicrosecondTimestamp timestamp,
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::OnSyncResultStatic(
+    bool, CameraFrameSync<FrameLayoutV>* self, LibXR::MicrosecondTimestamp timestamp,
     const CameraSync::SyncEvent& event)
 {
   if (event.run_trigger_div == 0)
@@ -489,13 +522,12 @@ void CameraFrameSync<CameraInfoV>::OnSyncResultStatic(
 /**
  * @brief 图像发布成功后的主同步入口。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ProcessCommittedImage(uint64_t image_timestamp_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ProcessCommittedImage(uint64_t image_timestamp_us)
 {
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   CollectIncomingTopics();
-  if (image_events_->PushBackDropOldest(
-          {.sensor_timestamp_us = image_timestamp_us}))
+  if (image_events_->PushBackDropOldest({.sensor_timestamp_us = image_timestamp_us}))
   {
     monitor_overflow_count_.fetch_add(1, std::memory_order_relaxed);
     overflowed_.store(true, std::memory_order_relaxed);
@@ -507,8 +539,8 @@ void CameraFrameSync<CameraInfoV>::ProcessCommittedImage(uint64_t image_timestam
 /**
  * @brief 没有新图像事件时，仍推进 IMU 组装和挂起帧等待。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ProcessSyncWorkWithoutImage()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ProcessSyncWorkWithoutImage()
 {
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   CollectIncomingTopics();
@@ -519,8 +551,8 @@ void CameraFrameSync<CameraInfoV>::ProcessSyncWorkWithoutImage()
 /**
  * @brief 图像未发布时，维护内部时间点但不发布同步 IMU。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ProcessDroppedImage(uint64_t image_timestamp_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ProcessDroppedImage(uint64_t image_timestamp_us)
 {
   LibXR::Mutex::LockGuard lock(sync_state_mutex_);
   CollectIncomingTopics();
@@ -532,12 +564,19 @@ void CameraFrameSync<CameraInfoV>::ProcessDroppedImage(uint64_t image_timestamp_
 /**
  * @brief 把 topic 回调入口队列搬运到状态机 pending 队列。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::CollectIncomingTopics()
 {
+  // LATEST_IMU assembles quaternion-only samples. Drain the unused vector
+  // channels without retaining them, or their pending queues grow forever.
+  const bool retain_raw_vectors = sync_mode_ != SyncMode::LATEST_IMU;
   GyroSample gyro{};
   while (gyro_ingress_->Pop(gyro) == LibXR::ErrorCode::OK)
   {
+    if (!retain_raw_vectors)
+    {
+      continue;
+    }
     if (pending_gyros_->PushBackDropOldest(gyro))
     {
       // pending 队列丢旧样本后，同步关系已经不可信，交给统一恢复处理。
@@ -549,6 +588,10 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
   AcclSample accl{};
   while (accl_ingress_->Pop(accl) == LibXR::ErrorCode::OK)
   {
+    if (!retain_raw_vectors)
+    {
+      continue;
+    }
     if (pending_accls_->PushBackDropOldest(accl))
     {
       // pending 队列丢旧样本后，同步关系已经不可信，交给统一恢复处理。
@@ -574,8 +617,8 @@ void CameraFrameSync<CameraInfoV>::CollectIncomingTopics()
 /**
  * @brief 连续组装所有当前可闭合的 IMU 样本。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::AssembleImuHistory()
 {
   while (TryAssembleOneImu())
   {
@@ -585,8 +628,8 @@ void CameraFrameSync<CameraInfoV>::AssembleImuHistory()
 /**
  * @brief 以 gyro timestamp 为主键尝试组装一帧完整 IMU。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
+template <CameraTypes::FrameLayout FrameLayoutV>
+bool CameraFrameSync<FrameLayoutV>::TryAssembleOneImu()
 {
   if (sync_mode_ == SyncMode::LATEST_IMU)
   {
@@ -608,8 +651,7 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
     if (!imu_history_->Empty() &&
         imu.sensor_timestamp_us <= imu_history_->Back().sensor_timestamp_us)
     {
-      const uint64_t previous_timestamp_us =
-          imu_history_->Back().sensor_timestamp_us;
+      const uint64_t previous_timestamp_us = imu_history_->Back().sensor_timestamp_us;
       if (imu.sensor_timestamp_us < previous_timestamp_us &&
           previous_timestamp_us - imu.sensor_timestamp_us >=
               raw_imu_epoch_reset_backward_us)
@@ -642,15 +684,13 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
   AcclSample queued_accl{};
   // 当前 DevC 固件把 gyro/accl/quat 都写成同一个 gyro interrupt timestamp。
   // 因此 raw 三通道 join 保持 exact；不匹配代表某个通道缺了这一拍。
-  while (pending_accls_->Front(queued_accl) &&
-         queued_accl.sensor_timestamp_us < gyro_ts)
+  while (pending_accls_->Front(queued_accl) && queued_accl.sensor_timestamp_us < gyro_ts)
   {
     pending_accls_->PopFront();
   }
 
   QuatReading queued_quat{};
-  while (pending_quats_->Front(queued_quat) &&
-         queued_quat.sensor_timestamp_us < gyro_ts)
+  while (pending_quats_->Front(queued_quat) && queued_quat.sensor_timestamp_us < gyro_ts)
   {
     pending_quats_->PopFront();
   }
@@ -685,8 +725,7 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
   if (!imu_history_->Empty() &&
       imu.sensor_timestamp_us <= imu_history_->Back().sensor_timestamp_us)
   {
-    const uint64_t previous_timestamp_us =
-        imu_history_->Back().sensor_timestamp_us;
+    const uint64_t previous_timestamp_us = imu_history_->Back().sensor_timestamp_us;
     if (imu.sensor_timestamp_us < previous_timestamp_us &&
         previous_timestamp_us - imu.sensor_timestamp_us >=
             raw_imu_epoch_reset_backward_us)
@@ -707,8 +746,8 @@ bool CameraFrameSync<CameraInfoV>::TryAssembleOneImu()
 /**
  * @brief 接受一帧单调递增的完整 raw IMU。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::AcceptAssembledImu(const AssembledImu& imu)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::AcceptAssembledImu(const AssembledImu& imu)
 {
   imu_history_->PushBackDropOldest(imu);
   monitor_assembled_imu_count_.fetch_add(1, std::memory_order_relaxed);
@@ -718,14 +757,13 @@ void CameraFrameSync<CameraInfoV>::AcceptAssembledImu(const AssembledImu& imu)
 /**
  * @brief raw IMU 时间戳大幅回退时，按设备/USB 流重启切换到新 epoch。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ResetRawImuEpoch(
-    uint64_t previous_timestamp_us, const AssembledImu& first_imu)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetRawImuEpoch(uint64_t previous_timestamp_us,
+                                                     const AssembledImu& first_imu)
 {
-  XR_LOG_WARN(
-      "CameraFrameSync: raw IMU timestamp epoch reset previous=%llu current=%llu",
-      static_cast<unsigned long long>(previous_timestamp_us),
-      static_cast<unsigned long long>(first_imu.sensor_timestamp_us));
+  XR_LOG_WARN("CameraFrameSync: raw IMU timestamp epoch reset previous=%llu current=%llu",
+              static_cast<unsigned long long>(previous_timestamp_us),
+              static_cast<unsigned long long>(first_imu.sensor_timestamp_us));
   ResetRuntimeState();
   AcceptAssembledImu(first_imu);
 }
@@ -733,8 +771,8 @@ void CameraFrameSync<CameraInfoV>::ResetRawImuEpoch(
 /**
  * @brief 观察完整 IMU 帧的发布周期。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
-void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_us)
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ObserveImuCadence(uint64_t sensor_timestamp_us)
 {
   if (sync_mode_ == SyncMode::LATEST_IMU)
   {
@@ -756,13 +794,11 @@ void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_u
   }
 
   if (imu_cadence_.stable && imu_cadence_.has_last_timestamp &&
-      imu_cadence_.period_us != 0 &&
-      sensor_timestamp_us > imu_cadence_.last_timestamp_us)
+      imu_cadence_.period_us != 0 && sensor_timestamp_us > imu_cadence_.last_timestamp_us)
   {
     const uint64_t gap_us = sensor_timestamp_us - imu_cadence_.last_timestamp_us;
     const uint32_t gap_stride = CameraFrameSyncCore::MatchPeriodGapStride(
-        gap_us, imu_cadence_.period_us, imu_cadence_tolerance_us,
-        max_raw_imu_gap_stride);
+        gap_us, imu_cadence_.period_us, imu_cadence_tolerance_us, max_raw_imu_gap_stride);
     if (gap_stride > 1)
     {
       imu_cadence_.last_timestamp_us = sensor_timestamp_us;
@@ -772,8 +808,7 @@ void CameraFrameSync<CameraInfoV>::ObserveImuCadence(uint64_t sensor_timestamp_u
   }
 
   const auto update = CameraFrameSyncCore::ObserveCadence(
-      imu_cadence_, sensor_timestamp_us, cadence_stable_gaps,
-      imu_cadence_tolerance_us);
+      imu_cadence_, sensor_timestamp_us, cadence_stable_gaps, imu_cadence_tolerance_us);
   if (update == CameraFrameSyncCore::CadenceUpdate::BROKEN)
   {
     // IMU 周期破坏会使 RAW_PROBE 的递推周期失效，必须回到观察状态。

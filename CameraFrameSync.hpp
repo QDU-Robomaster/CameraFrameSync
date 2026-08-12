@@ -6,16 +6,11 @@ module_description: 相机共享图像桥与原始 IMU 同步器
 constructor_args:
   camera: '@nullptr'
 template_args:
-  - Info:
-      width: 1280
-      height: 720
-      step: 3840
+  - Layout:
+      width: 720
+      height: 540
+      step: 2160
       encoding: CameraTypes::Encoding::BGR8
-      camera_matrix: [800.0, 0.0, 640.0, 0.0, 800.0, 360.0, 0.0, 0.0, 1.0]
-      distortion_model: CameraTypes::DistortionModel::PLUMB_BOB
-      distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
-      rectification_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-      projection_matrix: [800.0, 0.0, 640.0, 0.0, 0.0, 800.0, 360.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 required_hardware: []
 depends:
   - qdu-future/CameraBase
@@ -33,10 +28,11 @@ depends:
 #include <utility>
 
 #include "CameraBase.hpp"
-#include "CameraSync.hpp"
-#include "app_framework.hpp"
 #include "CameraFrameSyncCore.hpp"
 #include "CameraFrameSyncSubscriber.hpp"
+#include "CameraSync.hpp"
+#include "ReplayBenchmark.hpp"
+#include "app_framework.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
 #include "logger.hpp"
@@ -56,7 +52,7 @@ enum class CameraFrameSyncMode : uint8_t
  */
 enum class CameraFrameSyncRawImuFrame : uint8_t
 {
-  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,  ///< 已经是公开本体系 B：x 右、y 前、z 上。
+  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,    ///< 已经是公开本体系 B：x 右、y 前、z 上。
   X_FORWARD_Y_LEFT_Z_UP_TO_BODY = 1,  ///< 原始 x 前、y 左、z 上，转换到公开本体系 B。
 };
 
@@ -67,19 +63,20 @@ enum class CameraFrameSyncRawImuFrame : uint8_t
  * 完整同步状态机仍然在图像提交时串行推进。
  * RAW_PROBE 模式使用 MCU 侧 CameraSync 的回执 timestamp 锁定 IMU 时间轴。
  */
-template <CameraTypes::CameraInfo CameraInfoV>
+template <CameraTypes::FrameLayout FrameLayoutV>
 class CameraFrameSync : public LibXR::Application
 {
  public:
-  using Self = CameraFrameSync<CameraInfoV>;        ///< 当前模板实例类型。
-  using Base = CameraBase<CameraInfoV>;             ///< 相机基类类型。
-  using CameraInfo = typename Base::CameraInfo;     ///< 相机静态标定信息类型。
-  using ImageFrame = typename Base::ImageFrame;     ///< 共享图像帧类型。
-  using ImuStamped = typename Base::ImuStamped;     ///< 同步后 IMU 输出类型。
-  using ImuVector = std::array<float, 3>;           ///< Host 侧三轴数组。
-  using QuatSample = std::array<float, 4>;          ///< Host 侧 wxyz 四元数。
-  using RawImuVector = Eigen::Matrix<float, 3, 1>;  ///< MCU 侧三轴 topic 数据。
-  using RawQuatSample = LibXR::Quaternion<float>;   ///< MCU 侧四元数 topic 数据。
+  using FrameGeometry = CameraTypes::FrameGeometry;            ///< 逐帧采样几何。
+  using Self = CameraFrameSync<FrameLayoutV>;                  ///< 当前模板实例类型。
+  using Base = CameraBase<FrameLayoutV>;                       ///< 相机基类类型。
+  using CameraCalibration = typename Base::CameraCalibration;  ///< 原生相机标定。
+  using ImageFrame = typename Base::ImageFrame;                ///< 共享图像帧类型。
+  using ImuStamped = typename Base::ImuStamped;                ///< 同步后 IMU 输出类型。
+  using ImuVector = std::array<float, 3>;                      ///< Host 侧三轴数组。
+  using QuatSample = std::array<float, 4>;                     ///< Host 侧 wxyz 四元数。
+  using RawImuVector = Eigen::Matrix<float, 3, 1>;         ///< MCU 侧三轴 topic 数据。
+  using RawQuatSample = LibXR::Quaternion<float>;          ///< MCU 侧四元数 topic 数据。
   using ImageTopic = LibXR::LinuxSharedTopic<ImageFrame>;  ///< 图像共享 topic 类型。
   using ImageData = typename ImageTopic::Data;             ///< 共享图像槽位句柄。
   using ImageCommitCallback =
@@ -89,9 +86,9 @@ class CameraFrameSync : public LibXR::Application
   using RawImuFrame = CameraFrameSyncRawImuFrame;  ///< 原始 IMU 坐标系选择。
 
   /**
-   * @brief 当前模块实例使用的相机静态信息。
+   * @brief 当前模块实例使用的编译期帧存储布局。
    */
-  static inline constexpr CameraInfo camera_info = CameraInfoV;
+  static inline constexpr auto frame_layout = FrameLayoutV;
 
   /**
    * @brief 共享图像 topic 的默认槽位配置。
@@ -112,19 +109,20 @@ class CameraFrameSync : public LibXR::Application
    */
   struct RuntimeParam
   {
-    SyncMode mode = SyncMode::RAW_PROBE;  ///< 同步模式。
-    int32_t offset_us = 0;                ///< IMU 时间域内的最终采样偏移。
+    SyncMode mode = SyncMode::RAW_PROBE;               ///< 同步模式。
+    int32_t offset_us = 0;                             ///< IMU 时间域内的最终采样偏移。
     std::string_view host_topic_domain_name = "host";  ///< Host topic domain。
     std::string_view sync_command_topic_name =
         "camera_sync_command";  ///< CameraSync 命令 topic。
     std::string_view sync_result_topic_name =
-        "camera_sync_result";           ///< CameraSync 回执 topic。
-    uint32_t sync_probe_div = 3;         ///< CameraSync 探针分频倍率。
-    uint32_t sync_active_level = 1;      ///< 同步触发输出有效电平。
-    float target_trigger_hz = 50.0F;     ///< 同步完成后的目标相机触发频率。
+        "camera_sync_result";         ///< CameraSync 回执 topic。
+    uint32_t sync_probe_div = 3;      ///< CameraSync 探针分频倍率。
+    uint32_t sync_active_level = 1;   ///< 同步触发输出有效电平。
+    float target_trigger_hz = 50.0F;  ///< 同步完成后的目标相机触发频率。
     RawImuFrame raw_imu_frame =
         RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP;  ///< 原始 IMU 坐标系。
-    std::string_view raw_quat_topic_name = {};  ///< 显式四元数 topic 名；空则沿用 `<camera>_quat`。
+    std::string_view raw_quat_topic_name =
+        {};  ///< 显式四元数 topic 名；空则沿用 `<camera>_quat`。
   };
 
   /**
@@ -162,6 +160,11 @@ class CameraFrameSync : public LibXR::Application
    * @brief 返回 Host 侧 topic domain 名称。
    */
   const char* HostTopicDomainName() const;
+
+  /**
+   * @brief 返回构造时从相机复制的原生标定。
+   */
+  const CameraCalibration& Calibration() const noexcept { return calibration_; }
 
   /**
    * @brief 获取当前同步模式。
@@ -271,18 +274,15 @@ class CameraFrameSync : public LibXR::Application
                         : std::string(runtime.raw_quat_topic_name)),
           host_domain(host_domain_name.c_str()),
           image(image_name.c_str(), image_topic_config),
-          synced_imu(LibXR::Topic::FindOrCreate<ImuStamped>(
-              imu_name.c_str(), &host_domain)),
+          synced_imu(
+              LibXR::Topic::FindOrCreate<ImuStamped>(imu_name.c_str(), &host_domain)),
           sync_command(LibXR::Topic::FindOrCreate<CameraSync::SyncCommand>(
               sync_command_name.c_str(), &host_domain)),
           sync_result(LibXR::Topic::FindOrCreate<CameraSync::SyncEvent>(
               sync_result_name.c_str(), &host_domain)),
-          gyro(LibXR::Topic::FindOrCreate<RawImuVector>(gyro_name.c_str(),
-                                                        &host_domain)),
-          accl(LibXR::Topic::FindOrCreate<RawImuVector>(accl_name.c_str(),
-                                                        &host_domain)),
-          quat(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_name.c_str(),
-                                                         &host_domain))
+          gyro(LibXR::Topic::FindOrCreate<RawImuVector>(gyro_name.c_str(), &host_domain)),
+          accl(LibXR::Topic::FindOrCreate<RawImuVector>(accl_name.c_str(), &host_domain)),
+          quat(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_name.c_str(), &host_domain))
     {
       ASSERT(!raw_imu_prefix.empty());
     }
@@ -437,13 +437,15 @@ class CameraFrameSync : public LibXR::Application
     RESET = 2,  ///< 当前帧打破同步关系，丢帧后重新观察。
   };
 
-  static constexpr size_t imu_ingress_length = 1024;   ///< topic 回调入口队列长度。
-  static constexpr size_t pending_limit = 1024;        ///< 状态机待处理队列长度。
-  static constexpr size_t image_event_limit = 64;      ///< 图像时间戳待处理队列长度。
-  static constexpr size_t history_limit = 1024;        ///< 可供 offset 查找的 IMU 样本数。
-  static constexpr uint32_t cadence_stable_gaps = 2;   ///< 判定周期稳定所需连续 gap 数。
-  static constexpr uint32_t max_synced_image_gap_stride = 8;  ///< 同步态可接受的连续丢图数量。
-  static constexpr uint32_t max_raw_imu_gap_stride = 8;  ///< 稳定后可接受的连续 raw IMU 缺样数量。
+  static constexpr size_t imu_ingress_length = 1024;  ///< topic 回调入口队列长度。
+  static constexpr size_t pending_limit = 1024;       ///< 状态机待处理队列长度。
+  static constexpr size_t image_event_limit = 64;     ///< 图像时间戳待处理队列长度。
+  static constexpr size_t history_limit = 1024;       ///< 可供 offset 查找的 IMU 样本数。
+  static constexpr uint32_t cadence_stable_gaps = 2;  ///< 判定周期稳定所需连续 gap 数。
+  static constexpr uint32_t max_synced_image_gap_stride =
+      8;  ///< 同步态可接受的连续丢图数量。
+  static constexpr uint32_t max_raw_imu_gap_stride =
+      8;  ///< 稳定后可接受的连续 raw IMU 缺样数量。
   static constexpr uint64_t imu_cadence_tolerance_us = 300ULL;     ///< IMU 周期容差。
   static constexpr uint64_t image_cadence_tolerance_us = 1500ULL;  ///< 图像周期容差。
   static constexpr uint64_t raw_imu_epoch_reset_backward_us =
@@ -469,14 +471,12 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 将 MCU 侧 IMU 向量转换为 Host 侧数组。
    */
-  static ImuVector ToImuVector(const RawImuVector& data,
-                               RawImuFrame raw_imu_frame);
+  static ImuVector ToImuVector(const RawImuVector& data, RawImuFrame raw_imu_frame);
 
   /**
    * @brief 将 MCU 侧四元数转换为 Host 侧 wxyz 顺序。
    */
-  static QuatSample ToQuatSample(const RawQuatSample& data,
-                                 RawImuFrame raw_imu_frame);
+  static QuatSample ToQuatSample(const RawQuatSample& data, RawImuFrame raw_imu_frame);
 
   /**
    * @brief 启动时从共享图像 topic 租用第一块可写图像槽位。
@@ -514,8 +514,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief CameraSync 回执回调；只记录当前 active probe 的一次命中。
    */
-  static void OnSyncResultStatic(bool, Self* self,
-                                 LibXR::MicrosecondTimestamp timestamp,
+  static void OnSyncResultStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
                                  const CameraSync::SyncEvent& event);
 
   /**
@@ -561,8 +560,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief raw IMU 时间轴重启后清空旧样本，并接受新 epoch 第一帧。
    */
-  void ResetRawImuEpoch(uint64_t previous_timestamp_us,
-                        const AssembledImu& first_imu);
+  void ResetRawImuEpoch(uint64_t previous_timestamp_us, const AssembledImu& first_imu);
 
   /**
    * @brief 更新 IMU 发布周期观察，并在周期破坏时触发重同步。
@@ -640,8 +638,7 @@ class CameraFrameSync : public LibXR::Application
   /**
    * @brief 尝试发布匹配结果；若 offset 后 IMU 未到达则把匹配保存在 frame。
    */
-  ImageDecision PublishOrRememberMatch(PendingFrame& frame,
-                                       const SyncMatch& match);
+  ImageDecision PublishOrRememberMatch(PendingFrame& frame, const SyncMatch& match);
 
   /**
    * @brief 根据同步基准 IMU 和 offset 选择最终 IMU 并发布。
@@ -730,6 +727,13 @@ class CameraFrameSync : public LibXR::Application
    */
   ImageData current_image_{};
 
+  /// 构造时从 CameraBase 复制，之后不再修改的原生标定。
+  CameraCalibration calibration_{};
+
+  /// 首个有效帧锁定的完整 geometry；同步重置和模式切换不解除该锁。
+  CameraFrameSyncCore::GeometryLockState<FrameGeometry> geometry_lock_{};
+  bool geometry_reject_logged_{false};
+
   /**
    * @brief topic 回调写入的无锁入口队列。
    */
@@ -817,7 +821,6 @@ class CameraFrameSync : public LibXR::Application
   uint64_t pending_probe_imu_timestamp_us_{0};
   uint64_t pending_run_period_us_{0};
   uint64_t pending_probe_start_imu_timestamp_us_{0};
-
 };
 
 #include "CameraFrameSyncImpl.hpp"
