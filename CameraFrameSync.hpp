@@ -27,11 +27,11 @@ depends:
 #include <string_view>
 #include <utility>
 
+#include "AutoAimReplayBenchmark.hpp"
 #include "CameraBase.hpp"
 #include "CameraFrameSyncCore.hpp"
 #include "CameraFrameSyncSubscriber.hpp"
 #include "CameraSync.hpp"
-#include "ReplayBenchmark.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
 #include "linux_shared_topic.hpp"
