@@ -24,6 +24,20 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   ASSERT(camera != nullptr);
   camera_ = camera;
   calibration_ = camera_->Calibration();
+
+  const auto profiles = camera_->Profiles();
+  if (profiles.empty())
+  {
+    throw std::runtime_error("CameraFrameSync: camera has no profiles");
+  }
+  if (!runtime.LegacyTimingMatchesProfile(profiles.front().trigger_period_us))
+  {
+    XR_LOG_ERROR(
+        "CameraFrameSync incompatible legacy timing: probe_div=%u initial_period_us=%u",
+        runtime.legacy_sync_probe_div, profiles.front().trigger_period_us);
+    throw std::runtime_error("CameraFrameSync: incompatible legacy timing");
+  }
+
   topics_.emplace(*camera_, runtime);
   callbacks_.emplace(this);
   pending_gyros_.emplace(pending_limit);
@@ -37,8 +51,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   camera_settle_us_ = runtime.camera_settle_us;
   raw_imu_frame_ = runtime.raw_imu_frame;
 
-  const auto profiles = camera_->Profiles();
-  ASSERT(!profiles.empty());
   ASSERT(profiles.size() <= 2U);
   for (std::size_t index = 0U; index < profiles.size(); ++index)
   {
@@ -50,7 +62,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
       ASSERT(profiles[index].id != profiles[other].id);
     }
   }
-
   active_profile_ = profiles.front().id;
   requested_profile_ = active_profile_;
   active_trigger_period_us_ = profiles.front().trigger_period_us;

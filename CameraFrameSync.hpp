@@ -20,10 +20,13 @@ depends:
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -107,6 +110,81 @@ class CameraFrameSync : public LibXR::Application
     RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP;
     std::string_view raw_quat_topic_name = {};
     std::string_view synced_frame_topic_name = {};
+    bool legacy_timing_provided = false;
+    uint32_t legacy_sync_probe_div = 0U;
+    float legacy_target_trigger_hz = 0.0F;
+
+    RuntimeParam() = default;
+
+    constexpr RuntimeParam(
+        SyncMode mode, int32_t offset_us, std::string_view host_topic_domain_name,
+        std::string_view sync_command_topic_name, std::string_view sync_result_topic_name,
+        uint32_t sync_active_level, uint64_t camera_settle_us = 10000U,
+        RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
+        std::string_view raw_quat_topic_name = {},
+        std::string_view synced_frame_topic_name = {})
+        : mode(mode),
+          offset_us(offset_us),
+          host_topic_domain_name(host_topic_domain_name),
+          sync_command_topic_name(sync_command_topic_name),
+          sync_result_topic_name(sync_result_topic_name),
+          sync_active_level(sync_active_level),
+          camera_settle_us(camera_settle_us),
+          raw_imu_frame(raw_imu_frame),
+          raw_quat_topic_name(raw_quat_topic_name),
+          synced_frame_topic_name(synced_frame_topic_name)
+    {
+    }
+
+    /**
+     * Accepts the legacy product-YAML field order. Probe division is obsolete,
+     * and the camera profile now owns the trigger period.
+     */
+    constexpr RuntimeParam(
+        SyncMode mode, int32_t offset_us, std::string_view host_topic_domain_name,
+        std::string_view sync_command_topic_name, std::string_view sync_result_topic_name,
+        uint32_t legacy_sync_probe_div, uint32_t sync_active_level,
+        float legacy_target_trigger_hz,
+        RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
+        std::string_view raw_quat_topic_name = {})
+        : RuntimeParam(mode, offset_us, host_topic_domain_name, sync_command_topic_name,
+                       sync_result_topic_name, sync_active_level)
+    {
+      this->raw_imu_frame = raw_imu_frame;
+      this->raw_quat_topic_name = raw_quat_topic_name;
+      this->legacy_timing_provided = true;
+      this->legacy_sync_probe_div = legacy_sync_probe_div;
+      this->legacy_target_trigger_hz = legacy_target_trigger_hz;
+    }
+
+    [[nodiscard]] bool LegacyTimingMatchesProfile(
+        uint32_t initial_trigger_period_us) const noexcept
+    {
+      if (!legacy_timing_provided)
+      {
+        return true;
+      }
+      if (legacy_sync_probe_div != 3U || !std::isfinite(legacy_target_trigger_hz) ||
+          legacy_target_trigger_hz <= 0.0F)
+      {
+        return false;
+      }
+      if (mode == SyncMode::LATEST_IMU)
+      {
+        return true;
+      }
+      if (mode != SyncMode::TRIGGER)
+      {
+        return false;
+      }
+
+      const double period_us = 1000000.0 / static_cast<double>(legacy_target_trigger_hz);
+      const double rounded_period_us = std::round(period_us);
+      return std::isfinite(period_us) && rounded_period_us >= 1.0 &&
+             rounded_period_us <=
+                 static_cast<double>(std::numeric_limits<uint32_t>::max()) &&
+             static_cast<uint32_t>(rounded_period_us) == initial_trigger_period_us;
+    }
   };
 
   CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,

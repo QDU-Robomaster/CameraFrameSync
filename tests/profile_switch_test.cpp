@@ -34,6 +34,48 @@ constexpr std::string_view kSyncedTopicName = "cfs_profile_test_synced";
 constexpr uint64_t kStartupStopAckUs = 1000U;
 constexpr uint64_t kSettleUs = 10000U;
 
+constexpr Sync::RuntimeParam kCurrentRuntime{
+    Sync::SyncMode::TRIGGER,
+    125,
+    kDomainName,
+    kCommandTopicName,
+    kResultTopicName,
+    1U,
+    12000U,
+    Sync::RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY,
+    "current_quat",
+    kSyncedTopicName,
+};
+static_assert(kCurrentRuntime.sync_active_level == 1U);
+static_assert(kCurrentRuntime.camera_settle_us == 12000U);
+static_assert(kCurrentRuntime.raw_imu_frame ==
+              Sync::RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY);
+static_assert(kCurrentRuntime.raw_quat_topic_name == "current_quat");
+static_assert(kCurrentRuntime.synced_frame_topic_name == kSyncedTopicName);
+static_assert(!kCurrentRuntime.legacy_timing_provided);
+
+constexpr Sync::RuntimeParam kLegacyRuntime{
+    Sync::SyncMode::LATEST_IMU,
+    -25,
+    kDomainName,
+    kCommandTopicName,
+    kResultTopicName,
+    3U,
+    1U,
+    50.0F,
+    Sync::RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY,
+    "legacy_quat",
+};
+static_assert(kLegacyRuntime.sync_active_level == 1U);
+static_assert(kLegacyRuntime.camera_settle_us == 10000U);
+static_assert(kLegacyRuntime.raw_imu_frame ==
+              Sync::RawImuFrame::X_FORWARD_Y_LEFT_Z_UP_TO_BODY);
+static_assert(kLegacyRuntime.raw_quat_topic_name == "legacy_quat");
+static_assert(kLegacyRuntime.synced_frame_topic_name.empty());
+static_assert(kLegacyRuntime.legacy_timing_provided);
+static_assert(kLegacyRuntime.legacy_sync_probe_div == 3U);
+static_assert(kLegacyRuntime.legacy_target_trigger_hz == 50.0F);
+
 [[noreturn]] void Fail(std::string_view message)
 {
   std::cerr << "[FAIL] " << message << '\n';
@@ -69,36 +111,12 @@ constexpr Camera::CameraCalibration MakeCalibration()
 
 constexpr Camera::FrameGeometry MakeWideGeometry()
 {
-  return {
-      .width = 2U,
-      .height = 2U,
-      .step = 6U,
-      .roi_offset_x_native = 0U,
-      .roi_offset_y_native = 0U,
-      .decimation_x = 2U,
-      .decimation_y = 1U,
-      .flags = CameraTypes::FRAME_GEOMETRY_NONE,
-      .reserved = 0U,
-      .sample_phase_x_native = 0.0F,
-      .sample_phase_y_native = 0.0F,
-  };
+  return {2U, 2U, 6U, 0U, 0U, 2U, 1U, CameraTypes::FRAME_GEOMETRY_NONE, 0U, 0.0F, 0.0F};
 }
 
 constexpr Camera::FrameGeometry MakeNarrowGeometry()
 {
-  return {
-      .width = 2U,
-      .height = 2U,
-      .step = 6U,
-      .roi_offset_x_native = 1U,
-      .roi_offset_y_native = 0U,
-      .decimation_x = 1U,
-      .decimation_y = 1U,
-      .flags = CameraTypes::FRAME_GEOMETRY_NONE,
-      .reserved = 0U,
-      .sample_phase_x_native = 0.0F,
-      .sample_phase_y_native = 0.0F,
-  };
+  return {2U, 2U, 6U, 1U, 0U, 1U, 1U, CameraTypes::FRAME_GEOMETRY_NONE, 0U, 0.0F, 0.0F};
 }
 
 constexpr std::array<Camera::CameraProfile, 2U> kProfiles{{
@@ -287,6 +305,12 @@ class Harness
  public:
   Harness(Sync::SyncMode mode, SwitchBehavior behavior = SwitchBehavior::SUCCEED,
           bool retain_images = false, size_t profile_count = kProfiles.size())
+      : Harness(MakeRuntime(mode), behavior, retain_images, profile_count)
+  {
+  }
+
+  Harness(Sync::RuntimeParam runtime, SwitchBehavior behavior = SwitchBehavior::SUCCEED,
+          bool retain_images = false, size_t profile_count = kProfiles.size())
       : hw_(LibXR::Entry<LibXR::RamFS>{ramfs_, {"ramfs"}}),
         domain_(kDomainName.data()),
         command_topic_(
@@ -319,11 +343,6 @@ class Harness
       image_topic_.RegisterCallback(image_callback_);
     }
 
-    Sync::RuntimeParam runtime{};
-    runtime.mode = mode;
-    runtime.host_topic_domain_name = kDomainName;
-    runtime.sync_command_topic_name = kCommandTopicName;
-    runtime.sync_result_topic_name = kResultTopicName;
     runtime.synced_frame_topic_name = kSyncedTopicName;
     runtime.camera_settle_us = kSettleUs;
     sync_.emplace(hw_, app_, camera_, runtime);
@@ -418,6 +437,16 @@ class Harness
   }
 
  private:
+  static Sync::RuntimeParam MakeRuntime(Sync::SyncMode mode)
+  {
+    Sync::RuntimeParam runtime{};
+    runtime.mode = mode;
+    runtime.host_topic_domain_name = kDomainName;
+    runtime.sync_command_topic_name = kCommandTopicName;
+    runtime.sync_result_topic_name = kResultTopicName;
+    return runtime;
+  }
+
   LibXR::RamFS ramfs_{};
   LibXR::HardwareContainer hw_;
   LibXR::ApplicationManager app_{};
@@ -541,7 +570,13 @@ void PublishEdge(Harness& harness, const SyncCommand& start, uint32_t trigger_se
 
 void TestStartupFirstTrigger()
 {
-  Harness harness(Sync::SyncMode::TRIGGER);
+  Sync::RuntimeParam legacy_runtime{
+      Sync::SyncMode::TRIGGER, 0,  kDomainName, kCommandTopicName,
+      kResultTopicName,        3U, 1U,          100.0F};
+  Expect(legacy_runtime.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "legacy 100 Hz timing must match the WIDE camera profile");
+
+  Harness harness(legacy_runtime);
   const StartupCommands startup = CompleteStartup(harness);
 
   PublishEdge(harness, startup.start, 1U, 21000U);
@@ -1084,7 +1119,12 @@ void TestClockDomains()
 
 void TestLatestMode()
 {
-  Harness harness(Sync::SyncMode::LATEST_IMU);
+  Sync::RuntimeParam legacy_runtime{
+      Sync::SyncMode::LATEST_IMU, 0,  kDomainName, kCommandTopicName,
+      kResultTopicName,           3U, 1U,          50.0F};
+  Expect(legacy_runtime.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "LATEST_IMU must accept valid legacy timing metadata without profile override");
+  Harness harness(legacy_runtime);
   Expect(harness.Commands().commands.empty(),
          "LATEST_IMU construction must not control CameraSync");
   Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::WIDE) ==
@@ -1110,6 +1150,39 @@ void TestLatestMode()
   Expect(harness.CameraUnderTest().SwitchCount() == 0U,
          "LATEST_IMU must never call SwitchProfile");
   Pass("latest_mode");
+}
+
+void TestLegacyRuntimeRejection()
+{
+  Sync::RuntimeParam mismatched_runtime{
+      Sync::SyncMode::TRIGGER, 0,  kDomainName, kCommandTopicName,
+      kResultTopicName,        3U, 1U,          50.0F};
+  Expect(!mismatched_runtime.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "legacy trigger frequency must not override a mismatched camera profile");
+
+  auto invalid_probe_div = mismatched_runtime;
+  invalid_probe_div.legacy_sync_probe_div = 4U;
+  Expect(!invalid_probe_div.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "unknown legacy probe division must be rejected");
+  auto invalid_target_hz = mismatched_runtime;
+  invalid_target_hz.legacy_target_trigger_hz = 0.0F;
+  Expect(!invalid_target_hz.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "zero legacy target frequency must be rejected");
+  invalid_target_hz.legacy_target_trigger_hz = std::numeric_limits<float>::quiet_NaN();
+  Expect(!invalid_target_hz.LegacyTimingMatchesProfile(kProfiles[0].trigger_period_us),
+         "non-finite legacy target frequency must be rejected");
+
+  bool rejected = false;
+  try
+  {
+    Harness harness(mismatched_runtime);
+  }
+  catch (const std::runtime_error&)
+  {
+    rejected = true;
+  }
+  Expect(rejected, "Release construction must reject incompatible legacy timing");
+  Pass("legacy_runtime_rejection");
 }
 
 void TestDeferredDispatchRetry()
@@ -1230,6 +1303,10 @@ int main(int argc, char** argv)
   if (test_case == "latest_mode")
   {
     TestLatestMode();
+  }
+  if (test_case == "legacy_runtime_rejection")
+  {
+    TestLegacyRuntimeRejection();
   }
   if (test_case == "deferred_dispatch_retry")
   {
