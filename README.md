@@ -1,157 +1,204 @@
 # CameraFrameSync
 
-`CameraFrameSync` 负责把相机图像和原始 IMU 对齐：
+`CameraFrameSync` 在单进程内完成两件事：
 
-- 从 `CameraBase<FrameLayoutV>` 拿可写图像槽位，把已提交图像发布到 `LinuxSharedTopic`
-- 按相机名订阅原始 `gyro / accl / quat`
-- 发布与图像 `timestamp_us` 相同的同步后 `ImuStamped`
+- 从 `CameraBase<FrameLayoutV>` 的普通 Topic 接收并持有 `SharedFrame`
+- 把图像与 MCU 每个真实相机触发边沿对应的 IMU 时间戳配对，发布 `SyncedFrame`
 
-模块不创建线程。原始 IMU 只在 Topic 回调里入队；`CameraSync` 回执只记录当前 probe
-的命中结果。状态机只在图像提交时推进。
+模块不创建工作线程或信号量。图像、原始 IMU 和 `CameraSync` 事件回调通过同一把
+状态锁串行推进；`SyncCommand`、`SyncedFrame` 的 Topic 发布以及
+`CameraBase::SwitchProfile()` 都在锁外执行，允许同步订阅者重入模块接口。
 
 ## Topic
 
 输入：
 
-- 图像：`CameraBase<FrameLayoutV>::RegisterImageSink(...)`
-- 原始陀螺：`<camera_name>_gyro`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
-- 原始加速度：`<camera_name>_accl`，消息类型为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
-- 原始姿态：`<camera_name>_quat`，消息类型为 `LibXR::Quaternion<float>`
-- 同步回执：`camera_sync_result`，消息类型为 `CameraSync::SyncEvent`
+- 图像：`camera.ImageTopicNameView()`，载荷为仅在同步回调期间有效的
+  `const SharedFrame*`
+- 角速度：`<camera_name>_gyro`，类型为 `Eigen::Matrix<float, 3, 1>`，单位 rad/s
+- 加速度：`<camera_name>_accl`，类型为 `Eigen::Matrix<float, 3, 1>`，单位 m/s^2
+- 姿态：`<camera_name>_quat`，类型为 `LibXR::Quaternion<float>`
+- 同步事件：`camera_sync_result`，类型为 `CameraSync::SyncEvent`
 
 输出：
 
-- 图像共享 topic：`camera.ImageTopicName()`
-- 同步 IMU topic：`camera.ImuTopicName()`
-- 同步命令：`camera_sync_command`，消息类型为 `CameraSync::SyncCommand`
+- 同步结果：`CameraFrameSync::SyncedFrameTopicName()`，载荷为仅在同步回调期间有效的
+  `const SyncedFrame*`
+- 同步命令：`camera_sync_command`，类型为 `CameraSync::SyncCommand`
 
-## 数据采集
+命令、事件和原始 IMU Topic 使用 `host_topic_domain_name`。默认 domain 是
+`shared_memory`；产品配置可以显式改为 `host` 等 SharedTopic 转发 domain。图像和
+`SyncedFrame` 是当前进程内的普通 Topic，不能跨进程传递裸指针。
 
-完整同步图像/IMU 采集由 `VisionCapture` 负责。
-`CameraFrameSync` 只维护同步状态并发布同步后的图像/IMU topic，不写离线记录文件。
+## 所有权
 
-实机和 Webots 都应通过 SharedTopic 转发 `camera_sync_command / camera_sync_result`。Host 侧默认使用 `host` topic domain。原始 IMU topic 由 `camera.Name()` 派生；实机如果下位机把云台 IMU 暴露为 `gimbal_gyro / gimbal_accl / gimbal_quat`，相机运行配置里的 `camera_name` 应设为 `gimbal`，图像 topic 和同步后 IMU topic 仍可单独配置。
+Topic 中的指针只借用到当前同步回调返回。需要在回调后继续使用图像时，订阅者必须在
+回调内复制整个阶段包装或其中的 `SharedFrame`，再把副本移动到自己的稳定工作槽位；
+不得保存裸指针，也不得用异步 `QueuedSubscriber` 保存该指针。
 
-## 时间戳契约
+每份 `SharedFrame` 都共同持有 CameraBase 八槽对象池中的同一槽位。最后一份句柄析构后
+槽位自动归还，不复制像素，也不按帧分配堆内存。CameraFrameSync 内部的 image、trigger
+和 outbound FIFO 只是等待匹配及锁外发布的固定容量状态，不是另一套跨模块传输协议。
 
-只使用传感器侧时间戳：
+## 时间域
 
-- 图像时间来自 `ImageFrame::timestamp_us`
-- 原始 IMU 时间来自 Topic envelope timestamp
-- `CameraSync::SyncEvent` 的同步点时间来自 result topic 的 envelope timestamp
+相机时间和 MCU/IMU 时间属于两个独立设备时钟域：
 
-相机时间和 IMU 时间不做绝对值比较。相机侧只看相邻图像的时间差，IMU 侧只看相邻 IMU 的时间差和 `CameraSync` 回传的 IMU 时间戳。
+- `ImageFrame::timestamp_us` 保留相机采样时间
+- 原始 IMU 使用 Topic envelope timestamp
+- `FRAME_TRIGGER` 的 Topic envelope timestamp 是 MCU 产生真实 GPIO 边沿时的 IMU 时间
+- `SyncedFrame::imu.timestamp_us` 在 `TRIGGER` 模式下等于匹配边沿的时间戳
 
-## 相机几何契约
+模块不会比较相机时间和 MCU 时间的绝对值。相机时间只用于计算相邻已匹配图像的 gap；
+下游排序使用 `SyncedFrame::imu.timestamp_us`。已发布的权威时间戳在模块生命周期内必须
+严格递增，迟到或回退的输出不会进入下游。一次 STOP/START 事务会清除本地 image/trigger
+匹配基线，因此相机时钟可在事务后重新起算，只要新的 MCU 触发时间仍然向前。
 
-构造时，模块从相机复制不可变的原生 `CameraCalibration`。每次提交图像时先用同一
-`FrameLayoutV` 和该标定验证 `ImageFrame::geometry`；非法几何不会发布到共享 topic。
+## TRIGGER 模式
 
-首个有效帧的非零 `epoch` 会被锁存。当前运行期间如果后续帧切换到其它 `epoch`，该帧会被
-拒绝并计入 drop；改变 ROI 或下采样配置前必须先实现显式的 epoch 切换协议，当前固定 wide
-路径不支持运行中切换。
+`TRIGGER` 是实机默认模式。构造时即对当前 profile 发起一次同档重同步：
+
+```text
+WAIT_STOP_ACK
+  -> SETTLING
+  -> WAIT_START_ACK
+  -> RUNNING
+```
+
+真实切档时，`SETTLING` 后增加一次可选状态：
+
+```text
+WAIT_STOP_ACK
+  -> SETTLING
+  -> SWITCHING_CAMERA
+  -> WAIT_START_ACK
+  -> RUNNING
+```
+
+流程如下：
+
+1. Host 发送 `STOP_TRIGGER{seq, active_level, trigger_period_us=0}`。
+2. MCU 在下一条 IMU 消息处停触发并回 ACK。Host 校验 operation、seq、active level、
+   reserved 和 `effective_period_us=0`。
+3. 由后续 gyro 时间推进默认 10 ms 的 `camera_settle_us`。
+4. 真实切档时在状态锁外调用 `CameraBase::SwitchProfile()`；同档重同步跳过此步。
+5. Host 发送 `START_TRIGGER{seq, active_level, trigger_period_us}`。
+6. START ACK 必须返回相同 period 且 `trigger_sequence=0`，随后直接进入 `RUNNING`。
+7. START 后第一条真实边沿必须是 `trigger_sequence=1`；后续每个真实边沿严格加一，
+   event 的 `seq` 必须等于本次生效的 START seq。
+
+这里没有周期观察、probe gap、divider 或 RESET 命令。`RAW_PROBE` 仅保留为
+`TRIGGER` 的源码兼容枚举别名，不代表仍存在 probe 协议。
+
+## 图像与边沿匹配
+
+进入 `RUNNING` 后，每个合法 `FRAME_TRIGGER` 都进入固定容量 trigger FIFO。第一张图像
+与本次 START 后队列中的第一条真实边沿配对。后续图像按以下规则选择目标边沿：
+
+```text
+camera_gap = current_camera_ts - previous_camera_ts
+stride = round(camera_gap / active_profile.trigger_period_us)
+target_trigger_sequence = previous_trigger_sequence + stride
+```
+
+残差必须不超过：
+
+```text
+max(1500 us, trigger_period_us / 4)
+```
+
+`stride` 的上限为 128。合法 stride 为 2 或更大时，模块跳过 trigger FIFO 中较旧的真实
+边沿，直接消费目标 sequence；这表示相机少交付了图像，不表示 MCU 补发或猜测了边沿。
+目标边沿尚未到达时图像继续等待。无法解释的 camera gap、重复/回退相机时间、边沿
+sequence 不连续、边沿时间回退或 trigger FIFO 溢出都会清除本地匹配并对当前 profile
+重新执行 STOP/settle/START，不调用 `SwitchProfile()`。
+
+匹配到边沿后，模块在 IMU history 中寻找对应样本。`offset_us=0` 要求精确命中该边沿
+时间；非零 offset 在 IMU 时间域中选择 `trigger_timestamp + offset_us` 附近 500 us 内的
+样本。若未来样本尚未到达则继续等待，找不到合法样本则重新同步。无论选用了哪条 IMU
+内容，发布的 `SyncedFrame::imu.timestamp_us` 始终保留原始 `FRAME_TRIGGER` 时间。
+
+## 固定 profile
+
+相机通过 `Profiles()` 声明一到两个固定 profile。每项包含 `ProfileId`、逐帧 geometry
+和直接传给 MCU 的 `trigger_period_us`。
+
+`RequestProfile()` 只负责接纳异步 STOP/settle/SwitchProfile/START 事务：
+
+- `RUNNING` 中请求当前 profile 直接返回 `OK`，不发送命令，也不调用 `SwitchProfile()`
+- 单 profile 相机仍在启动和异常恢复时执行 STOP/START，但永远不切相机
+- `SwitchProfile()` 失败时不发送 START，不假设旧配置可用，也不自动回滚
+- 失败后进入 `FAILED`，MCU 保持停止，后续对任一有效 profile 的请求都返回 `STATE_ERR`
+
+非 `RUNNING` 控制阶段到达的图像立即释放。切档不等待八个图像槽全部回池；已经被下游
+持有的旧 profile `SharedFrame` 可以和新 profile 图像同时存在。
+
+## 逐帧 geometry
+
+构造时模块复制相机的原生 `CameraCalibration`。每张图像都携带不可变
+`ImageFrame::geometry`，提交后像素和 geometry 均不得修改。CameraFrameSync 只验证该
+快照能否由 `FrameLayoutV` 承载并落在原生标定范围内，不用当前 active profile 拒绝
+其它合法 geometry。
+
+因此 profile id 只存在于控制面。下游必须使用当前帧的 geometry，把像素坐标映射到
+统一的原生相机或物理坐标；无需 geometry epoch、全链路 barrier 或下游 reset Topic。
 
 ## 原始 IMU 组装
 
-IMU 组装以 gyro 为主轴：
+`TRIGGER` 模式以 gyro 为主键组装 `gyro / accl / quat`：
 
-1. gyro/accl/quat 回调分别把样本放进固定长度队列
-2. 图像提交时，把队列推进到能确定为止
-3. 取 gyro 队首时间戳
-4. 丢掉所有早于该 gyro 的 accl / quat
-5. 如果 accl / quat 缺失，先停住，不丢 gyro
-6. 如果 accl / quat 已经晚于该 gyro，说明这条 gyro 缺帧，丢 gyro 并回到观察态
-7. 三个 timestamp 完全一致时，组装一条完整 IMU 样本
+1. 三路回调分别进入固定容量队列。
+2. 丢弃早于当前 gyro 的 accl 和 quat。
+3. 三路 timestamp 完全一致时生成一条完整 IMU history 样本。
+4. 若 accl 或 quat 已晚于当前 gyro，只丢弃这条无法补齐的 gyro。
+5. gyro timestamp 重复或回退会清空原始 IMU history，并触发同档重同步。
 
-当前协议要求同一帧 IMU 的 `gyro / accl / quat` envelope timestamp 完全一致。
+队列溢出同样会清空原始 IMU 状态并重新同步。模块不会按历史周期合成或补齐 IMU。
 
-## 同步模式
+## LATEST_IMU 模式
 
-`LATEST_IMU`：
+`LATEST_IMU` 用于数据源已经自行同步的兼容路径：
 
-- 不发 `CameraSync::SyncCommand`
-- 每张图像直接绑定当前最新完整 IMU
-- 如果 `offset_us` 指向的最终 IMU 还没到，当前图像留在唯一 pending 槽位里等待
+- 不发送 `CameraSync::SyncCommand`
+- 不允许切换到非当前 profile
+- 当前实现只消费 quat 样本，以 quat envelope timestamp 作为输出权威时间，并将角速度和
+  加速度置零
+- 每张图像需要一个时间戳继续向前的新 quat；同一 quat timestamp 不会重复发布
+- `offset_us` 只用于 `TRIGGER` 的边沿匹配，`LATEST_IMU` 不应用该偏移
 
-`RAW_PROBE`：
+该模式的内部控制状态为 `BYPASS`。
 
-- 默认实机模式
-- 通过 `CameraSync::SyncCommand` 触发一次节拍扰动
-- 通过 `CameraSync::SyncEvent` 的 envelope timestamp 得到同步点 IMU 时间
-- 锁定后按 IMU 周期递推后续图像对应的同步 IMU
+## ACK、重试与失败
 
-## RAW_PROBE 状态机
+operation 或 seq 不属于当前待处理命令的 ACK 会被忽略。operation 和 seq 已匹配、但
+active level、reserved、effective period 或 START `trigger_sequence` 非法时进入
+`FAILED`，不会继续等待另一条“正确”ACK。
 
-状态只有三种：
-
-- `OBSERVING`：持续观察图像周期和完整 IMU 周期
-- `PROBE_SENT`：已发送一次 `CameraSync::SyncCommand`，等待 probe 图像和同 seq 回执；若回执长期未到会超时回到 `OBSERVING` 并重发 probe
-- `SYNCED`：已锁定，后续按 IMU 时间轴递推
-
-流程：
-
-1. `OBSERVING` 中观察到稳定图像周期 `T` 和稳定 IMU 周期 `t`
-2. 计算 `N = round(T / t)`，同步 IMU 周期为 `N * t`
-3. 根据 IMU 周期和 `target_trigger_hz` 计算 `run_trigger_div`
-4. 发送 `CameraSync::SyncCommand{flags, active_level, seq, sync_probe_div, run_trigger_div}`
-5. MCU 制造一次可预测的 probe 图像 gap，并在同步点发布 `CameraSync::SyncEvent{seq, run_trigger_div}`
-6. Host 看到期望 probe 图像 gap，同时收到同 seq result 后，用 result 的 envelope timestamp 找完整 IMU
-7. 找到后发布该图像对应的同步 IMU，并进入 `SYNCED`
-8. `SYNCED` 中每张正常图像用 `last_sync_imu_ts + sync_period` 找下一条同步 IMU
-
-构造时会先发送 `RESET_TO_DEFAULT` 命令，让 MCU 恢复默认触发分频；该命令不产生
-`SyncEvent`。
-
-如果首个普通 `SyncCommand` 在启动阶段被串口转发层丢掉，或 MCU 未返回匹配
-`SyncEvent`，状态机不会永久停在 `PROBE_SENT`。模块按 IMU 时间轴等待
-`max(100ms, probe_gap + 4 * image_period)`，超时后清掉当前 probe 并重新观察、
-重新发送下一次 probe。
-
-如果 `PROBE_SENT` 或 `SYNCED` 退回 `OBSERVING`，Host 会先发送一次
-`RESET_TO_DEFAULT`，让 MCU 恢复默认触发分频，然后再重新观察周期并发送新的普通
-`SyncCommand`。`LATEST_IMU` 模式不会发送 CameraSync reset。
-
-入口队列溢出、raw IMU 时间轴重启等需要清空运行状态的情况，也会在 `RAW_PROBE`
-模式下发送 `RESET_TO_DEFAULT`。
-
-`sync_probe_div = 3` 时，期望 probe 图像 gap 为 `3T`。通用公式是 `T * sync_probe_div`。
-
-## offset_us
-
-`offset_us` 只在 IMU 时间域内使用：
-
-1. 先确定同步点 IMU：`sync_imu_ts`
-2. 再计算最终样本：`final_imu_ts = sync_imu_ts + offset_us`
-3. 如果最终样本还没到，当前图像等待
-4. 发布时 `ImuStamped.timestamp_us` 写图像时间戳，IMU 内容来自 `final_imu_ts`
-
-等待期间不会重新选择同步点 IMU。
-
-## 消费者接口
-
-后续模块通过 `CameraFrameSync::Subscriber` 消费同步结果：
-
-- `Wait(out, timeout_ms)` 是阻塞接口，`UINT32_MAX` 表示无限等待
-- `Wait()` 先等待同步后 IMU，再取同 timestamp 的共享图像；RAW_PROBE 启动尚未锁定时，消费者不会持有未同步图像槽位
-- 成功返回时，`out.image` 持有共享图像槽位，`out.imu` 是 timestamp 完全相同的同步 IMU
-- 图像订阅使用丢旧语义；如果某张图像已经被 IMU 时间轴越过，Subscriber 会释放这张图并继续等下一张
-- 回调里不做 Detector/Tracker 工作，重计算应放在消费者线程里
+STOP/START 初次发布后，以 raw gyro 时间每 100 ms 重发同一条完整命令，最多重试三次。
+尚在 outbound FIFO、还没有真正发布的命令不开始计时，也不消耗重试次数。重试耗尽、
+相机切档失败或 outbound FIFO 无法接纳控制项都会进入 `FAILED`。
 
 ## 配置
 
-以下示例假设 `constexpr_namespace: ProjectConstexpr`，并已定义
-`CameraTypes::FrameLayout MainFrameLayout`。相机、同步桥和消费者必须引用同一个布局常量。
-
-默认配置走实机 `RAW_PROBE`：
+默认实机配置：
 
 ```yaml
 template_args:
   Layout: {constexpr: MainFrameLayout}
 constructor_args:
   camera: '@camera'
+  runtime:
+    mode: {expr: "CameraFrameSync<ProjectConstexpr::MainFrameLayout>::SyncMode::TRIGGER"}
+    offset_us: 0
+    host_topic_domain_name: shared_memory
+    sync_command_topic_name: camera_sync_command
+    sync_result_topic_name: camera_sync_result
+    sync_active_level: 1
+    camera_settle_us: 10000
+    synced_frame_topic_name: camera_synced
 ```
 
-已经同步的数据源使用 `LATEST_IMU`：
+已经自行同步的数据源：
 
 ```yaml
 template_args:
@@ -160,42 +207,22 @@ constructor_args:
   camera: '@camera'
   runtime:
     mode: {expr: "CameraFrameSync<ProjectConstexpr::MainFrameLayout>::SyncMode::LATEST_IMU"}
-    offset_us: 0
-    host_topic_domain_name: libxr_def_domain
-    sync_command_topic_name: camera_sync_command
-    sync_result_topic_name: camera_sync_result
-    sync_probe_div: 3
-    sync_active_level: 1
-    target_trigger_hz: {expr: 50.0F}
+    host_topic_domain_name: shared_memory
+    synced_frame_topic_name: camera_synced
 ```
 
-Webots / 实机可显式配置同步 topic：
+## 监控
 
-```yaml
-template_args:
-  Layout: {constexpr: MainFrameLayout}
-constructor_args:
-  camera: '@camera'
-  runtime:
-    mode: {expr: "CameraFrameSync<ProjectConstexpr::MainFrameLayout>::SyncMode::RAW_PROBE"}
-    offset_us: 0
-    host_topic_domain_name: host
-    sync_command_topic_name: camera_sync_command
-    sync_result_topic_name: camera_sync_result
-    sync_probe_div: 3
-    sync_active_level: 1
-    target_trigger_hz: {expr: 50.0F}
-```
+启动日志记录输入/输出 Topic、模式、active profile、触发周期和 settle 时间。周期 monitor
+报告当前控制状态、profile、period、raw/assembled IMU、真实 trigger、输入/持有/丢弃图像、
+同步输出、重同步和溢出计数。控制状态只可能是：
 
-## 日志
+- `BYPASS`
+- `WAIT_STOP_ACK`
+- `SETTLING`
+- `SWITCHING_CAMERA`
+- `WAIT_START_ACK`
+- `RUNNING`
+- `FAILED`
 
-模块只在状态变化和异常恢复时打日志：
-
-- 启动时打印图像、IMU、原始 topic 和模式
-- 发送 `CameraSync::SyncCommand`
-- 进入 `SYNCED`
-- 从 `PROBE_SENT / SYNCED` 回到 `OBSERVING`
-- `probe-timeout` 表示 probe 命令或回执丢失后触发了自动恢复
-- ingress 溢出导致运行时状态重置
-
-正常稳态不应持续出现 `-> OBSERVING`。
+非法 geometry 只在首次出现时打印详细错误，避免持续刷日志。
