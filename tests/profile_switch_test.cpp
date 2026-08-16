@@ -993,6 +993,156 @@ void TestRetryExhausted()
   Pass("retry_exhausted");
 }
 
+void TestTimestampEpochRunning()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  const StartupCommands startup = CompleteStartup(harness);
+
+  PublishEdge(harness, startup.start, 1U, 21000U);
+  harness.PublishFrame(100000U, MakeWideGeometry());
+  Expect(harness.SyncedFrames().frames.size() == 1U,
+         "RUNNING epoch test must publish the old-epoch frame");
+  PublishEdge(harness, startup.start, 2U, 31000U);
+  harness.ClearCommandTrace();
+
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 1U,
+         "RUNNING timestamp rollback must restart with STOP");
+  const SyncCommand stop = harness.Commands().commands.front();
+  ExpectCommand(stop, Operation::STOP_TRIGGER, 0U,
+                "RUNNING timestamp rollback STOP fields are wrong");
+  harness.PublishEvent(AckFor(stop), 101U);
+  harness.PublishGyroOnly(10100U);
+  Expect(harness.Commands().commands.size() == 1U,
+         "new epoch must still honor the complete settle interval");
+  harness.PublishGyroOnly(10101U);
+  Expect(harness.Commands().commands.size() == 2U,
+         "new epoch settle deadline must publish START");
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishEvent(AckFor(start), 10102U);
+
+  harness.PublishFrame(1000U, MakeWideGeometry());
+  Expect(harness.SyncedFrames().frames.size() == 1U,
+         "old-epoch trigger queue must be cleared on rollback");
+  PublishEdge(harness, start, 1U, 10103U);
+  Expect(harness.SyncedFrames().frames.size() == 2U &&
+             static_cast<uint64_t>(
+                 harness.SyncedFrames().frames.back().imu.timestamp_us) == 10103U,
+         "new epoch must publish timestamps below the previous epoch");
+  Pass("timestamp_epoch_running");
+}
+
+void TestTimestampEpochWaitStopAck()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "WAIT_STOP_ACK epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  harness.PublishGyroOnly(111000U);
+  harness.PublishGyroOnly(211000U);
+  Expect(harness.Commands().commands.size() == 3U,
+         "WAIT_STOP_ACK setup must consume two retries");
+
+  harness.PublishGyroOnly(100U);
+  harness.PublishGyroOnly(100099U);
+  Expect(harness.Commands().commands.size() == 3U,
+         "WAIT_STOP_ACK retry must be timed from the new epoch");
+  harness.PublishGyroOnly(100100U);
+  harness.PublishGyroOnly(200100U);
+  harness.PublishGyroOnly(300100U);
+  Expect(harness.Commands().commands.size() == 6U,
+         "WAIT_STOP_ACK must restore the bounded retry budget in the new epoch");
+  for (size_t index = 1U; index < harness.Commands().commands.size(); ++index)
+  {
+    ExpectSameCommand(harness.Commands().commands[index], stop,
+                      "WAIT_STOP_ACK epoch retry must preserve the command");
+  }
+
+  harness.PublishEvent(AckFor(stop), 300101U);
+  harness.PublishGyroOnly(310101U);
+  const SyncCommand start = harness.Commands().commands.back();
+  ExpectCommand(start, Operation::START_TRIGGER, kProfiles[1].trigger_period_us,
+                "WAIT_STOP_ACK epoch recovery START fields are wrong");
+  harness.PublishEvent(AckFor(start), 310102U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW,
+         "WAIT_STOP_ACK must recover after a timestamp rollback");
+  Pass("timestamp_epoch_wait_stop_ack");
+}
+
+void TestTimestampEpochSettling()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "SETTLING epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  harness.PublishEvent(AckFor(stop), 500000U);
+  harness.PublishGyroOnly(509999U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 0U,
+         "SETTLING setup must remain before the old deadline");
+
+  harness.PublishGyroOnly(100U);
+  harness.PublishGyroOnly(10099U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 0U,
+         "SETTLING rollback must rebase the complete settle interval");
+  harness.PublishGyroOnly(10100U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
+             harness.Commands().commands.size() == 2U,
+         "SETTLING must switch and publish START at the new epoch deadline");
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishEvent(AckFor(start), 10101U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW,
+         "SETTLING must recover after a timestamp rollback");
+  Pass("timestamp_epoch_settling");
+}
+
+void TestTimestampEpochWaitStartAck()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "WAIT_START_ACK epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  harness.PublishEvent(AckFor(stop), 12000U);
+  harness.PublishGyroOnly(22000U);
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishGyroOnly(122000U);
+  harness.PublishGyroOnly(222000U);
+  Expect(harness.Commands().commands.size() == 4U,
+         "WAIT_START_ACK setup must consume two START retries");
+
+  harness.PublishGyroOnly(100U);
+  harness.PublishGyroOnly(100099U);
+  Expect(harness.Commands().commands.size() == 4U,
+         "WAIT_START_ACK retry must be timed from the new epoch");
+  harness.PublishGyroOnly(100100U);
+  harness.PublishGyroOnly(200100U);
+  harness.PublishGyroOnly(300100U);
+  Expect(harness.Commands().commands.size() == 7U,
+         "WAIT_START_ACK must restore the bounded retry budget in the new epoch");
+  for (size_t index = 2U; index < harness.Commands().commands.size(); ++index)
+  {
+    ExpectSameCommand(harness.Commands().commands[index], start,
+                      "WAIT_START_ACK epoch retry must preserve the command");
+  }
+
+  harness.PublishEvent(AckFor(start), 300101U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW &&
+             harness.CameraUnderTest().SwitchCount() == 1U,
+         "WAIT_START_ACK must recover without repeating the camera switch");
+  Pass("timestamp_epoch_wait_start_ack");
+}
+
 void TestSwitchFailure()
 {
   Harness harness(Sync::SyncMode::TRIGGER, SwitchBehavior::FAIL);
@@ -1287,6 +1437,22 @@ int main(int argc, char** argv)
   if (test_case == "retry_exhausted")
   {
     TestRetryExhausted();
+  }
+  if (test_case == "timestamp_epoch_running")
+  {
+    TestTimestampEpochRunning();
+  }
+  if (test_case == "timestamp_epoch_wait_stop_ack")
+  {
+    TestTimestampEpochWaitStopAck();
+  }
+  if (test_case == "timestamp_epoch_settling")
+  {
+    TestTimestampEpochSettling();
+  }
+  if (test_case == "timestamp_epoch_wait_start_ack")
+  {
+    TestTimestampEpochWaitStartAck();
   }
   if (test_case == "switch_failure")
   {

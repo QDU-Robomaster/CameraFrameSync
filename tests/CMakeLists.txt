@@ -49,6 +49,10 @@ if(TARGET camera_frame_sync_profile_switch_test)
     malformed_start_ack
     retry
     retry_exhausted
+    timestamp_epoch_running
+    timestamp_epoch_wait_stop_ack
+    timestamp_epoch_settling
+    timestamp_epoch_wait_start_ack
     switch_failure
     ownership
     clock_domains

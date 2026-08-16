@@ -439,6 +439,7 @@ class CameraFrameSync : public LibXR::Application
   void QueueStartLocked();
   void FailControlLocked();
   void RestartForMismatchLocked();
+  void ResetTimestampEpochLocked(uint64_t gyro_timestamp_us);
   void ResetMatchingLocked();
   void ResetRawImuLocked();
 

@@ -444,8 +444,7 @@ void CameraFrameSync<FrameLayoutV>::OnGyroStatic(bool, Self* self,
         sensor_timestamp_us <= self->latest_raw_imu_timestamp_us_;
     if (timestamp_backwards)
     {
-      self->ResetRawImuLocked();
-      self->RestartForMismatchLocked();
+      self->ResetTimestampEpochLocked(sensor_timestamp_us);
     }
     self->latest_raw_imu_timestamp_us_ = sensor_timestamp_us;
     self->MaybeRetryCommandLocked(sensor_timestamp_us);
@@ -743,6 +742,46 @@ void CameraFrameSync<FrameLayoutV>::RestartForMismatchLocked()
   else
   {
     ResetMatchingLocked();
+  }
+}
+
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetTimestampEpochLocked(uint64_t gyro_timestamp_us)
+{
+  ResetRawImuLocked();
+  last_output_timestamp_valid_ = false;
+  last_output_timestamp_us_ = 0U;
+
+  if (sync_mode_ == SyncMode::TRIGGER && control_state_ == ControlState::RUNNING)
+  {
+    BeginRestartLocked(active_profile_, false);
+    return;
+  }
+  ResetMatchingLocked();
+
+  if (sync_mode_ != SyncMode::TRIGGER)
+  {
+    return;
+  }
+
+  switch (control_state_)
+  {
+    case ControlState::RUNNING:
+      break;
+    case ControlState::WAIT_STOP_ACK:
+    case ControlState::WAIT_START_ACK:
+      command_retry_count_ = 0U;
+      command_last_dispatch_imu_timestamp_us_ = 0U;
+      break;
+    case ControlState::SETTLING:
+      settle_deadline_us_ = gyro_timestamp_us > UINT64_MAX - camera_settle_us_
+                                ? UINT64_MAX
+                                : gyro_timestamp_us + camera_settle_us_;
+      break;
+    case ControlState::BYPASS:
+    case ControlState::SWITCHING_CAMERA:
+    case ControlState::FAILED:
+      break;
   }
 }
 

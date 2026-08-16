@@ -153,7 +153,6 @@ jobs:
             using ImageFrame = typename Base::ImageFrame;
 
             static inline constexpr FrameGeometry fixed_geometry{
-                .epoch = 1,
                 .width = FrameLayoutV.width,
                 .height = FrameLayoutV.height,
                 .step = FrameLayoutV.step,
@@ -166,7 +165,6 @@ jobs:
                 .sample_phase_x_native = 0.0F,
                 .sample_phase_y_native = 0.0F,
             };
-            static_assert(fixed_geometry.epoch != 0);
             static_assert(std::is_same_v<decltype(&ImageFrame::geometry),
                                          FrameGeometry ImageFrame::*>);
 
