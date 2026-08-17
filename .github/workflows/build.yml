@@ -20,8 +20,9 @@ jobs:
       - name: Checkout current module repo to ./Modules/${{ env.XR_MODULE_NAME }}
         uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           path: Modules/${{ env.XR_MODULE_NAME }}
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Create main.cpp
         run: |
@@ -90,8 +91,9 @@ jobs:
       - name: Checkout current module repo again
         uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           path: Modules/${{ env.XR_MODULE_NAME }}
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Align coordinated dependency branches
         shell: bash
