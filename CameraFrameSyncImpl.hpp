@@ -384,7 +384,6 @@ void CameraFrameSync<FrameLayoutV>::HandleImage(SharedFrame image)
         log_invalid_geometry = true;
       }
       monitor_image_drop_count_.fetch_add(1U, std::memory_order_relaxed);
-      AutoAimReplayBenchmark::RecordSyncDrop();
     }
     else
     {
@@ -401,7 +400,6 @@ void CameraFrameSync<FrameLayoutV>::HandleImage(SharedFrame image)
       {
         monitor_image_drop_count_.fetch_add(1U, std::memory_order_relaxed);
         monitor_overflow_count_.fetch_add(1U, std::memory_order_relaxed);
-        AutoAimReplayBenchmark::RecordSyncDrop();
       }
       else
       {
@@ -993,8 +991,6 @@ void CameraFrameSync<FrameLayoutV>::DispatchOutbound()
     ASSERT(output.frame.Valid());
     SyncedFrameTopicPayload payload = &output.frame;
     topics_->synced_frame.Publish(payload);
-    AutoAimReplayBenchmark::RecordSync(
-        static_cast<uint64_t>(output.frame.imu.timestamp_us));
     monitor_synced_output_count_.fetch_add(1U, std::memory_order_relaxed);
   }
 }

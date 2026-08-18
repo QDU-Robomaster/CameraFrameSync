@@ -29,7 +29,6 @@ depends:
 #include <string_view>
 #include <utility>
 
-#include "AutoAimReplayBenchmark.hpp"
 #include "CameraBase.hpp"
 #include "CameraFrameSyncCore.hpp"
 #include "CameraFrameSyncFrameQueue.hpp"

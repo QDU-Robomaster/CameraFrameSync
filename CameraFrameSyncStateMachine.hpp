@@ -92,7 +92,6 @@ void CameraFrameSync<FrameLayoutV>::ProcessTriggerMatchesLocked()
     if (!QueueSyncedFrameLocked(*image, *imu, trigger->imu_timestamp_us))
     {
       monitor_image_drop_count_.fetch_add(1U, std::memory_order_relaxed);
-      AutoAimReplayBenchmark::RecordSyncDrop();
     }
     CompleteMatchedImageLocked(camera_timestamp_us, trigger_sequence);
     const bool image_popped = images_.PopFront();
@@ -112,7 +111,6 @@ void CameraFrameSync<FrameLayoutV>::ProcessLatestMatchesLocked()
     if (!QueueSyncedFrameLocked(*image, imu, imu.sensor_timestamp_us))
     {
       monitor_image_drop_count_.fetch_add(1U, std::memory_order_relaxed);
-      AutoAimReplayBenchmark::RecordSyncDrop();
     }
     const bool popped = images_.PopFront();
     ASSERT(popped);
