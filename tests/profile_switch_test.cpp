@@ -401,6 +401,12 @@ class Harness
     quat_topic_.Publish(quat, timestamp);
   }
 
+  void PublishQuatOnly(uint64_t timestamp_us)
+  {
+    Sync::RawQuatSample quat(1.0F, 0.0F, 0.0F, 0.0F);
+    quat_topic_.Publish(quat, LibXR::MicrosecondTimestamp(timestamp_us));
+  }
+
   void PublishEvent(const SyncEvent& event, uint64_t timestamp_us)
   {
     SyncEvent copy = event;
@@ -1112,6 +1118,24 @@ void TestLatestMode()
   Pass("latest_mode");
 }
 
+void TestLatestModeIgnoresUnusedImu()
+{
+  Harness harness(Sync::SyncMode::LATEST_IMU);
+  for (uint64_t timestamp_us = 1U; timestamp_us <= 1024U; ++timestamp_us)
+  {
+    harness.PublishGyroOnly(timestamp_us);
+  }
+  harness.PublishQuatOnly(2000U);
+  harness.PublishGyroOnly(2001U);
+  harness.PublishFrame(60000U, MakeWideGeometry());
+
+  Expect(harness.SyncedFrames().frames.size() == 1U &&
+             static_cast<uint64_t>(harness.SyncedFrames().frames.front().imu.timestamp_us) ==
+                 2000U,
+         "LATEST_IMU must retain quaternion history when gyro input is continuous");
+  Pass("latest_mode_ignores_unused_imu");
+}
+
 void TestDeferredDispatchRetry()
 {
   Harness harness(Sync::SyncMode::TRIGGER);
@@ -1230,6 +1254,10 @@ int main(int argc, char** argv)
   if (test_case == "latest_mode")
   {
     TestLatestMode();
+  }
+  if (test_case == "latest_mode_ignores_unused_imu")
+  {
+    TestLatestModeIgnoresUnusedImu();
   }
   if (test_case == "deferred_dispatch_retry")
   {
