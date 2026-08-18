@@ -15,6 +15,7 @@ required_hardware: []
 depends:
   - qdu-future/CameraBase
   - qdu-future/CameraSync
+  - xrobot-org/DurationStatistics
 === END MANIFEST === */
 // clang-format on
 
@@ -33,6 +34,7 @@ depends:
 #include "CameraFrameSyncCore.hpp"
 #include "CameraFrameSyncFrameQueue.hpp"
 #include "CameraSync.hpp"
+#include "DurationStatistics.hpp"
 #include "app_framework.hpp"
 #include "libxr.hpp"
 #include "logger.hpp"
@@ -441,6 +443,7 @@ class CameraFrameSync : public LibXR::Application
   std::atomic<uint64_t> monitor_synced_output_count_{0U};
   std::atomic<uint64_t> monitor_reset_count_{0U};
   std::atomic<uint64_t> monitor_overflow_count_{0U};
+  XRobot::DurationStatistics synchronization_duration_{};
 };
 
 #include "CameraFrameSyncImpl.hpp"
