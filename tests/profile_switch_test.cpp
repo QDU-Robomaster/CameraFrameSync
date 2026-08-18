@@ -566,32 +566,42 @@ void TestTriggerStride()
 {
   Harness harness(Sync::SyncMode::TRIGGER);
   const StartupCommands startup = CompleteStartup(harness);
+  constexpr std::array<uint64_t, 4U> expected_trigger_times{21000U, 41000U, 71000U,
+                                                            81000U};
+  std::array<uint64_t, expected_trigger_times.size()> actual_trigger_times{};
+  size_t published_count = 0U;
+  auto check_and_release = [&]()
+  {
+    Expect(harness.SyncedFrames().frames.size() == 1U,
+           "each stride sample must publish one retained frame");
+    actual_trigger_times[published_count++] =
+        static_cast<uint64_t>(harness.SyncedFrames().frames.front().imu.timestamp_us);
+    harness.SyncedFrames().frames.front().image.Reset();
+    harness.SyncedFrames().frames.clear();
+  };
 
   PublishEdge(harness, startup.start, 1U, 21000U);
   harness.PublishFrame(100000U, MakeWideGeometry());
+  check_and_release();
 
   PublishEdge(harness, startup.start, 2U, 31000U);
   PublishEdge(harness, startup.start, 3U, 41000U);
   harness.PublishFrame(120000U, MakeWideGeometry());
+  check_and_release();
 
   PublishEdge(harness, startup.start, 4U, 51000U);
   PublishEdge(harness, startup.start, 5U, 61000U);
   PublishEdge(harness, startup.start, 6U, 71000U);
   harness.PublishFrame(150000U, MakeWideGeometry());
+  check_and_release();
 
   PublishEdge(harness, startup.start, 7U, 81000U);
   harness.PublishFrame(160000U, MakeWideGeometry());
+  check_and_release();
 
-  constexpr std::array<uint64_t, 4U> expected_trigger_times{21000U, 41000U, 71000U,
-                                                            81000U};
-  Expect(harness.SyncedFrames().frames.size() == expected_trigger_times.size(),
-         "stride 1/2/3 sequence must publish four frames");
-  for (size_t index = 0U; index < expected_trigger_times.size(); ++index)
-  {
-    Expect(static_cast<uint64_t>(harness.SyncedFrames().frames[index].imu.timestamp_us) ==
-               expected_trigger_times[index],
-           "camera gap must select and consume the target trigger");
-  }
+  Expect(published_count == expected_trigger_times.size() &&
+             actual_trigger_times == expected_trigger_times,
+         "camera gap must select and consume the target trigger");
   Pass("trigger_stride");
 }
 
@@ -1032,11 +1042,24 @@ void TestOwnership()
 
   PublishEdge(harness, start, 1U, 27001U);
   harness.PublishFrame(5000U, MakeNarrowGeometry());
+  Expect(harness.SyncedFrames().frames.size() == 1U &&
+             CameraTypes::SameFrameGeometry(
+                 harness.SyncedFrames().frames.front().GetImageFrame()->geometry,
+                 MakeNarrowGeometry()) &&
+             harness.Images().frames.front().Valid() &&
+             harness.Images().frames.front().Get() == old_frame &&
+             harness.CameraUnderTest().AvailableImageSlots() == 0U,
+         "two-slot pool must retain one old raw owner and one new synced owner");
+
+  harness.Images().frames.front().Reset();
+  Expect(harness.CameraUnderTest().AvailableImageSlots() == 1U,
+         "releasing the old raw owner must reopen one image slot");
+
   PublishEdge(harness, start, 2U, 32001U);
   harness.PublishFrame(10000U, MakeWideGeometry());
 
   Expect(harness.SyncedFrames().frames.size() == 2U,
-         "new NARROW and legal WIDE geometry must both publish");
+         "releasing the old owner must allow the next WIDE frame to publish");
   Expect(CameraTypes::SameFrameGeometry(
              harness.SyncedFrames().frames[0].GetImageFrame()->geometry,
              MakeNarrowGeometry()) &&
@@ -1044,9 +1067,6 @@ void TestOwnership()
                  harness.SyncedFrames().frames[1].GetImageFrame()->geometry,
                  MakeWideGeometry()),
          "CFS must validate each frame, not the active profile identity");
-  Expect(harness.Images().frames.front().Valid() &&
-             harness.Images().frames.front().Get() == old_frame,
-         "old raw owner must coexist with new synced owners");
   Expect(harness.CameraUnderTest().SwitchCount() == 1U,
          "retained old owner must not delay SwitchProfile");
   Pass("ownership");

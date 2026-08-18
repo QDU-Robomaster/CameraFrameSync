@@ -36,7 +36,7 @@ Topic 中的指针只借用到当前同步回调返回。需要在回调后继�
 回调内复制整个阶段包装或其中的 `SharedFrame`，再把副本移动到自己的稳定工作槽位；
 不得保存裸指针，也不得用异步 `QueuedSubscriber` 保存该指针。
 
-每份 `SharedFrame` 都共同持有 CameraBase 八槽对象池中的同一槽位。最后一份句柄析构后
+每份 `SharedFrame` 都共同持有 CameraBase 两槽对象池中的同一槽位。最后一份句柄析构后
 槽位自动归还，不复制像素，也不按帧分配堆内存。CameraFrameSync 内部的 image、trigger
 和 outbound FIFO 只是等待匹配及锁外发布的固定容量状态，不是另一套跨模块传输协议。
 
