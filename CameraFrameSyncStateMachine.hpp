@@ -3,7 +3,7 @@
 template <CameraTypes::FrameLayout FrameLayoutV>
 void CameraFrameSync<FrameLayoutV>::ProcessPendingLocked()
 {
-  auto synchronization_measurement = synchronization_duration_.Measure();
+  auto pending_processing_measurement = pending_processing_duration_.Measure();
   if (sync_mode_ == SyncMode::LATEST_IMU)
   {
     ProcessLatestMatchesLocked();

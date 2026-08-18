@@ -443,7 +443,7 @@ class CameraFrameSync : public LibXR::Application
   std::atomic<uint64_t> monitor_synced_output_count_{0U};
   std::atomic<uint64_t> monitor_reset_count_{0U};
   std::atomic<uint64_t> monitor_overflow_count_{0U};
-  XRobot::DurationStatistics synchronization_duration_{};
+  XRobot::DurationStatistics pending_processing_duration_{};
 };
 
 #include "CameraFrameSyncImpl.hpp"

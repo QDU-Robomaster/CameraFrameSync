@@ -226,3 +226,7 @@ constructor_args:
 - `FAILED`
 
 非法 geometry 只在首次出现时打印详细错误，避免持续刷日志。
+
+此外，`OnMonitor()` 输出 `pending_processing` 的累计次数、平均、最小和最大耗时，
+单位均为微秒。该统计覆盖每次 `ProcessPendingLocked()` 调用，包含没有可匹配帧时的
+快速返回；它用于观察同步处理开销，不等同于端到端相机同步延迟。
