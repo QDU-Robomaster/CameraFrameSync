@@ -116,6 +116,7 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
   const uint64_t resets = monitor_reset_count_.exchange(0U, std::memory_order_relaxed);
   const uint64_t overflows =
       monitor_overflow_count_.exchange(0U, std::memory_order_relaxed);
+  const auto synchronization = synchronization_duration_.GetSummary();
 
   ControlState state{};
   ProfileId profile{};
@@ -147,6 +148,13 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
       static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(synced),
       static_cast<unsigned long long>(resets),
       static_cast<unsigned long long>(overflows));
+  XR_LOG_INFO(
+      "CameraFrameSync synchronization count=%llu average_us=%llu minimum_us=%llu "
+      "maximum_us=%llu",
+      static_cast<unsigned long long>(synchronization.sample_count),
+      static_cast<unsigned long long>(synchronization.average_us),
+      static_cast<unsigned long long>(synchronization.minimum_us),
+      static_cast<unsigned long long>(synchronization.maximum_us));
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
