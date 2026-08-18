@@ -53,6 +53,7 @@ if(TARGET camera_frame_sync_profile_switch_test)
     ownership
     clock_domains
     latest_mode
+    latest_mode_ignores_unused_imu
     deferred_dispatch_retry)
     add_test(NAME camera_frame_sync_profile_switch_${_CASE}
              COMMAND camera_frame_sync_profile_switch_test ${_CASE})

@@ -21,8 +21,13 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
                                                LibXR::ApplicationManager& app,
                                                Base* camera, RuntimeParam runtime)
 {
-  ASSERT(camera != nullptr);
+  REQUIRE(camera != nullptr);
   camera_ = camera;
+  REQUIRE(!camera_->NameView().empty());
+  REQUIRE(!camera_->ImageTopicNameView().empty());
+  REQUIRE(!runtime.host_topic_domain_name.empty());
+  REQUIRE(!runtime.sync_command_topic_name.empty());
+  REQUIRE(!runtime.sync_result_topic_name.empty());
   calibration_ = camera_->Calibration();
   topics_.emplace(*camera_, runtime);
   callbacks_.emplace(this);
@@ -38,16 +43,16 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   raw_imu_frame_ = runtime.raw_imu_frame;
 
   const auto profiles = camera_->Profiles();
-  ASSERT(!profiles.empty());
-  ASSERT(profiles.size() <= 2U);
+  REQUIRE(!profiles.empty());
+  REQUIRE(profiles.size() <= 2U);
   for (std::size_t index = 0U; index < profiles.size(); ++index)
   {
-    ASSERT(profiles[index].trigger_period_us != 0U);
-    ASSERT(CameraTypes::ValidateFrameGeometry(frame_layout, calibration_,
-                                              profiles[index].geometry));
+    REQUIRE(profiles[index].trigger_period_us != 0U);
+    REQUIRE(CameraTypes::ValidateFrameGeometry(frame_layout, calibration_,
+                                               profiles[index].geometry));
     for (std::size_t other = index + 1U; other < profiles.size(); ++other)
     {
-      ASSERT(profiles[index].id != profiles[other].id);
+      REQUIRE(profiles[index].id != profiles[other].id);
     }
   }
 
@@ -77,8 +82,8 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   app.Register(*this);
 
   XR_LOG_INFO(
-      "CameraFrameSync: input=%s output=%s mode=%s profile=%u period_us=%u "
-      "settle_us=%llu",
+      XR_PRINTF("CameraFrameSync: input=%s output=%s mode=%s profile=%u period_us=%u "
+                "settle_us=%llu"),
       topics_->camera_image_name.c_str(), topics_->synced_frame_name.c_str(),
       SyncModeName(sync_mode_), static_cast<unsigned>(active_profile_),
       static_cast<unsigned>(active_trigger_period_us_),
@@ -133,9 +138,9 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
   }
 
   XR_LOG_INFO(
-      "CameraFrameSync monitor: mode=%s state=%s profile=%u period_us=%u "
-      "raw=%llu/%llu/%llu assembled=%llu trigger=%llu image=%llu retained=%llu "
-      "held=%llu pending_trigger=%llu drop=%llu synced=%llu reset=%llu overflow=%llu",
+      XR_PRINTF("CameraFrameSync monitor: mode=%s state=%s profile=%u period_us=%u "
+                "raw=%llu/%llu/%llu assembled=%llu trigger=%llu image=%llu retained=%llu "
+                "held=%llu pending_trigger=%llu drop=%llu synced=%llu reset=%llu overflow=%llu"),
       SyncModeName(sync_mode_), ControlStateName(state), static_cast<unsigned>(profile),
       static_cast<unsigned>(period_us), static_cast<unsigned long long>(raw_gyro),
       static_cast<unsigned long long>(raw_accl),
@@ -149,8 +154,8 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
       static_cast<unsigned long long>(resets),
       static_cast<unsigned long long>(overflows));
   XR_LOG_INFO(
-      "CameraFrameSync synchronization count=%llu average_us=%llu minimum_us=%llu "
-      "maximum_us=%llu",
+      XR_PRINTF("CameraFrameSync synchronization count=%llu average_us=%llu minimum_us=%llu "
+                "maximum_us=%llu"),
       static_cast<unsigned long long>(synchronization.sample_count),
       static_cast<unsigned long long>(synchronization.average_us),
       static_cast<unsigned long long>(synchronization.minimum_us),
@@ -432,6 +437,10 @@ void CameraFrameSync<FrameLayoutV>::OnGyroStatic(bool, Self* self,
       .sensor_timestamp_us = sensor_timestamp_us,
       .angular_velocity_xyz = ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_gyro_count_.fetch_add(1U, std::memory_order_relaxed);
+  if (self->sync_mode_ == SyncMode::LATEST_IMU)
+  {
+    return;
+  }
 
   std::optional<ProfileId> switch_profile;
   {
@@ -477,6 +486,10 @@ void CameraFrameSync<FrameLayoutV>::OnAcclStatic(bool, Self* self,
       .sensor_timestamp_us = static_cast<uint64_t>(timestamp),
       .linear_acceleration_xyz = ToImuVector(data, self->raw_imu_frame_)};
   self->monitor_raw_accl_count_.fetch_add(1U, std::memory_order_relaxed);
+  if (self->sync_mode_ == SyncMode::LATEST_IMU)
+  {
+    return;
+  }
   {
     LibXR::Mutex::LockGuard lock(self->sync_state_mutex_);
     if (self->pending_accls_->PushBackDropOldest(sample))
