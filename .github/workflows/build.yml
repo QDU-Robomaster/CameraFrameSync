@@ -138,6 +138,7 @@ jobs:
           cat > Modules/FakeCamera/FakeCamera.hpp <<'EOF'
           #pragma once
 
+          #include <span>
           #include <type_traits>
 
           /* === MODULE MANIFEST V2 ===
@@ -174,6 +175,9 @@ jobs:
             using CameraCalibration = typename Base::CameraCalibration;
             using FrameGeometry = typename Base::FrameGeometry;
             using ImageFrame = typename Base::ImageFrame;
+            using ProfileId = typename Base::ProfileId;
+            using CameraProfile = typename Base::CameraProfile;
+            using AppliedProfile = typename Base::AppliedProfile;
 
             static inline constexpr FrameGeometry fixed_geometry{
                 .width = FrameLayoutV.width,
@@ -187,6 +191,11 @@ jobs:
                 .reserved = 0,
                 .sample_phase_x_native = 0.0F,
                 .sample_phase_y_native = 0.0F,
+            };
+            static inline constexpr CameraProfile profile{
+                .id = ProfileId::WIDE,
+                .geometry = fixed_geometry,
+                .trigger_period_us = 10000U,
             };
             static_assert(std::is_same_v<decltype(&ImageFrame::geometry),
                                          FrameGeometry ImageFrame::*>);
@@ -202,6 +211,22 @@ jobs:
             void OnMonitor() override {}
             void SetExposure(double) override {}
             void SetGain(double) override {}
+
+            std::span<const CameraProfile> Profiles() const noexcept override
+            {
+              return std::span<const CameraProfile>(&profile, 1U);
+            }
+
+            LibXR::ErrorCode SwitchProfile(ProfileId id,
+                                            AppliedProfile& applied) override
+            {
+              if (id != profile.id)
+              {
+                return LibXR::ErrorCode::NOT_SUPPORT;
+              }
+              applied = {.id = profile.id, .geometry = profile.geometry};
+              return LibXR::ErrorCode::OK;
+            }
           };
           EOF
 
