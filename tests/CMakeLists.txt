@@ -9,14 +9,13 @@ add_executable(camera_frame_sync_frame_queue_test frame_queue_test.cpp)
 if(TARGET xr)
   find_package(Threads REQUIRED)
   add_executable(camera_frame_sync_profile_switch_test profile_switch_test.cpp)
-  target_link_libraries(camera_frame_sync_profile_switch_test
-                        PRIVATE xr Threads::Threads)
-  target_compile_features(camera_frame_sync_profile_switch_test
-                          PRIVATE cxx_std_20)
+  target_link_libraries(camera_frame_sync_profile_switch_test PRIVATE xr Threads::Threads)
+  target_compile_features(camera_frame_sync_profile_switch_test PRIVATE cxx_std_20)
 endif()
 
-target_include_directories(camera_frame_sync_sequence_test
-                           PRIVATE ${CMAKE_CURRENT_LIST_DIR}/..)
+target_include_directories(
+  camera_frame_sync_sequence_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/..
+)
 
 target_compile_features(camera_frame_sync_sequence_test PRIVATE cxx_std_20)
 target_compile_features(camera_frame_sync_frame_queue_test PRIVATE cxx_std_20)
@@ -29,10 +28,10 @@ if(MSVC)
   endif()
 endif()
 
-add_test(NAME camera_frame_sync_sequence_test
-         COMMAND camera_frame_sync_sequence_test)
+add_test(NAME camera_frame_sync_sequence_test COMMAND camera_frame_sync_sequence_test)
 add_test(NAME camera_frame_sync_frame_queue_test
-         COMMAND camera_frame_sync_frame_queue_test)
+         COMMAND camera_frame_sync_frame_queue_test
+)
 
 if(TARGET camera_frame_sync_profile_switch_test)
   foreach(
@@ -49,15 +48,25 @@ if(TARGET camera_frame_sync_profile_switch_test)
     malformed_start_ack
     retry
     retry_exhausted
+    timestamp_epoch_running
+    timestamp_epoch_wait_stop_ack
+    timestamp_epoch_settling
+    timestamp_epoch_wait_start_ack
+    timestamp_epoch_budget
+    timestamp_epoch_switching
+    duplicate_timestamp
     switch_failure
     ownership
     clock_domains
     latest_mode
     latest_mode_ignores_unused_imu
-    deferred_dispatch_retry)
+    runtime_param_compat
+    deferred_dispatch_retry
+    deferred_dispatch_epoch
+  )
     add_test(NAME camera_frame_sync_profile_switch_${_CASE}
-             COMMAND camera_frame_sync_profile_switch_test ${_CASE})
-    set_tests_properties(camera_frame_sync_profile_switch_${_CASE}
-                         PROPERTIES TIMEOUT 5)
+             COMMAND camera_frame_sync_profile_switch_test ${_CASE}
+    )
+    set_tests_properties(camera_frame_sync_profile_switch_${_CASE} PROPERTIES TIMEOUT 5)
   endforeach()
 endif()

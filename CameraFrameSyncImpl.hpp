@@ -28,6 +28,19 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   REQUIRE(!runtime.host_topic_domain_name.empty());
   REQUIRE(!runtime.sync_command_topic_name.empty());
   REQUIRE(!runtime.sync_result_topic_name.empty());
+  const auto profiles = camera_->Profiles();
+  REQUIRE(!profiles.empty());
+  if (!runtime.LegacyTimingMatchesProfile(profiles.front().trigger_period_us))
+  {
+    XR_LOG_ERROR(
+        "CameraFrameSync incompatible legacy timing: probe_div=%u "
+        "target_hz=%.3f "
+        "initial_period_us=%u",
+        runtime.legacy_sync_probe_div,
+        static_cast<double>(runtime.legacy_target_trigger_hz),
+        profiles.front().trigger_period_us);
+    throw std::runtime_error("CameraFrameSync: incompatible legacy timing");
+  }
   calibration_ = camera_->Calibration();
   topics_.emplace(*camera_, runtime);
   callbacks_.emplace(this);
@@ -42,8 +55,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   camera_settle_us_ = runtime.camera_settle_us;
   raw_imu_frame_ = runtime.raw_imu_frame;
 
-  const auto profiles = camera_->Profiles();
-  REQUIRE(!profiles.empty());
   REQUIRE(profiles.size() <= 2U);
   for (std::size_t index = 0U; index < profiles.size(); ++index)
   {
@@ -445,11 +456,10 @@ void CameraFrameSync<FrameLayoutV>::OnGyroStatic(bool, Self* self,
     LibXR::Mutex::LockGuard lock(self->sync_state_mutex_);
     const bool timestamp_backwards =
         self->latest_raw_imu_timestamp_us_ != 0U &&
-        sensor_timestamp_us <= self->latest_raw_imu_timestamp_us_;
+        sensor_timestamp_us < self->latest_raw_imu_timestamp_us_;
     if (timestamp_backwards)
     {
-      self->ResetRawImuLocked();
-      self->RestartForMismatchLocked();
+      self->ResetTimestampEpochLocked(sensor_timestamp_us);
     }
     self->latest_raw_imu_timestamp_us_ = sensor_timestamp_us;
     self->MaybeRetryCommandLocked(sensor_timestamp_us);
@@ -569,6 +579,7 @@ void CameraFrameSync<FrameLayoutV>::BeginRestartLocked(ProfileId profile,
   requested_profile_ = profile;
   requested_trigger_period_us_ = requested->trigger_period_us;
   switch_profile_after_settle_ = switch_profile;
+  epoch_recovery_ = false;
   settle_deadline_us_ = 0U;
   ClearCommandLocked();
   control_state_ = ControlState::WAIT_STOP_ACK;
@@ -583,6 +594,10 @@ template <CameraTypes::FrameLayout FrameLayoutV>
 bool CameraFrameSync<FrameLayoutV>::QueueCommandLocked(CameraSync::Operation operation,
                                                        uint32_t trigger_period_us)
 {
+  if (epoch_recovery_ && command_retry_count_ >= command_retry_limit)
+  {
+    return false;
+  }
   CameraSync::SyncCommand command{};
   command.operation = operation;
   command.active_level = sync_active_level_;
@@ -593,6 +608,7 @@ bool CameraFrameSync<FrameLayoutV>::QueueCommandLocked(CameraSync::Operation ope
   OutboundItem output{};
   output.kind = OutboundKind::SYNC_COMMAND;
   output.command = command;
+  output.consumes_retry = epoch_recovery_;
   if (!QueueOutboundLocked(std::move(output)))
   {
     return false;
@@ -608,7 +624,10 @@ void CameraFrameSync<FrameLayoutV>::ArmCommandLocked(
   pending_command_ = command;
   command_waiting_ack_ = true;
   command_pending_dispatch_ = true;
-  command_retry_count_ = 0U;
+  if (!epoch_recovery_)
+  {
+    command_retry_count_ = 0U;
+  }
   command_last_dispatch_imu_timestamp_us_ = 0U;
 }
 
@@ -618,7 +637,6 @@ void CameraFrameSync<FrameLayoutV>::ClearCommandLocked()
   pending_command_ = {};
   command_waiting_ack_ = false;
   command_pending_dispatch_ = false;
-  command_retry_count_ = 0U;
   command_last_dispatch_imu_timestamp_us_ = 0U;
 }
 
@@ -661,20 +679,21 @@ void CameraFrameSync<FrameLayoutV>::MaybeRetryCommandLocked(uint64_t gyro_timest
   OutboundItem output{};
   output.kind = OutboundKind::SYNC_COMMAND;
   output.command = pending_command_;
+  output.consumes_retry = true;
   if (!QueueOutboundLocked(std::move(output)))
   {
     FailControlLocked();
     return;
   }
   command_pending_dispatch_ = true;
-  ++command_retry_count_;
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
 std::optional<typename CameraFrameSync<FrameLayoutV>::ProfileId>
 CameraFrameSync<FrameLayoutV>::AdvanceSettlingLocked(uint64_t gyro_timestamp_us)
 {
-  if (control_state_ != ControlState::SETTLING || gyro_timestamp_us < settle_deadline_us_)
+  if (control_state_ != ControlState::SETTLING || camera_switch_in_progress_ ||
+      gyro_timestamp_us < settle_deadline_us_)
   {
     return std::nullopt;
   }
@@ -682,6 +701,7 @@ CameraFrameSync<FrameLayoutV>::AdvanceSettlingLocked(uint64_t gyro_timestamp_us)
   if (switch_profile_after_settle_)
   {
     control_state_ = ControlState::SWITCHING_CAMERA;
+    camera_switch_in_progress_ = true;
     return requested_profile_;
   }
 
@@ -703,7 +723,8 @@ void CameraFrameSync<FrameLayoutV>::ApplyProfileSwitch(ProfileId profile)
 
   {
     LibXR::Mutex::LockGuard lock(sync_state_mutex_);
-    if (control_state_ != ControlState::SWITCHING_CAMERA || requested_profile_ != profile)
+    camera_switch_in_progress_ = false;
+    if (control_state_ == ControlState::FAILED || requested_profile_ != profile)
     {
       return;
     }
@@ -716,7 +737,14 @@ void CameraFrameSync<FrameLayoutV>::ApplyProfileSwitch(ProfileId profile)
     active_profile_ = applied.id;
     active_trigger_period_us_ = requested_trigger_period_us_;
     switch_profile_after_settle_ = false;
-    QueueStartLocked();
+    if (control_state_ == ControlState::SWITCHING_CAMERA)
+    {
+      QueueStartLocked();
+    }
+    else
+    {
+      (void)AdvanceSettlingLocked(latest_raw_imu_timestamp_us_);
+    }
   }
   DispatchOutbound();
 }
@@ -736,6 +764,11 @@ void CameraFrameSync<FrameLayoutV>::QueueStartLocked()
 template <CameraTypes::FrameLayout FrameLayoutV>
 void CameraFrameSync<FrameLayoutV>::FailControlLocked()
 {
+  XR_LOG_ERROR("CameraFrameSync control failed: state=%s operation=%u seq=%u retries=%u",
+               ControlStateName(control_state_),
+               static_cast<unsigned>(pending_command_.operation),
+               static_cast<unsigned>(pending_command_.seq),
+               static_cast<unsigned>(command_retry_count_));
   control_state_ = ControlState::FAILED;
   ClearCommandLocked();
   ResetMatchingLocked();
@@ -751,6 +784,49 @@ void CameraFrameSync<FrameLayoutV>::RestartForMismatchLocked()
   else
   {
     ResetMatchingLocked();
+  }
+}
+
+template <CameraTypes::FrameLayout FrameLayoutV>
+void CameraFrameSync<FrameLayoutV>::ResetTimestampEpochLocked(uint64_t gyro_timestamp_us)
+{
+  latest_raw_imu_timestamp_us_ = gyro_timestamp_us;
+  ResetRawImuLocked();
+  last_output_timestamp_valid_ = false;
+  last_output_timestamp_us_ = 0U;
+
+  if (sync_mode_ == SyncMode::TRIGGER && control_state_ == ControlState::RUNNING)
+  {
+    BeginRestartLocked(active_profile_, false);
+    return;
+  }
+  ResetMatchingLocked();
+
+  if (sync_mode_ != SyncMode::TRIGGER)
+  {
+    return;
+  }
+
+  switch (control_state_)
+  {
+    case ControlState::RUNNING:
+      break;
+    case ControlState::WAIT_STOP_ACK:
+    case ControlState::WAIT_START_ACK:
+    case ControlState::SETTLING:
+    case ControlState::SWITCHING_CAMERA:
+      epoch_recovery_ = true;
+      ClearCommandLocked();
+      control_state_ = ControlState::WAIT_STOP_ACK;
+      settle_deadline_us_ = 0U;
+      if (!QueueCommandLocked(CameraSync::Operation::STOP_TRIGGER, 0U))
+      {
+        FailControlLocked();
+      }
+      break;
+    case ControlState::BYPASS:
+    case ControlState::FAILED:
+      break;
   }
 }
 
@@ -819,6 +895,7 @@ void CameraFrameSync<FrameLayoutV>::HandleSyncEventLocked(
     ClearCommandLocked();
     ResetMatchingLocked();
     control_state_ = ControlState::RUNNING;
+    epoch_recovery_ = false;
     return;
   }
 
@@ -969,6 +1046,20 @@ void CameraFrameSync<FrameLayoutV>::DispatchOutbound()
       if (command)
       {
         discard = !IsPendingCommandLocked(output.command);
+        if (!discard && output.consumes_retry)
+        {
+          if (command_retry_count_ >= command_retry_limit)
+          {
+            FailControlLocked();
+            discard = true;
+          }
+          else
+          {
+            // Claim this send before releasing the lock; retired queued items
+            // never consume an attempt.
+            ++command_retry_count_;
+          }
+        }
       }
     }
 

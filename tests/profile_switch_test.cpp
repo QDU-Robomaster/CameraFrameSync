@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "CameraFrameSync.hpp"
+#include "CameraSyncStateMachine.hpp"
 
 namespace
 {
@@ -974,6 +976,225 @@ void TestRetryExhausted()
   Pass("retry_exhausted");
 }
 
+void TestTimestampEpochRunning()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  const StartupCommands startup = CompleteStartup(harness);
+
+  PublishEdge(harness, startup.start, 1U, 21000U);
+  harness.PublishFrame(100000U, MakeWideGeometry());
+  Expect(harness.SyncedFrames().frames.size() == 1U,
+         "RUNNING epoch test must publish the old-epoch frame");
+  PublishEdge(harness, startup.start, 2U, 31000U);
+  harness.ClearCommandTrace();
+
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 1U,
+         "RUNNING timestamp rollback must restart with STOP");
+  const SyncCommand stop = harness.Commands().commands.front();
+  ExpectCommand(stop, Operation::STOP_TRIGGER, 0U,
+                "RUNNING timestamp rollback STOP fields are wrong");
+  harness.PublishEvent(AckFor(stop), 101U);
+  harness.PublishGyroOnly(10100U);
+  Expect(harness.Commands().commands.size() == 1U,
+         "new epoch must still honor the complete settle interval");
+  harness.PublishGyroOnly(10101U);
+  Expect(harness.Commands().commands.size() == 2U,
+         "new epoch settle deadline must publish START");
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishEvent(AckFor(start), 10102U);
+
+  harness.PublishFrame(1000U, MakeWideGeometry());
+  Expect(harness.SyncedFrames().frames.size() == 1U,
+         "old-epoch trigger queue must be cleared on rollback");
+  PublishEdge(harness, start, 1U, 10103U);
+  Expect(harness.SyncedFrames().frames.size() == 2U &&
+             static_cast<uint64_t>(
+                 harness.SyncedFrames().frames.back().imu.timestamp_us) == 10103U,
+         "new epoch must publish timestamps below the previous epoch");
+  Pass("timestamp_epoch_running");
+}
+
+void TestTimestampEpochWaitStopAck()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "WAIT_STOP_ACK epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  CameraSyncDetail::StateMachine mcu(kProfiles[0].trigger_period_us);
+  mcu.OnCommand(stop);
+  const auto completed = mcu.OnImu(5000000U);
+  Expect(completed.event_count == 1U, "MCU must execute STOP before clock rollback");
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 2U,
+         "rollback must send a fresh STOP without waiting for old uptime");
+  const SyncCommand fresh_stop = harness.Commands().commands.back();
+  Expect(fresh_stop.seq != stop.seq, "recovery STOP must retire the old sequence");
+  const auto cached = mcu.OnCommand(stop);
+  Expect(cached.event_count == 1U && cached.events[0].timestamp_us == 5000000U,
+         "real MCU duplicate must return the previous epoch's cached timestamp");
+  harness.PublishEvent(cached.events[0].event, cached.events[0].timestamp_us);
+  harness.PublishGyroOnly(101U);
+  Expect(harness.Commands().commands.size() == 2U &&
+             harness.CameraUnderTest().SwitchCount() == 0U,
+         "retired STOP ACK must not advance recovery");
+  mcu.OnCommand(fresh_stop);
+  const auto fresh = mcu.OnImu(102U);
+  Expect(fresh.event_count == 1U && fresh.events[0].timestamp_us == 102U,
+         "new STOP must obtain a new-epoch MCU confirmation");
+  harness.PublishEvent(fresh.events[0].event, fresh.events[0].timestamp_us);
+  harness.PublishGyroOnly(10102U);
+  const SyncCommand start = harness.Commands().commands.back();
+  ExpectCommand(start, Operation::START_TRIGGER, kProfiles[1].trigger_period_us,
+                "WAIT_STOP_ACK epoch recovery START fields are wrong");
+  harness.PublishEvent(AckFor(start), 10103U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW,
+         "WAIT_STOP_ACK must recover after a timestamp rollback");
+  Pass("timestamp_epoch_wait_stop_ack");
+}
+
+void TestTimestampEpochSettling()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "SETTLING epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  harness.PublishEvent(AckFor(stop), 500000U);
+  harness.PublishGyroOnly(509999U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 0U,
+         "SETTLING setup must remain before the old deadline");
+
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 2U,
+         "settling rollback must request fresh STOP confirmation");
+  const SyncCommand fresh_stop = harness.Commands().commands.back();
+  Expect(fresh_stop.seq != stop.seq, "settling rollback must use a fresh sequence");
+  harness.PublishGyroOnly(20000U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 0U,
+         "settle time alone cannot replace a fresh STOP ACK");
+  harness.PublishEvent(AckFor(fresh_stop), 20001U);
+  harness.PublishGyroOnly(30000U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 0U,
+         "fresh STOP requires the full settling interval");
+  harness.PublishGyroOnly(30001U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
+             harness.Commands().commands.size() == 3U,
+         "SETTLING must switch and publish START at the new epoch deadline");
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishEvent(AckFor(start), 30002U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW,
+         "SETTLING must recover after a timestamp rollback");
+  Pass("timestamp_epoch_settling");
+}
+
+void TestTimestampEpochWaitStartAck()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "WAIT_START_ACK epoch test must admit NARROW");
+  const SyncCommand stop = harness.Commands().commands.front();
+  harness.PublishEvent(AckFor(stop), 12000U);
+  harness.PublishGyroOnly(22000U);
+  const SyncCommand start = harness.Commands().commands.back();
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 3U,
+         "interrupted START must recover through STOP");
+  const SyncCommand fresh_stop = harness.Commands().commands.back();
+  ExpectCommand(fresh_stop, Operation::STOP_TRIGGER, 0U, "recovery must first STOP");
+  harness.PublishEvent(AckFor(start), 22001U);
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::STATE_ERR,
+         "retired START ACK must not enter RUNNING");
+  harness.PublishEvent(AckFor(fresh_stop), 101U);
+  harness.PublishGyroOnly(10101U);
+  const SyncCommand fresh_start = harness.Commands().commands.back();
+  Expect(fresh_start.seq != start.seq, "recovery must retire old START sequence");
+  harness.PublishEvent(AckFor(fresh_start), 10102U);
+  Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW &&
+             harness.CameraUnderTest().SwitchCount() == 1U,
+         "WAIT_START_ACK must recover without repeating the camera switch");
+  Pass("timestamp_epoch_wait_start_ack");
+}
+
+void TestTimestampEpochBudget()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "budget test must admit NARROW");
+  const auto base = harness.LastImuTimestamp();
+  harness.PublishGyroOnly(base + 100000U);
+  harness.PublishGyroOnly(base + 200000U);
+  Expect(harness.Commands().commands.size() == 3U, "setup must consume two retries");
+  harness.PublishGyroOnly(100U);
+  Expect(harness.Commands().commands.size() == 4U, "fresh STOP consumes the last retry");
+  harness.PublishGyroOnly(99U);
+  harness.PublishGyroOnly(98U);
+  harness.PublishGyroOnly(1000000U);
+  Expect(harness.Commands().commands.size() == 4U,
+         "repeated rollback cannot replenish exhausted recovery attempts");
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::STATE_ERR,
+         "exhaustion must remain FAILED");
+  Pass("timestamp_epoch_budget");
+}
+
+void TestTimestampEpochSwitching()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+  harness.CameraUnderTest().SetSwitchHook(
+      [&harness]()
+      {
+        harness.PublishGyroOnly(100U);
+        const auto stop = harness.Commands().commands.back();
+        ExpectCommand(stop, Operation::STOP_TRIGGER, 0U, "in-flight reset requires STOP");
+        harness.PublishEvent(AckFor(stop), 101U);
+        harness.PublishGyroOnly(10101U);
+        Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
+                   harness.Commands().commands.size() == 2U,
+               "settling cannot reenter an outstanding camera call or send START");
+      });
+  Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
+             LibXR::ErrorCode::OK,
+         "switching test must admit NARROW");
+  harness.PublishEvent(AckFor(harness.Commands().commands.front()), 12000U);
+  harness.PublishGyroOnly(22000U);
+  Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
+             harness.Commands().commands.size() == 3U,
+         "completed camera call may START only after fresh STOP and settling");
+  const auto start = harness.Commands().commands.back();
+  ExpectCommand(start, Operation::START_TRIGGER, kProfiles[1].trigger_period_us,
+                "recovery START must use validated target period");
+  harness.PublishEvent(AckFor(start), 10102U);
+  Pass("timestamp_epoch_switching");
+}
+
+void TestDuplicateTimestamp()
+{
+  Harness harness(Sync::SyncMode::TRIGGER);
+  CompleteStartup(harness);
+  harness.ClearCommandTrace();
+  harness.PublishGyroOnly(harness.LastImuTimestamp());
+  Expect(harness.Commands().commands.empty(), "duplicate timestamp is not a rollback");
+  Pass("duplicate_timestamp");
+}
+
 void TestSwitchFailure()
 {
   Harness harness(Sync::SyncMode::TRIGGER, SwitchBehavior::FAIL);
@@ -1156,7 +1377,52 @@ void TestLatestModeIgnoresUnusedImu()
   Pass("latest_mode_ignores_unused_imu");
 }
 
-void TestDeferredDispatchRetry()
+void TestRuntimeParamCompat()
+{
+  constexpr Sync::RuntimeParam current{Sync::SyncMode::TRIGGER,
+                                       17,
+                                       kDomainName,
+                                       kCommandTopicName,
+                                       kResultTopicName,
+                                       1U,
+                                       kSettleUs,
+                                       Sync::RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
+                                       "current_quat",
+                                       kSyncedTopicName};
+  constexpr Sync::RuntimeParam legacy{Sync::SyncMode::TRIGGER,
+                                      23,
+                                      kDomainName,
+                                      kCommandTopicName,
+                                      kResultTopicName,
+                                      3U,
+                                      1U,
+                                      100.0F,
+                                      Sync::RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
+                                      "legacy_quat"};
+  static_assert(!current.legacy_timing_provided && current.offset_us == 17);
+  static_assert(current.raw_quat_topic_name == "current_quat");
+  static_assert(legacy.legacy_timing_provided && legacy.offset_us == 23);
+  static_assert(legacy.legacy_sync_probe_div == 3U);
+  static_assert(legacy.raw_quat_topic_name == "legacy_quat");
+  Expect(current.LegacyTimingMatchesProfile(5000U), "current config owns no legacy rate");
+  Expect(legacy.LegacyTimingMatchesProfile(10000U), "100 Hz matches 10000 us");
+  Expect(!legacy.LegacyTimingMatchesProfile(5000U),
+         "legacy rate must not override profile");
+  auto replay = legacy;
+  replay.mode = Sync::SyncMode::LATEST_IMU;
+  replay.legacy_target_trigger_hz = 50.0F;
+  Expect(replay.LegacyTimingMatchesProfile(10000U),
+         "replay metadata must not start triggers");
+  auto invalid = legacy;
+  invalid.legacy_sync_probe_div = 4U;
+  Expect(!invalid.LegacyTimingMatchesProfile(10000U), "invalid legacy division rejected");
+  invalid = legacy;
+  invalid.legacy_target_trigger_hz = std::numeric_limits<float>::quiet_NaN();
+  Expect(!invalid.LegacyTimingMatchesProfile(10000U), "nonfinite legacy rate rejected");
+  Pass("runtime_param_compat");
+}
+
+void TestDeferredDispatchRetry(bool rollback = false)
 {
   Harness harness(Sync::SyncMode::TRIGGER);
   const StartupCommands startup = CompleteStartup(harness);
@@ -1182,6 +1448,15 @@ void TestDeferredDispatchRetry()
   }
   Expect(harness.Commands().commands.empty(),
          "undispatched STOP must not consume retries");
+  if (rollback)
+  {
+    for (uint64_t timestamp_us : {500U, 400U, 300U, 200U})
+    {
+      harness.PublishGyroOnly(timestamp_us);
+    }
+    Expect(harness.Commands().commands.empty(),
+           "retired queued commands must not be published by another dispatcher");
+  }
 
   harness.ReleaseSyncedBlock();
   publisher.join();
@@ -1190,15 +1465,17 @@ void TestDeferredDispatchRetry()
          "releasing the publisher must dispatch exactly one STOP");
 
   const SyncCommand stop = harness.Commands().commands.front();
-  harness.PublishEvent(AckFor(stop), 422000U);
-  harness.PublishGyroOnly(432000U);
+  const uint64_t stop_ack_us = rollback ? 201U : 422000U;
+  harness.PublishEvent(AckFor(stop), stop_ack_us);
+  harness.PublishGyroOnly(stop_ack_us + kSettleUs);
   Expect(harness.Commands().commands.size() == 2U &&
              harness.Commands().commands.back().operation == Operation::START_TRIGGER,
          "deferred STOP ACK must switch and dispatch START");
-  harness.PublishEvent(AckFor(harness.Commands().commands.back()), 432001U);
+  harness.PublishEvent(AckFor(harness.Commands().commands.back()),
+                       stop_ack_us + kSettleUs + 1U);
   Expect(harness.SyncUnderTest().ActiveProfile() == Camera::ProfileId::NARROW,
          "deferred transaction must finish on NARROW");
-  Pass("deferred_dispatch_retry");
+  Pass(rollback ? "deferred_dispatch_epoch" : "deferred_dispatch_retry");
 }
 }  // namespace
 
@@ -1259,9 +1536,37 @@ int main(int argc, char** argv)
   {
     TestRetryExhausted();
   }
+  if (test_case == "timestamp_epoch_running")
+  {
+    TestTimestampEpochRunning();
+  }
+  if (test_case == "timestamp_epoch_wait_stop_ack")
+  {
+    TestTimestampEpochWaitStopAck();
+  }
+  if (test_case == "timestamp_epoch_settling")
+  {
+    TestTimestampEpochSettling();
+  }
+  if (test_case == "timestamp_epoch_wait_start_ack")
+  {
+    TestTimestampEpochWaitStartAck();
+  }
   if (test_case == "switch_failure")
   {
     TestSwitchFailure();
+  }
+  if (test_case == "timestamp_epoch_budget")
+  {
+    TestTimestampEpochBudget();
+  }
+  if (test_case == "timestamp_epoch_switching")
+  {
+    TestTimestampEpochSwitching();
+  }
+  if (test_case == "duplicate_timestamp")
+  {
+    TestDuplicateTimestamp();
   }
   if (test_case == "ownership")
   {
@@ -1279,9 +1584,17 @@ int main(int argc, char** argv)
   {
     TestLatestModeIgnoresUnusedImu();
   }
+  if (test_case == "runtime_param_compat")
+  {
+    TestRuntimeParamCompat();
+  }
   if (test_case == "deferred_dispatch_retry")
   {
     TestDeferredDispatchRetry();
+  }
+  if (test_case == "deferred_dispatch_epoch")
+  {
+    TestDeferredDispatchRetry(true);
   }
   Fail("unknown profile-switch test case");
 }

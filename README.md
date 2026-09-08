@@ -50,9 +50,17 @@ Topic 中的指针只借用到当前同步回调返回。需要在回调后继�
 - `SyncedFrame::imu.timestamp_us` 在 `TRIGGER` 模式下等于匹配边沿的时间戳
 
 模块不会比较相机时间和 MCU 时间的绝对值。相机时间只用于计算相邻已匹配图像的 gap；
-下游排序使用 `SyncedFrame::imu.timestamp_us`。已发布的权威时间戳在模块生命周期内必须
-严格递增，迟到或回退的输出不会进入下游。一次 STOP/START 事务会清除本地 image/trigger
-匹配基线，因此相机时钟可在事务后重新起算，只要新的 MCU 触发时间仍然向前。
+下游排序使用 `SyncedFrame::imu.timestamp_us`。同一时钟 epoch 内的权威时间戳严格递增，
+迟到输出不会进入下游。检测到 gyro 时间戳回退时，会清除旧匹配和输出时间基线：
+TRIGGER 链路用新命令序号重新确认 STOP，忽略旧序号 ACK，再按新确认时间等待 settle。
+中断事务已消耗的重试次数不清零，恢复命令共用剩余额度；超限记录错误并进入 FAILED。
+尚未返回的相机切换不会重入，也不会越过新的 STOP/settle 边界发出 START。
+新 epoch 可以发布比上一 epoch 小的时间戳，下游需要重建跟踪时间基线。
+普通 STOP/START 只清除匹配基线，不清除同一 MCU 时钟内的输出顺序约束。
+
+旧 YAML 的 `sync_probe_div`、`target_trigger_hz` 由兼容构造入口接收，不恢复旧探针策略。
+`TRIGGER` 下要求旧频率与相机初始 profile 周期一致；`LATEST_IMU` 只校验元数据有效性，
+不使用它控制触发。无效旧参数记录错误并拒绝构造。
 
 ## TRIGGER 模式
 
@@ -128,7 +136,8 @@ sequence 不连续、边沿时间回退或 trigger FIFO 溢出都会清除本地
 - `RUNNING` 中请求当前 profile 直接返回 `OK`，不发送命令，也不调用 `SwitchProfile()`
 - 单 profile 相机仍在启动和异常恢复时执行 STOP/START，但永远不切相机
 - `SwitchProfile()` 失败时不发送 START，不假设旧配置可用，也不自动回滚
-- 失败后进入 `FAILED`，MCU 保持停止，后续对任一有效 profile 的请求都返回 `STATE_ERR`
+- 相机切换失败后进入 `FAILED`，不发送 START；后续有效 profile 请求都返回 `STATE_ERR`
+- 命令 ACK 超时也会进入 `FAILED`，但不能据此断言 MCU 未执行命令或触发已经停止
 
 非 `RUNNING` 控制阶段到达的图像立即释放。切档不等待八个图像槽全部回池；已经被下游
 持有的旧 profile `SharedFrame` 可以和新 profile 图像同时存在。
@@ -151,7 +160,7 @@ sequence 不连续、边沿时间回退或 trigger FIFO 溢出都会清除本地
 2. 丢弃早于当前 gyro 的 accl 和 quat。
 3. 三路 timestamp 完全一致时生成一条完整 IMU history 样本。
 4. 若 accl 或 quat 已晚于当前 gyro，只丢弃这条无法补齐的 gyro。
-5. gyro timestamp 重复或回退会清空原始 IMU history，并触发同档重同步。
+5. gyro timestamp 严格回退会清空原始 IMU history，并触发重同步；重复时间戳不建立新 epoch。
 
 队列溢出同样会清空原始 IMU 状态并重新同步。模块不会按历史周期合成或补齐 IMU。
 
