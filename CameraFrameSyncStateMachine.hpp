@@ -1,4 +1,5 @@
 #pragma once
+#include "libxr_def.hpp"
 
 template <CameraTypes::FrameLayout FrameLayoutV>
 void CameraFrameSync<FrameLayoutV>::ProcessPendingLocked()

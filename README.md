@@ -1,5 +1,16 @@
 # CameraFrameSync
 
+## Static assembly source line
+
+This source line uses explicit C++ constructor dependencies and ordered instance
+arguments. Inspect the current primary header with `xrobot_mod_parser --path .`;
+its declarations, not old manifest/config examples, define the interface.
+Historical HardwareContainer/ApplicationManager examples below apply only to the
+older dynamic source tags. Device/protocol descriptions remain relevant.
+See the XRobot [migration guide](https://github.com/xrobot-org/XRobot/blob/dev/MIGRATION.md).
+Compilation is not hardware validation; retain version-specific board evidence.
+
+
 `CameraFrameSync` 在单进程内完成两件事：
 
 - 从 `CameraBase<FrameLayoutV>` 的普通 Topic 接收并持有 `SharedFrame`
@@ -239,3 +250,11 @@ constructor_args:
 此外，`OnMonitor()` 输出 `pending_processing` 的累计次数、平均、最小和最大耗时，
 单位均为微秒。该统计覆盖每次 `ProcessPendingLocked()` 调用，包含没有可匹配帧时的
 快速返回；它用于观察同步处理开销，不等同于端到端相机同步延迟。
+
+## Profile-switch epoch test
+
+The timestamp-epoch fixture records a sample acquired during the camera switch
+and delivers it after the current gyro publication returns. A non-mutex Topic
+does not allow recursive publication into itself. The test verifies STOP, settle,
+and START recovery without reentering the completed camera switch; it does not
+change the runtime Topic or synchronization contract.

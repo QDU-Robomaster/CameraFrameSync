@@ -3,19 +3,13 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: In-process camera frame ownership and MCU trigger timestamp synchronization
-constructor_args:
-  camera: '@nullptr'
-template_args:
-  - Layout:
-      width: 720
-      height: 540
-      step: 2160
-      encoding: CameraTypes::Encoding::BGR8
-required_hardware: []
 depends:
-  - qdu-future/CameraBase
-  - qdu-future/CameraSync
-  - xrobot-org/DurationStatistics
+- id: QDU-Robomaster/CameraBase
+  ref: same-or-dev
+- id: QDU-Robomaster/CameraSync
+  ref: same-or-dev
+- id: xrobot-org/DurationStatistics
+  ref: same-or-dev
 === END MANIFEST === */
 // clang-format on
 
@@ -37,8 +31,8 @@ depends:
 #include "CameraFrameSyncFrameQueue.hpp"
 #include "CameraSync.hpp"
 #include "DurationStatistics.hpp"
-#include "app_framework.hpp"
 #include "libxr.hpp"
+#include "libxr_def.hpp"
 #include "logger.hpp"
 #include "transform.hpp"
 
@@ -62,7 +56,7 @@ enum class CameraFrameSyncRawImuFrame : uint8_t
  * mutex so synchronous subscribers may re-enter other module APIs safely.
  */
 template <CameraTypes::FrameLayout FrameLayoutV>
-class CameraFrameSync : public LibXR::Application
+class CameraFrameSync
 {
  public:
   using Self = CameraFrameSync<FrameLayoutV>;
@@ -188,14 +182,10 @@ class CameraFrameSync : public LibXR::Application
     }
   };
 
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base* camera);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base& camera);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base* camera, RuntimeParam runtime);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base& camera, RuntimeParam runtime);
+  CameraFrameSync(Base* camera);
+  CameraFrameSync(Base& camera);
+  CameraFrameSync(Base* camera, RuntimeParam runtime);
+  CameraFrameSync(Base& camera, RuntimeParam runtime);
 
   [[nodiscard]] const char* SyncedFrameTopicName() const;
   [[nodiscard]] const char* RawTopicDomainName() const;
@@ -221,7 +211,7 @@ class CameraFrameSync : public LibXR::Application
   void SetOffsetUs(int32_t offset_us);
 
   void FlushPendingFrames();
-  void OnMonitor() override;
+  void OnMonitor();
 
  private:
   template <typename T, std::size_t Capacity>

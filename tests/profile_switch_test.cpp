@@ -16,6 +16,7 @@
 
 #include "CameraFrameSync.hpp"
 #include "CameraSyncStateMachine.hpp"
+#include "ramfs.hpp"
 
 namespace
 {
@@ -210,9 +211,10 @@ enum class SwitchBehavior : uint8_t
 class MockCamera final : public Camera
 {
  public:
-  MockCamera(LibXR::HardwareContainer& hw, SwitchBehavior behavior,
+  MockCamera(LibXR::RamFS& external_ramfs, SwitchBehavior behavior,
              std::vector<TraceEvent>* trace, size_t profile_count)
-      : Camera(hw, MakeCalibration(), kCameraName, kImageTopicName, kImuTopicName),
+      : Camera(external_ramfs, MakeCalibration(), kCameraName, kImageTopicName,
+               kImuTopicName),
         behavior_(behavior),
         trace_(trace),
         profile_count_(profile_count)
@@ -289,8 +291,7 @@ class Harness
  public:
   Harness(Sync::SyncMode mode, SwitchBehavior behavior = SwitchBehavior::SUCCEED,
           bool retain_images = false, size_t profile_count = kProfiles.size())
-      : hw_(LibXR::Entry<LibXR::RamFS>{ramfs_, {"ramfs"}}),
-        domain_(kDomainName.data()),
+      : domain_(kDomainName.data()),
         command_topic_(
             LibXR::Topic::FindOrCreate<SyncCommand>(kCommandTopicName.data(), &domain_)),
         result_topic_(
@@ -310,7 +311,7 @@ class Harness
         synced_callback_(LibXR::Topic::Callback::Create(OnSyncedFrame, &synced_frames_)),
         blocking_synced_callback_(
             LibXR::Topic::Callback::Create(OnBlockingSyncedFrame, &synced_blocker_)),
-        camera_(hw_, behavior, &trace_, profile_count)
+        camera_(ramfs_, behavior, &trace_, profile_count)
   {
     commands_.trace = &trace_;
     command_topic_.RegisterCallback(command_callback_);
@@ -328,7 +329,7 @@ class Harness
     runtime.sync_result_topic_name = kResultTopicName;
     runtime.synced_frame_topic_name = kSyncedTopicName;
     runtime.camera_settle_us = kSettleUs;
-    sync_.emplace(hw_, app_, camera_, runtime);
+    sync_.emplace(camera_, runtime);
     camera_.BindSync(*sync_);
     commands_.sync = &*sync_;
   }
@@ -427,8 +428,6 @@ class Harness
 
  private:
   LibXR::RamFS ramfs_{};
-  LibXR::HardwareContainer hw_;
-  LibXR::ApplicationManager app_{};
   LibXR::Topic::Domain domain_;
   LibXR::Topic command_topic_;
   LibXR::Topic result_topic_;
@@ -1158,29 +1157,39 @@ void TestTimestampEpochSwitching()
   Harness harness(Sync::SyncMode::TRIGGER);
   CompleteStartup(harness);
   harness.ClearCommandTrace();
+  uint64_t queued_gyro_timestamp = 0U;
   harness.CameraUnderTest().SetSwitchHook(
-      [&harness]()
+      [&harness, &queued_gyro_timestamp]()
       {
-        harness.PublishGyroOnly(100U);
-        const auto stop = harness.Commands().commands.back();
-        ExpectCommand(stop, Operation::STOP_TRIGGER, 0U, "in-flight reset requires STOP");
-        harness.PublishEvent(AckFor(stop), 101U);
-        harness.PublishGyroOnly(10101U);
+        // Acquisition can observe a new epoch while switching. Topic delivery is
+        // serialized: publishing recursively into the active gyro Topic is invalid.
+        queued_gyro_timestamp = 100U;
         Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
-                   harness.Commands().commands.size() == 2U,
-               "settling cannot reenter an outstanding camera call or send START");
+                   harness.Commands().commands.size() == 1U,
+               "an outstanding camera call must not send START or reenter switching");
       });
   Expect(harness.SyncUnderTest().RequestProfile(Camera::ProfileId::NARROW) ==
              LibXR::ErrorCode::OK,
          "switching test must admit NARROW");
   harness.PublishEvent(AckFor(harness.Commands().commands.front()), 12000U);
   harness.PublishGyroOnly(22000U);
+  Expect(queued_gyro_timestamp == 100U && harness.CameraUnderTest().SwitchCount() == 1U &&
+             harness.Commands().commands.size() == 2U,
+         "completed switch must send its initial START before queued gyro delivery");
+
+  harness.PublishGyroOnly(queued_gyro_timestamp);
+  const auto stop = harness.Commands().commands.back();
+  ExpectCommand(stop, Operation::STOP_TRIGGER, 0U, "queued epoch reset requires STOP");
+  Expect(harness.Commands().commands.size() == 3U,
+         "rollback must replace the outstanding START with a fresh STOP");
+  harness.PublishEvent(AckFor(stop), 101U);
+  harness.PublishGyroOnly(10101U);
   Expect(harness.CameraUnderTest().SwitchCount() == 1U &&
-             harness.Commands().commands.size() == 3U,
-         "completed camera call may START only after fresh STOP and settling");
+             harness.Commands().commands.size() == 4U,
+         "recovery must settle and START without repeating the completed camera call");
   const auto start = harness.Commands().commands.back();
   ExpectCommand(start, Operation::START_TRIGGER, kProfiles[1].trigger_period_us,
-                "recovery START must use validated target period");
+                "recovery START must use the validated target period");
   harness.PublishEvent(AckFor(start), 10102U);
   Pass("timestamp_epoch_switching");
 }
@@ -1371,8 +1380,8 @@ void TestLatestModeIgnoresUnusedImu()
   harness.PublishFrame(60000U, MakeWideGeometry());
 
   Expect(harness.SyncedFrames().frames.size() == 1U &&
-             static_cast<uint64_t>(harness.SyncedFrames().frames.front().imu.timestamp_us) ==
-                 2000U,
+             static_cast<uint64_t>(
+                 harness.SyncedFrames().frames.front().imu.timestamp_us) == 2000U,
          "LATEST_IMU must retain quaternion history when gyro input is continuous");
   Pass("latest_mode_ignores_unused_imu");
 }
