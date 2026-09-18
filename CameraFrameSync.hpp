@@ -182,10 +182,11 @@ class CameraFrameSync
     }
   };
 
-  CameraFrameSync(Base* camera);
-  CameraFrameSync(Base& camera);
-  CameraFrameSync(Base* camera, RuntimeParam runtime);
-  CameraFrameSync(Base& camera, RuntimeParam runtime);
+  static RuntimeParam DefaultRuntime() { return {}; }
+
+  CameraFrameSync(
+      Base& camera,
+      RuntimeParam runtime = DefaultRuntime());
 
   [[nodiscard]] const char* SyncedFrameTopicName() const;
   [[nodiscard]] const char* RawTopicDomainName() const;

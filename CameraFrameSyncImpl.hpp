@@ -2,22 +2,11 @@
 #include "libxr_def.hpp"
 
 template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(Base* camera)
-    : CameraFrameSync(camera, RuntimeParam{})
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
+      Base& camera,
+      RuntimeParam runtime)
 {
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(Base& camera)
-    : CameraFrameSync(&camera, RuntimeParam{})
-{
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(Base* camera, RuntimeParam runtime)
-{
-  REQUIRE(camera != nullptr);
-  camera_ = camera;
+  camera_ = std::addressof(camera);
   REQUIRE(!camera_->NameView().empty());
   REQUIRE(!camera_->ImageTopicNameView().empty());
   REQUIRE(!runtime.host_topic_domain_name.empty());
@@ -93,12 +82,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(Base* camera, RuntimeParam runtim
       SyncModeName(sync_mode_), static_cast<unsigned>(active_profile_),
       static_cast<unsigned>(active_trigger_period_us_),
       static_cast<unsigned long long>(camera_settle_us_));
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(Base& camera, RuntimeParam runtime)
-    : CameraFrameSync(&camera, runtime)
-{
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
