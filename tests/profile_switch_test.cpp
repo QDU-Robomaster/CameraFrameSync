@@ -211,10 +211,9 @@ enum class SwitchBehavior : uint8_t
 class MockCamera final : public Camera
 {
  public:
-  MockCamera(LibXR::RamFS& external_ramfs, SwitchBehavior behavior,
-             std::vector<TraceEvent>* trace, size_t profile_count)
-      : Camera(external_ramfs, MakeCalibration(), kCameraName, kImageTopicName,
-               kImuTopicName),
+  MockCamera(LibXR::RamFS& ramfs, SwitchBehavior behavior, std::vector<TraceEvent>* trace,
+             size_t profile_count)
+      : Camera(ramfs, MakeCalibration(), kCameraName, kImageTopicName, kImuTopicName),
         behavior_(behavior),
         trace_(trace),
         profile_count_(profile_count)
@@ -1386,7 +1385,7 @@ void TestLatestModeIgnoresUnusedImu()
   Pass("latest_mode_ignores_unused_imu");
 }
 
-void TestRuntimeParamCompat()
+void TestRuntimeParam()
 {
   constexpr Sync::RuntimeParam current{Sync::SyncMode::TRIGGER,
                                        17,
@@ -1398,37 +1397,9 @@ void TestRuntimeParamCompat()
                                        Sync::RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
                                        "current_quat",
                                        kSyncedTopicName};
-  constexpr Sync::RuntimeParam legacy{Sync::SyncMode::TRIGGER,
-                                      23,
-                                      kDomainName,
-                                      kCommandTopicName,
-                                      kResultTopicName,
-                                      3U,
-                                      1U,
-                                      100.0F,
-                                      Sync::RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
-                                      "legacy_quat"};
-  static_assert(!current.legacy_timing_provided && current.offset_us == 17);
+  static_assert(current.offset_us == 17);
   static_assert(current.raw_quat_topic_name == "current_quat");
-  static_assert(legacy.legacy_timing_provided && legacy.offset_us == 23);
-  static_assert(legacy.legacy_sync_probe_div == 3U);
-  static_assert(legacy.raw_quat_topic_name == "legacy_quat");
-  Expect(current.LegacyTimingMatchesProfile(5000U), "current config owns no legacy rate");
-  Expect(legacy.LegacyTimingMatchesProfile(10000U), "100 Hz matches 10000 us");
-  Expect(!legacy.LegacyTimingMatchesProfile(5000U),
-         "legacy rate must not override profile");
-  auto replay = legacy;
-  replay.mode = Sync::SyncMode::LATEST_IMU;
-  replay.legacy_target_trigger_hz = 50.0F;
-  Expect(replay.LegacyTimingMatchesProfile(10000U),
-         "replay metadata must not start triggers");
-  auto invalid = legacy;
-  invalid.legacy_sync_probe_div = 4U;
-  Expect(!invalid.LegacyTimingMatchesProfile(10000U), "invalid legacy division rejected");
-  invalid = legacy;
-  invalid.legacy_target_trigger_hz = std::numeric_limits<float>::quiet_NaN();
-  Expect(!invalid.LegacyTimingMatchesProfile(10000U), "nonfinite legacy rate rejected");
-  Pass("runtime_param_compat");
+  Pass("runtime_param");
 }
 
 void TestDeferredDispatchRetry(bool rollback = false)
@@ -1593,9 +1564,9 @@ int main(int argc, char** argv)
   {
     TestLatestModeIgnoresUnusedImu();
   }
-  if (test_case == "runtime_param_compat")
+  if (test_case == "runtime_param")
   {
-    TestRuntimeParamCompat();
+    TestRuntimeParam();
   }
   if (test_case == "deferred_dispatch_retry")
   {

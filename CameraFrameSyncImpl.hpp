@@ -14,17 +14,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(
   REQUIRE(!runtime.sync_result_topic_name.empty());
   const auto profiles = camera_->Profiles();
   REQUIRE(!profiles.empty());
-  if (!runtime.LegacyTimingMatchesProfile(profiles.front().trigger_period_us))
-  {
-    XR_LOG_ERROR(
-        "CameraFrameSync incompatible legacy timing: probe_div=%u "
-        "target_hz=%.3f "
-        "initial_period_us=%u",
-        runtime.legacy_sync_probe_div,
-        static_cast<double>(runtime.legacy_target_trigger_hz),
-        profiles.front().trigger_period_us);
-    throw std::runtime_error("CameraFrameSync: incompatible legacy timing");
-  }
   calibration_ = camera_->Calibration();
   topics_.emplace(*camera_, runtime);
   callbacks_.emplace(this);

@@ -69,9 +69,8 @@ TRIGGER 链路用新命令序号重新确认 STOP，忽略旧序号 ACK，再按
 新 epoch 可以发布比上一 epoch 小的时间戳，下游需要重建跟踪时间基线。
 普通 STOP/START 只清除匹配基线，不清除同一 MCU 时钟内的输出顺序约束。
 
-旧 YAML 的 `sync_probe_div`、`target_trigger_hz` 由兼容构造入口接收，不恢复旧探针策略。
-`TRIGGER` 下要求旧频率与相机初始 profile 周期一致；`LATEST_IMU` 只校验元数据有效性，
-不使用它控制触发。无效旧参数记录错误并拒绝构造。
+触发周期只由相机 profile 的 `trigger_period_us` 决定，`RuntimeParam` 不再接收旧 YAML 的
+`sync_probe_div` 或 `target_trigger_hz`。
 
 ## TRIGGER 模式
 
