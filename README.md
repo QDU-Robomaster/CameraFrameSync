@@ -352,7 +352,7 @@ constexprs:
     value: '{.width = 800, .height = 600, .step = 2400, .encoding = CameraTypes::Encoding::BGR8}'
 modules:
   - module: QDU-Robomaster/CameraFrameSync
-    id: camera_frame_sync
+    id: CameraFrameSync_0
     template_args:
       - AutoAimRunConfig::MainFrameLayout
     args:
@@ -360,9 +360,9 @@ modules:
       - runtime: CameraFrameSync<AutoAimRunConfig::MainFrameLayout>::DefaultRuntime()
 ```
 
-`WebotsCamera_0` 是 WebotsCamera（或 HikCamera、CaptureFileCamera）实例的 id，它列在本实例之前，使用相同的 `template_args`。`runtime` 也可以展开为 `RuntimeParam` 全部字段的 YAML 映射，字段顺序见第 7 节；数据源已经自行同步时，其中 `mode` 取 `CameraFrameSyncMode::LATEST_IMU`。ArmorDetector、ArmorTracker 等下游模块以 `sync: camera_frame_sync` 引用本实例。
+`WebotsCamera_0` 是 WebotsCamera（或 HikCamera、CaptureFileCamera）实例的 id，它列在本实例之前，使用相同的 `template_args`。`runtime` 也可以展开为 `RuntimeParam` 全部字段的 YAML 映射，字段顺序见第 7 节；数据源已经自行同步时，其中 `mode` 取 `CameraFrameSyncMode::LATEST_IMU`。ArmorDetector、ArmorTracker 等下游模块以 `sync: CameraFrameSync_0` 引用本实例。
 
-`WebotsCamera_0` is the id of a WebotsCamera (or HikCamera, CaptureFileCamera) instance, listed before this instance and using the same `template_args`. `runtime` can also be expanded into a YAML mapping of all `RuntimeParam` fields in the order of section 7; when the data source is already synchronized by itself, its `mode` is `CameraFrameSyncMode::LATEST_IMU`. Downstream Modules such as ArmorDetector and ArmorTracker reference this instance with `sync: camera_frame_sync`.
+`WebotsCamera_0` is the id of a WebotsCamera (or HikCamera, CaptureFileCamera) instance, listed before this instance and using the same `template_args`. `runtime` can also be expanded into a YAML mapping of all `RuntimeParam` fields in the order of section 7; when the data source is already synchronized by itself, its `mode` is `CameraFrameSyncMode::LATEST_IMU`. Downstream Modules such as ArmorDetector and ArmorTracker reference this instance with `sync: CameraFrameSync_0`.
 
 ## 10. 依赖与硬件 / Dependencies and Hardware
 
