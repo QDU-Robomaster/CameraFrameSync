@@ -338,9 +338,9 @@ Public methods: `SyncedFrameTopicName()`, `RawTopicDomainName()`, `Calibration()
 
 ## 9. 配置示例 / Configuration Example
 
-`xrobot instance add QDU-Robomaster/CameraFrameSync` 写入实例条目与空的 `template_args`；`template_args` 填为帧布局 constexpr，`args` 按构造接口填写。帧布局与相机实例一致。下例取自 `bsp-webots-autoaim` 的配置，同进程仿真使用 `libxr_def_domain`：
+`xrobot instance add QDU-Robomaster/CameraFrameSync` 写入实例条目与空的 `template_args`；`template_args` 填为帧布局 constexpr，`camera` 填为相机实例的 id，`runtime` 为 `DefaultRuntime()` 表达式，`RuntimeParam` 的默认值见第 7 节。帧布局与相机实例一致：
 
-`xrobot instance add QDU-Robomaster/CameraFrameSync` writes the instance entry with an empty `template_args`; `template_args` is set to the frame layout constexpr and `args` follows the constructor interface. The frame layout equals that of the camera instance. The following example is taken from the `bsp-webots-autoaim` configuration, where in-process simulation uses `libxr_def_domain`:
+`xrobot instance add QDU-Robomaster/CameraFrameSync` writes the instance entry with an empty `template_args`; `template_args` is set to the frame layout constexpr, `camera` is set to the id of a camera instance, and `runtime` is the `DefaultRuntime()` expression, with the defaults of `RuntimeParam` listed in section 7. The frame layout equals that of the camera instance:
 
 ```yaml
 constexpr_namespace: AutoAimRunConfig
@@ -357,22 +357,12 @@ modules:
       - AutoAimRunConfig::MainFrameLayout
     args:
       - camera: WebotsCamera_0
-      - runtime:
-          mode: CameraFrameSyncMode::TRIGGER
-          offset_us: 0
-          host_topic_domain_name: "libxr_def_domain"
-          sync_command_topic_name: "camera_sync_command"
-          sync_result_topic_name: "camera_sync_result"
-          sync_active_level: 1
-          camera_settle_us: 10000
-          raw_imu_frame: CameraFrameSyncRawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP
-          raw_quat_topic_name: '{}'
-          synced_frame_topic_name: '{}'
+      - runtime: CameraFrameSync<AutoAimRunConfig::MainFrameLayout>::DefaultRuntime()
 ```
 
-`WebotsCamera_0` 是 WebotsCamera（或 HikCamera、CaptureFileCamera）实例的 id，它列在本实例之前，使用相同的 `template_args`。数据源已经自行同步时，`mode` 填 `CameraFrameSyncMode::LATEST_IMU`。ArmorDetector、ArmorTracker 等下游模块以 `sync: camera_frame_sync` 引用本实例。
+`WebotsCamera_0` 是 WebotsCamera（或 HikCamera、CaptureFileCamera）实例的 id，它列在本实例之前，使用相同的 `template_args`。`runtime` 也可以展开为 `RuntimeParam` 全部字段的 YAML 映射，字段顺序见第 7 节；数据源已经自行同步时，其中 `mode` 取 `CameraFrameSyncMode::LATEST_IMU`。ArmorDetector、ArmorTracker 等下游模块以 `sync: camera_frame_sync` 引用本实例。
 
-`WebotsCamera_0` is the id of a WebotsCamera (or HikCamera, CaptureFileCamera) instance, listed before this instance and using the same `template_args`. When the data source is already synchronized by itself, `mode` is `CameraFrameSyncMode::LATEST_IMU`. Downstream Modules such as ArmorDetector and ArmorTracker reference this instance with `sync: camera_frame_sync`.
+`WebotsCamera_0` is the id of a WebotsCamera (or HikCamera, CaptureFileCamera) instance, listed before this instance and using the same `template_args`. `runtime` can also be expanded into a YAML mapping of all `RuntimeParam` fields in the order of section 7; when the data source is already synchronized by itself, its `mode` is `CameraFrameSyncMode::LATEST_IMU`. Downstream Modules such as ArmorDetector and ArmorTracker reference this instance with `sync: camera_frame_sync`.
 
 ## 10. 依赖与硬件 / Dependencies and Hardware
 
