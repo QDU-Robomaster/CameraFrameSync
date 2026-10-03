@@ -92,8 +92,8 @@ class SampleHistory
 }
 
 /**
- * Camera timestamps are in a device-local clock. Only adjacent gaps are used;
- * no absolute comparison with the MCU clock is valid.
+ * Camera timestamps belong to a device-local clock, so only the gap between
+ * adjacent timestamps is used.
  */
 [[nodiscard]] inline uint64_t ImageGapToleranceUs(uint64_t trigger_period_us)
 {

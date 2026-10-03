@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: In-process camera frame ownership and MCU trigger timestamp synchronization
+module_description: 相机帧与 MCU 触发时间戳同步模块：持有相机帧并与 IMU 触发时间配对，发布 SyncedFrame / Camera frame and MCU trigger timestamp synchronization Module that holds camera frames, pairs them with IMU trigger times and publishes SyncedFrame
 depends:
 - id: QDU-Robomaster/CameraBase
   ref: same-or-dev
