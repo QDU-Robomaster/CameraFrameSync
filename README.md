@@ -119,24 +119,9 @@ max(1500 us, trigger_period_us / 4)
 
 ACK、重试与失败：operation 或 seq 不属于当前待处理命令的 ACK 被忽略。operation 和 seq 已匹配、但 active level、reserved、effective period 或 START `trigger_sequence` 非法时，状态进入 `FAILED`。STOP / START 初次发布后，以 raw gyro 时间每 100 ms 重发同一条完整命令，最多重试三次。仍在 outbound FIFO、尚未真正发布的命令在发布之后才开始计时与计数。重试耗尽、相机切档失败或 outbound FIFO 无法接纳控制项时，状态进入 `FAILED`。
 
-`TRIGGER` is the default mode on the machine. On construction it starts one same-profile resynchronization of the current profile:
+`TRIGGER` is the default mode on the machine. On construction it starts one same-profile resynchronization of the current profile, through the state sequence of the first code block above.
 
-```text
-WAIT_STOP_ACK
-  -> SETTLING
-  -> WAIT_START_ACK
-  -> RUNNING
-```
-
-On a real profile switch, one more state follows `SETTLING`:
-
-```text
-WAIT_STOP_ACK
-  -> SETTLING
-  -> SWITCHING_CAMERA
-  -> WAIT_START_ACK
-  -> RUNNING
-```
+On a real profile switch, one more state follows `SETTLING`, as in the second code block above.
 
 Procedure:
 
@@ -150,19 +135,9 @@ Procedure:
 
 The procedure consists of the three steps STOP / settle / START, implemented by the two commands `STOP_TRIGGER` and `START_TRIGGER`. `CameraFrameSyncMode::RAW_PROBE` is a source-level alias of `TRIGGER`.
 
-Image and edge matching: once `RUNNING`, every valid `FRAME_TRIGGER` enters the trigger FIFO of capacity 256. The first image is paired with the first real edge in the queue after this START. Later images select the target edge by:
+Image and edge matching: once `RUNNING`, every valid `FRAME_TRIGGER` enters the trigger FIFO of capacity 256. The first image is paired with the first real edge in the queue after this START. Later images select the target edge by the formulas in the first code block above.
 
-```text
-camera_gap = current_camera_ts - previous_camera_ts
-stride = round(camera_gap / active_profile.trigger_period_us)
-target_trigger_sequence = previous_trigger_sequence + stride
-```
-
-The residual limit is:
-
-```text
-max(1500 us, trigger_period_us / 4)
-```
+The residual limit is the expression in the second code block above.
 
 `stride` is at most 128. When a valid `stride` is 2 or larger, the Module skips older real edges in the trigger FIFO and consumes the target sequence directly, which corresponds to the camera having delivered fewer images. While the target edge has not arrived, the image keeps waiting. In the following cases the Module clears the local matching and runs STOP / settle / START again on the current profile, keeping the current camera profile meanwhile: an unexplainable camera gap, a repeated or regressing camera time, a discontinuous edge sequence, a regressing edge time, a trigger FIFO overflow.
 
