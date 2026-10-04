@@ -27,11 +27,11 @@ A `SyncedFrame` holds a monotonically increasing `sequence`, the image handle `i
 相机时间与 MCU / IMU 时间属于两个独立的设备时钟域：
 
 - `ImageFrame::timestamp_us` 保存相机采样时间。
-- 原始 IMU 使用 Topic envelope timestamp。
-- `FRAME_TRIGGER` 的 Topic envelope timestamp 是 MCU 产生真实 GPIO 边沿时的 IMU 时间。
+- 原始 IMU 使用 Topic 消息时间戳（envelope timestamp）。
+- `FRAME_TRIGGER` 的 Topic 消息时间戳是 MCU 产生真实 GPIO 边沿时的 IMU 时间。
 - `TRIGGER` 模式下，`SyncedFrame::imu.timestamp_us` 等于匹配边沿的时间戳。
 
-相机时间只用于计算相邻已匹配图像的间隔（gap），下游排序使用 `SyncedFrame::imu.timestamp_us`。同一时钟 epoch 内的权威时间戳严格递增，迟到输出被丢弃。gyro 时间戳回退时开始新的 epoch：旧匹配、原始 IMU 和输出时间基线被清除，`TRIGGER` 链路以新的命令序号重新确认 STOP，忽略旧序号的 ACK，再按新确认时间等待 settle。被中断事务已消耗的重试次数保留，恢复命令共用剩余额度，超限时记录错误并进入 `FAILED`。尚未返回的相机切换在新的 STOP / settle 边界之后才允许发出 START。新 epoch 发布的时间戳可以小于上一 epoch，下游据此重建跟踪时间基线。普通 STOP / START 只清除匹配基线，同一 MCU 时钟内的输出顺序约束继续保留。
+相机时间只用于计算相邻已匹配图像的间隔（gap），下游排序使用 `SyncedFrame::imu.timestamp_us`。同一时钟纪元（epoch）内的权威时间戳严格递增，迟到输出被丢弃。gyro 时间戳回退时开始新的纪元：旧匹配、原始 IMU 和输出时间基线被清除，`TRIGGER` 链路以新的命令序号重新确认 STOP，忽略旧序号的 ACK，再从新的确认时间起等待稳定时间（settle）。被中断事务已消耗的重试次数保留，恢复命令共用剩余额度，超限时记录错误并进入 `FAILED`。尚未返回的相机切换在新的 STOP / 稳定等待边界之后才允许发出 START。新纪元发布的时间戳可以小于上一纪元，下游据此重建跟踪时间基线。普通 STOP / START 只清除匹配基线，同一 MCU 时钟内的输出顺序约束继续保留。
 
 触发周期由相机 profile 的 `trigger_period_us` 决定。
 
@@ -87,9 +87,9 @@ WAIT_STOP_ACK
 6. START ACK 返回相同的 period 且 `trigger_sequence=0`，随后进入 `RUNNING`。
 7. START 之后第一条真实边沿的 `trigger_sequence` 为 1；后续每个真实边沿加一、时间戳严格递增，event 的 `seq` 等于本次生效的 START seq。
 
-流程仅含 STOP / settle / START 三步，由 `STOP_TRIGGER` 与 `START_TRIGGER` 两种命令实现。`CameraFrameSyncMode::RAW_PROBE` 是 `TRIGGER` 的源码别名。
+流程仅含 STOP / 稳定等待 / START 三步，由 `STOP_TRIGGER` 与 `START_TRIGGER` 两种命令实现。`CameraFrameSyncMode::RAW_PROBE` 是 `TRIGGER` 的源码别名。
 
-图像与边沿匹配：进入 `RUNNING` 后，每个合法 `FRAME_TRIGGER` 进入容量为 256 的 trigger FIFO。第一张图像与本次 START 之后队列中的第一条真实边沿配对。后续图像按下式选择目标边沿：
+图像与边沿匹配：进入 `RUNNING` 后，每个合法 `FRAME_TRIGGER` 进入容量为 256 的触发边沿 FIFO。第一张图像与本次 START 之后队列中的第一条真实边沿配对。后续图像按下式选择目标边沿：
 
 ```text
 camera_gap = current_camera_ts - previous_camera_ts
@@ -103,7 +103,7 @@ target_trigger_sequence = previous_trigger_sequence + stride
 max(1500 us, trigger_period_us / 4)
 ```
 
-`stride` 上限为 128。合法 `stride` 为 2 或更大时，模块跳过 trigger FIFO 中较旧的真实边沿，直接消费目标 sequence，对应相机少交付了图像的情形。目标边沿尚未到达时图像继续等待。出现以下情形时，模块清除本地匹配并对当前 profile 重新执行 STOP / settle / START，期间保持当前相机 profile：无法解释的 camera gap、重复或回退的相机时间、边沿 sequence 不连续、边沿时间回退、trigger FIFO 溢出。
+`stride` 上限为 128。合法 `stride` 为 2 或更大时，模块跳过触发边沿 FIFO 中较旧的真实边沿，直接消费目标 sequence，对应相机少交付了图像的情形。目标边沿尚未到达时图像继续等待。出现以下情形时，模块清除本地匹配并对当前 profile 重新执行 STOP / 稳定等待 / START，期间保持当前相机 profile：无法解释的 camera gap、重复或回退的相机时间、边沿 sequence 不连续、边沿时间回退、触发边沿 FIFO 溢出。
 
 匹配到边沿后，模块在最多 1024 条的 IMU history 中寻找对应样本。`offset_us=0` 要求精确命中该边沿时间；非零 offset 在 IMU 时间域中选择 `trigger_timestamp + offset_us` 附近 500 us 内最近的样本。未来样本尚未到达时继续等待，找不到合法样本时重新同步。无论选用哪条 IMU 内容，发布的 `SyncedFrame::imu.timestamp_us` 保留原始 `FRAME_TRIGGER` 时间。`SetOffsetUs()` 可在运行时修改 offset。
 
@@ -113,11 +113,11 @@ max(1500 us, trigger_period_us / 4)
 2. 早于当前 gyro 的 accl 和 quat 被丢弃。
 3. 三路 timestamp 一致时生成一条完整的 IMU history 样本。
 4. accl 或 quat 已晚于当前 gyro 时，丢弃该条无法补齐的 gyro。
-5. gyro timestamp 严格回退时清空原始 IMU 状态并按第 2 节建立新 epoch；时间戳重复时清空 history 并重新同步。
+5. gyro timestamp 严格回退时清空原始 IMU 状态并按第 2 节开始新的纪元；时间戳重复时清空 history 并重新同步。
 
 队列溢出时同样清空原始 IMU 状态并重新同步。
 
-ACK、重试与失败：operation 或 seq 不属于当前待处理命令的 ACK 被忽略。operation 和 seq 已匹配、但 active level、reserved、effective period 或 START `trigger_sequence` 非法时，状态进入 `FAILED`。STOP / START 初次发布后，以 raw gyro 时间每 100 ms 重发同一条完整命令，最多重试三次。仍在 outbound FIFO、尚未真正发布的命令在发布之后才开始计时与计数。重试耗尽、相机切档失败或 outbound FIFO 无法接纳控制项时，状态进入 `FAILED`。
+ACK、重试与失败：operation 或 seq 不属于当前待处理命令的 ACK 被忽略。operation 和 seq 已匹配、但 active level、reserved、effective period 或 START `trigger_sequence` 非法时，状态进入 `FAILED`。STOP / START 初次发布后，以 raw gyro 时间每 100 ms 重发同一条完整命令，最多重试三次。仍在待发送 FIFO（outbound FIFO）中、尚未真正发布的命令在发布之后才开始计时与计数。重试耗尽、相机切档失败或待发送 FIFO 无法接纳控制项时，状态进入 `FAILED`。
 
 `TRIGGER` is the default mode on the machine. On construction it starts one same-profile resynchronization of the current profile, through the state sequence of the first code block above.
 
@@ -159,7 +159,7 @@ ACK, retry and failure: an ACK whose operation or seq does not belong to the pen
 
 相机通过 `Profiles()` 声明一到两个固定 profile（构造时检查 ID 唯一、周期非零、几何合法）。每项包含 `ProfileId`、逐帧 geometry 和直接传给 MCU 的 `trigger_period_us`。
 
-`RequestProfile()` 接纳异步的 STOP / settle / SwitchProfile / START 事务：
+`RequestProfile()` 接纳异步的 STOP / 稳定等待 / SwitchProfile / START 事务：
 
 - 相机不支持的 profile 返回 `NOT_SUPPORT`。
 - 非 `RUNNING` 状态（包括控制阶段和 `FAILED`）返回 `STATE_ERR`。
@@ -172,7 +172,7 @@ ACK, retry and failure: an ACK whose operation or seq does not belong to the pen
 
 构造时模块复制相机的原生 `CameraCalibration`（`Calibration()` 返回）。每张图像携带不可变的 `ImageFrame::geometry`，提交后像素和 geometry 保持只读。CameraFrameSync 验证该快照能由 `FrameLayoutV` 承载并落在原生标定范围内，其它合法 geometry 同样被接受。
 
-profile id 因此仅存在于控制面。下游使用当前帧的 geometry，把像素坐标映射到统一的原生相机或物理坐标，无需 geometry epoch、全链路 barrier 或下游 reset Topic。
+profile id 因此仅存在于控制面。下游按当前帧的 geometry 把像素坐标映射到统一的原生相机坐标或物理坐标。
 
 The camera declares one or two fixed profiles through `Profiles()` (the constructor checks unique IDs, non-zero periods and valid geometry). Each entry holds a `ProfileId`, the per-frame geometry and the `trigger_period_us` passed directly to the MCU.
 
@@ -189,7 +189,7 @@ Images arriving in a control phase other than `RUNNING` are released immediately
 
 On construction the Module copies the native `CameraCalibration` of the camera (returned by `Calibration()`). Every image carries an immutable `ImageFrame::geometry`, and pixels and geometry stay read-only after submission. CameraFrameSync validates that the snapshot can be carried by `FrameLayoutV` and lies within the native calibration range; any other valid geometry is accepted as well.
 
-The profile id therefore lives in the control plane only. Downstream Modules use the geometry of the current frame to map pixel coordinates to unified native-camera or physical coordinates, and a geometry epoch, a pipeline-wide barrier or a downstream reset Topic is unnecessary.
+The profile id therefore lives in the control plane only. Downstream Modules map pixel coordinates to unified native-camera or physical coordinates with the geometry of the current frame.
 
 ## 5. LATEST_IMU 模式 / LATEST_IMU Mode
 
@@ -197,7 +197,7 @@ The profile id therefore lives in the control plane only. Downstream Modules use
 
 - 发送 `CameraSync::SyncCommand` 的步骤省略。
 - 仅当前 profile 可用（`RequestProfile()` 对当前 profile 返回 `OK`，其余返回 `NOT_SUPPORT`）。
-- 只消费 quat 样本，以 quat envelope timestamp 作为输出权威时间，角速度和加速度置零。
+- 只消费 quat 样本，以 quat 的 Topic 消息时间戳作为输出权威时间，角速度和加速度置零。
 - 每张图像取最新 quat；自上次输出后没有时间戳更新的 quat 时，该图像被丢弃，同一 quat timestamp 只发布一次。
 - `offset_us` 作用于 `TRIGGER` 的边沿匹配，`LATEST_IMU` 使用 quat 时间原值。
 
@@ -217,9 +217,9 @@ The internal control state of this mode is `BYPASS`.
 
 Topic 中的指针在当前同步回调返回前有效。图像需要在回调后继续使用时，订阅者在回调内复制整个 `SyncedFrame` 或其中的 `SharedFrame`，再把副本移动到自己的稳定工作槽位。异步订阅者（如 `QueuedSubscriber`）保存复制后的副本。
 
-每份 `SharedFrame` 共同持有 CameraBase 两槽对象池中的同一槽位。最后一份句柄析构后槽位归还对象池，像素不被复制，每帧也无堆内存分配。CameraFrameSync 内部的 image、trigger 和 outbound FIFO 是等待匹配及锁外发布用的固定容量状态。
+每份 `SharedFrame` 共同持有 CameraBase 两槽对象池中的同一槽位。最后一份句柄析构后槽位归还对象池，像素不被复制，每帧也无堆内存分配。CameraFrameSync 内部的图像 FIFO、触发边沿 FIFO 和待发送 FIFO 是等待匹配及锁外发布用的固定容量状态。
 
-启动日志记录输入 / 输出 Topic、模式、active profile、触发周期和 settle 时间。`OnMonitor()` 由 XRobot 监控循环调用，报告当前控制状态、profile、period，以及自上次调用以来的 raw / assembled IMU、真实 trigger、输入 / 持有 / 丢弃图像、同步输出、重同步和溢出计数，另报告当前持有的图像数和待匹配 trigger 数。控制状态取值：
+启动日志记录输入 / 输出 Topic、模式、active profile、触发周期和稳定等待时间。`OnMonitor()` 由 XRobot 监控循环调用，报告当前控制状态、profile、period，以及自上次调用以来的 raw / assembled IMU、真实 trigger、输入 / 持有 / 丢弃图像、同步输出、重同步和溢出计数，另报告当前持有的图像数和待匹配 trigger 数。控制状态取值：
 
 - `BYPASS`
 - `WAIT_STOP_ACK`
@@ -338,9 +338,9 @@ Public methods: `SyncedFrameTopicName()`, `RawTopicDomainName()`, `Calibration()
 
 ## 9. 配置示例 / Configuration Example
 
-`xrobot instance add QDU-Robomaster/CameraFrameSync` 写入实例条目与空的 `template_args`；`template_args` 填为帧布局 constexpr，`camera` 填为相机实例的 id，`runtime` 为 `DefaultRuntime()` 表达式，`RuntimeParam` 的默认值见第 7 节。帧布局与相机实例一致：
+`xrobot instance add QDU-Robomaster/CameraFrameSync --template-arg <FrameLayout>` 写入的实例：`template_args` 为帧布局 constexpr，`camera` 填为相机实例的 id，`runtime` 为 `DefaultRuntime()` 表达式，`RuntimeParam` 的默认值见第 7 节。帧布局与相机实例一致：
 
-`xrobot instance add QDU-Robomaster/CameraFrameSync` writes the instance entry with an empty `template_args`; `template_args` is set to the frame layout constexpr, `camera` is set to the id of a camera instance, and `runtime` is the `DefaultRuntime()` expression, with the defaults of `RuntimeParam` listed in section 7. The frame layout equals that of the camera instance:
+An instance written by `xrobot instance add QDU-Robomaster/CameraFrameSync --template-arg <FrameLayout>`: `template_args` is the frame layout constexpr, `camera` is set to the id of a camera instance, and `runtime` is the `DefaultRuntime()` expression, with the defaults of `RuntimeParam` listed in section 7. The frame layout equals that of the camera instance:
 
 ```yaml
 constexpr_namespace: AutoAimRunConfig
@@ -373,7 +373,7 @@ modules:
 - `xrobot-org/DurationStatistics`：`pending_processing` 耗时统计。
 - LibXR（含 Eigen）。
 
-硬件：相机的触发输入由 MCU 侧 CameraSync 驱动；IMU 数据来自发布 `<camera_name>_gyro`、`<camera_name>_accl`、`<camera_name>_quat` 的实例。模块为 header-only 模板，所需硬件对象通过相机实例和 Topic 获得，无需额外的 `XR_REGISTER`（硬件注册）。
+硬件：相机的触发输入由 MCU 侧 CameraSync 驱动；IMU 数据来自发布 `<camera_name>_gyro`、`<camera_name>_accl`、`<camera_name>_quat` 的实例。模块为 header-only 模板，所需的硬件对象通过相机实例和 Topic 获得。
 
 Dependencies:
 
@@ -382,4 +382,4 @@ Dependencies:
 - `xrobot-org/DurationStatistics`: duration statistics of `pending_processing`.
 - LibXR (including Eigen).
 
-Hardware: the camera trigger input is driven by CameraSync on the MCU side; the IMU data comes from the instances publishing `<camera_name>_gyro`, `<camera_name>_accl` and `<camera_name>_quat`. The Module is a header-only template; the hardware objects it needs come through the camera instance and the Topics, and no extra `XR_REGISTER` (Registration) is required.
+Hardware: the camera trigger input is driven by CameraSync on the MCU side; the IMU data comes from the instances publishing `<camera_name>_gyro`, `<camera_name>_accl` and `<camera_name>_quat`. The Module is a header-only template; the hardware objects it needs come through the camera instance and the Topics.
