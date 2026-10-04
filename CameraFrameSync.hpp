@@ -2,20 +2,14 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: In-process camera frame ownership and MCU trigger timestamp synchronization
-constructor_args:
-  camera: '@nullptr'
-template_args:
-  - Layout:
-      width: 720
-      height: 540
-      step: 2160
-      encoding: CameraTypes::Encoding::BGR8
-required_hardware: []
+module_description: 相机帧与 MCU 触发时间戳同步模块：持有相机帧并与 IMU 触发时间配对，发布 SyncedFrame / Camera frame and MCU trigger timestamp synchronization Module that holds camera frames, pairs them with IMU trigger times and publishes SyncedFrame
 depends:
-  - qdu-future/CameraBase
-  - qdu-future/CameraSync
-  - xrobot-org/DurationStatistics
+- id: QDU-Robomaster/CameraBase
+  ref: same-or-dev
+- id: QDU-Robomaster/CameraSync
+  ref: same-or-dev
+- id: xrobot-org/DurationStatistics
+  ref: same-or-dev
 === END MANIFEST === */
 // clang-format on
 
@@ -37,32 +31,52 @@ depends:
 #include "CameraFrameSyncFrameQueue.hpp"
 #include "CameraSync.hpp"
 #include "DurationStatistics.hpp"
-#include "app_framework.hpp"
 #include "libxr.hpp"
+#include "libxr_def.hpp"
 #include "logger.hpp"
 #include "transform.hpp"
 
+/**
+ * @brief 同步模式。
+ *        Synchronization mode.
+ */
 enum class CameraFrameSyncMode : uint8_t
 {
-  TRIGGER = 0,
-  RAW_PROBE = TRIGGER,  // Source-compatible name for existing product configs.
-  LATEST_IMU = 1,
-};
-
-enum class CameraFrameSyncRawImuFrame : uint8_t
-{
-  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,
-  X_FORWARD_Y_LEFT_Z_UP_TO_BODY = 1,
+  TRIGGER = 0,          ///< 与 MCU 真实触发边沿配对
+                        ///< Pair images with real MCU trigger edges
+  RAW_PROBE = TRIGGER,  ///< TRIGGER 的别名
+                        ///< Alias of TRIGGER
+  LATEST_IMU = 1,       ///< 每张图像取最新姿态四元数，数据源已自行同步
+                        ///< Take the latest attitude quaternion per image; the data
+                        ///< source is already synchronized
 };
 
 /**
- * CameraFrameSync retains CameraBase SharedFrame handles, pairs each image with
- * a real MCU FRAME_TRIGGER event, and publishes a transient SyncedFrame pointer.
- * All callbacks share one state mutex. Topic publication happens outside that
- * mutex so synchronous subscribers may re-enter other module APIs safely.
+ * @brief 原始 IMU 的坐标约定。
+ *        Coordinate convention of the raw IMU.
+ */
+enum class CameraFrameSyncRawImuFrame : uint8_t
+{
+  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,  ///< 本体系 x 右 / y 前 / z 上，数据原样使用
+                                    ///< Body frame x right / y forward / z up, used as is
+  X_FORWARD_Y_LEFT_Z_UP_TO_BODY = 1,  ///< 转换：x 前 / y 左 / z 上
+                                      ///< Converted: x forward / y left / z up
+};
+
+/**
+ * @brief 相机帧同步模块：持有相机帧，与 MCU 触发事件配对并发布 SyncedFrame。
+ *        Camera frame synchronization Module that holds camera frames, pairs them with
+ *        MCU trigger events and publishes SyncedFrame.
+ *
+ * 所有回调共用一把状态互斥锁，Topic 发布在锁外执行，同步订阅者可以重入模块接口。
+ * All callbacks share one state mutex. Topic publication runs outside the mutex, so
+ * synchronous subscribers may re-enter the Module interface.
+ *
+ * @tparam FrameLayoutV 帧布局，与相机实例相同。
+ *                      Frame layout, identical to that of the camera instance.
  */
 template <CameraTypes::FrameLayout FrameLayoutV>
-class CameraFrameSync : public LibXR::Application
+class CameraFrameSync
 {
  public:
   using Self = CameraFrameSync<FrameLayoutV>;
@@ -85,38 +99,112 @@ class CameraFrameSync : public LibXR::Application
 
   static inline constexpr auto frame_layout = FrameLayoutV;
 
+  /**
+   * @brief 同步后的图像帧。
+   *        Synchronized image frame.
+   */
   struct SyncedFrame
   {
-    uint64_t sequence{};
-    SharedFrame image{};
-    ImuStamped imu{};
+    uint64_t sequence{};  ///< 单调递增的输出序号
+                          ///< Monotonically increasing output sequence number
+    SharedFrame image{};  ///< 图像句柄
+                          ///< Image handle
+    ImuStamped imu{};     ///< 配对的 IMU 数据，时间戳为权威时间
+                          ///< Paired IMU data whose timestamp is the authoritative time
 
+    /**
+     * @brief 获取只读图像帧。
+     *        Get the read-only image frame.
+     *
+     * @return 图像帧指针，句柄无效时为空指针。
+     *         Image frame pointer; null when the handle is invalid.
+     */
     [[nodiscard]] const ImageFrame* GetImageFrame() const noexcept { return image.Get(); }
 
+    /**
+     * @brief 判断图像句柄是否有效。
+     *        Check whether the image handle is valid.
+     *
+     * @return 句柄有效为 true。
+     *         True when the handle is valid.
+     */
     [[nodiscard]] bool Valid() const noexcept { return image.Valid(); }
   };
 
-  /** Borrowed only for the duration of synchronous Topic callbacks. */
+  /**
+   * @brief SyncedFrame Topic 载荷，指针在同步回调期间有效。
+   *        SyncedFrame Topic payload; the pointer is valid during synchronous callbacks.
+   */
   using SyncedFrameTopicPayload = const SyncedFrame*;
 
+  /**
+   * @brief 运行参数。
+   *        Runtime parameters.
+   */
   struct RuntimeParam
   {
-    SyncMode mode = SyncMode::TRIGGER;
-    int32_t offset_us = 0;
+    SyncMode mode = SyncMode::TRIGGER;  ///< 同步模式
+                                        ///< Synchronization mode
+    int32_t offset_us = 0;  ///< IMU 时间域中相对触发时间的取样偏移 (us)，作用于 TRIGGER
+                            ///< Sampling offset relative to the trigger time in the IMU
+                            ///< time domain (us); applies to TRIGGER
     std::string_view host_topic_domain_name = "shared_memory";
+    ///< 命令、事件和原始 IMU Topic 的 domain 名称
+    ///< Domain name of the command, event and raw IMU Topics
     std::string_view sync_command_topic_name = "camera_sync_command";
+    ///< 发给 CameraSync 的命令 Topic 名称
+    ///< Name of the command Topic sent to CameraSync
     std::string_view sync_result_topic_name = "camera_sync_result";
-    uint32_t sync_active_level = 1;
-    uint64_t camera_settle_us = 10000U;
+    ///< CameraSync 回执与触发事件 Topic 名称
+    ///< Name of the CameraSync acknowledgement and trigger event Topic
+    uint32_t sync_active_level = 1;  ///< 触发有效电平，非零按 1 处理
+                                     ///< Trigger active level; non-zero is treated as 1
+    uint64_t camera_settle_us = 10000U;  ///< STOP ACK 后等待相机稳定的时间 (us)
+                                         ///< Time to wait for the camera to settle after
+                                         ///< the STOP ACK (us)
     RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP;
+    ///< 原始 IMU 坐标约定
+    ///< Raw IMU coordinate convention
     std::string_view raw_quat_topic_name = {};
+    ///< 非空时替代 <相机名>_quat 的姿态 Topic 名称
+    ///< Attitude Topic name replacing <camera_name>_quat when non-empty
     std::string_view synced_frame_topic_name = {};
-    bool legacy_timing_provided = false;
-    uint32_t legacy_sync_probe_div = 0U;
-    float legacy_target_trigger_hz = 0.0F;
+    ///< 同步结果 Topic 名称，为空时使用 <图像 Topic>_synced
+    ///< Synchronized result Topic name; <image Topic>_synced when empty
 
+    /**
+     * @brief 使用全部默认值构造。
+     *        Construct with all defaults.
+     */
     RuntimeParam() = default;
 
+    /**
+     * @brief 逐项构造运行参数。
+     *        Construct runtime parameters field by field.
+     *
+     * @param mode 同步模式。
+     *             Synchronization mode.
+     * @param offset_us IMU 时间域取样偏移 (us)。
+     *                  Sampling offset in the IMU time domain (us).
+     * @param host_topic_domain_name 命令、事件和原始 IMU Topic 的 domain 名称。
+     *                               Domain name of the command, event and raw IMU Topics.
+     * @param sync_command_topic_name 命令 Topic 名称。
+     *                                Command Topic name.
+     * @param sync_result_topic_name 回执与触发事件 Topic 名称。
+     *                               Acknowledgement and trigger event Topic name.
+     * @param sync_active_level 触发有效电平。
+     *                          Trigger active level.
+     * @param camera_settle_us STOP ACK 后等待相机稳定的时间 (us)。
+     *                         Time to wait for the camera to settle after the STOP ACK
+     *                         (us).
+     * @param raw_imu_frame 原始 IMU 坐标约定。
+     *                      Raw IMU coordinate convention.
+     * @param raw_quat_topic_name 姿态 Topic 名称，为空时使用 <相机名>_quat。
+     *                            Attitude Topic name; <camera_name>_quat when empty.
+     * @param synced_frame_topic_name 同步结果 Topic 名称，为空时用 <图像 Topic>_synced。
+     *                                Synced result Topic name; <image Topic>_synced when
+     *                                empty.
+     */
     constexpr RuntimeParam(
         SyncMode mode, int32_t offset_us, std::string_view host_topic_domain_name,
         std::string_view sync_command_topic_name, std::string_view sync_result_topic_name,
@@ -136,92 +224,140 @@ class CameraFrameSync : public LibXR::Application
           synced_frame_topic_name(synced_frame_topic_name)
     {
     }
-
-    /**
-     * Accepts the legacy product-YAML field order. Probe division is obsolete,
-     * and the camera profile now owns the trigger period.
-     */
-    constexpr RuntimeParam(
-        SyncMode mode, int32_t offset_us, std::string_view host_topic_domain_name,
-        std::string_view sync_command_topic_name, std::string_view sync_result_topic_name,
-        uint32_t legacy_sync_probe_div, uint32_t sync_active_level,
-        float legacy_target_trigger_hz,
-        RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
-        std::string_view raw_quat_topic_name = {})
-        : RuntimeParam(mode, offset_us, host_topic_domain_name, sync_command_topic_name,
-                       sync_result_topic_name, sync_active_level)
-    {
-      this->raw_imu_frame = raw_imu_frame;
-      this->raw_quat_topic_name = raw_quat_topic_name;
-      this->legacy_timing_provided = true;
-      this->legacy_sync_probe_div = legacy_sync_probe_div;
-      this->legacy_target_trigger_hz = legacy_target_trigger_hz;
-    }
-
-    [[nodiscard]] bool LegacyTimingMatchesProfile(
-        uint32_t initial_trigger_period_us) const noexcept
-    {
-      if (!legacy_timing_provided)
-      {
-        return true;
-      }
-      if (legacy_sync_probe_div != 3U || !std::isfinite(legacy_target_trigger_hz) ||
-          legacy_target_trigger_hz <= 0.0F)
-      {
-        return false;
-      }
-      if (mode == SyncMode::LATEST_IMU)
-      {
-        return true;
-      }
-      if (mode != SyncMode::TRIGGER)
-      {
-        return false;
-      }
-
-      const double period_us = 1000000.0 / static_cast<double>(legacy_target_trigger_hz);
-      const double rounded_period_us = std::round(period_us);
-      return std::isfinite(period_us) && rounded_period_us >= 1.0 &&
-             rounded_period_us <=
-                 static_cast<double>(std::numeric_limits<uint32_t>::max()) &&
-             static_cast<uint32_t>(rounded_period_us) == initial_trigger_period_us;
-    }
   };
 
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base* camera);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base& camera);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base* camera, RuntimeParam runtime);
-  CameraFrameSync(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app,
-                  Base& camera, RuntimeParam runtime);
+  /**
+   * @brief 返回全部默认值的运行参数。
+   *        Return runtime parameters with all defaults.
+   *
+   * @return 默认运行参数。
+   *         Default runtime parameters.
+   */
+  static RuntimeParam DefaultRuntime() { return {}; }
 
+  /**
+   * @brief 构造 CameraFrameSync，订阅图像、原始 IMU 与同步事件 Topic。
+   *        TRIGGER 模式下立即对当前 profile 发起一次 STOP / settle / START。
+   *        Construct CameraFrameSync and subscribe to the image, raw IMU and
+   *        synchronization event Topics. In TRIGGER mode it immediately starts one
+   *        STOP / settle / START sequence on the current profile.
+   *
+   * 相机名、图像 Topic、domain 与两个同步 Topic 名为非空值，相机 profile 数量为 1 到 2
+   * 且周期非零、几何合法、ID 唯一；否则 REQUIRE 失败。
+   * The camera name, image Topic, domain and both synchronization Topic names are
+   * non-empty, and the camera has one or two profiles with non-zero periods, valid
+   * geometry and unique IDs; otherwise REQUIRE fails.
+   *
+   * @param camera 相机实例，其帧布局为 FrameLayoutV。
+   *               Camera instance whose frame layout is FrameLayoutV.
+   * @param runtime 运行参数。
+   *                Runtime parameters.
+   */
+  CameraFrameSync(Base& camera, RuntimeParam runtime = DefaultRuntime());
+
+  /**
+   * @brief 获取同步结果 Topic 名称。
+   *        Get the name of the synchronized result Topic.
+   *
+   * @return Topic 名称。
+   *         Topic name.
+   */
   [[nodiscard]] const char* SyncedFrameTopicName() const;
+
+  /**
+   * @brief 获取命令、事件和原始 IMU Topic 的 domain 名称。
+   *        Get the domain name of the command, event and raw IMU Topics.
+   *
+   * @return domain 名称。
+   *         Domain name.
+   */
   [[nodiscard]] const char* RawTopicDomainName() const;
+
+  /**
+   * @brief 获取构造时复制的相机原生标定。
+   *        Get the native camera calibration copied at construction.
+   *
+   * @return 相机标定。
+   *         Camera calibration.
+   */
   [[nodiscard]] const CameraCalibration& Calibration() const noexcept
   {
     return calibration_;
   }
+
+  /**
+   * @brief 获取相机声明的固定 profile。
+   *        Get the fixed profiles declared by the camera.
+   *
+   * @return profile 列表。
+   *         Profile list.
+   */
   [[nodiscard]] std::span<const CameraProfile> Profiles() const noexcept;
+
+  /**
+   * @brief 获取当前生效的 profile。
+   *        Get the profile currently in effect.
+   *
+   * @return profile ID。
+   *         Profile ID.
+   */
   [[nodiscard]] ProfileId ActiveProfile() const;
+
+  /**
+   * @brief 获取同步模式。
+   *        Get the synchronization mode.
+   *
+   * @return 同步模式。
+   *         Synchronization mode.
+   */
   [[nodiscard]] SyncMode GetSyncMode() const;
 
   /**
-   * Requests a different fixed profile. The call only admits the asynchronous
-   * STOP/settle/SwitchProfile/START transaction. TRIGGER mode accepts requests
-   * only while RUNNING; after failure, even the active profile is rejected.
+   * @brief 请求切换到另一个固定 profile，仅接纳异步的 STOP / settle /
+   *        SwitchProfile / START 事务。
+   *        Request a different fixed profile; the call admits the asynchronous
+   *        STOP / settle / SwitchProfile / START transaction.
+   *
+   * TRIGGER 模式仅在 RUNNING 状态接纳请求，进入 FAILED 之后对当前 profile 的请求同样
+   * 返回 STATE_ERR。LATEST_IMU 模式仅当前 profile 可用。
+   * TRIGGER mode admits requests only while RUNNING; after FAILED, a request for the
+   * current profile also returns STATE_ERR. In LATEST_IMU mode only the current profile
+   * is available.
+   *
+   * @param profile 目标 profile ID。
+   *                Target profile ID.
+   * @return OK 表示已接纳或已处于该 profile，NOT_SUPPORT 表示相机未声明该 profile
+   *         （LATEST_IMU 模式下为非当前 profile），STATE_ERR 表示当前状态不接纳请求。
+   *         OK when admitted or already on that profile; NOT_SUPPORT when the camera
+   *         does not declare the profile (a non-current profile in LATEST_IMU mode);
+   *         STATE_ERR when the current state does not admit requests.
    */
   LibXR::ErrorCode RequestProfile(ProfileId profile);
 
   /**
-   * Selects a nearby IMU sample without changing the authoritative trigger
-   * timestamp carried by SyncedFrame::imu.timestamp_us.
+   * @brief 设置 IMU 取样偏移，选择触发时间附近的 IMU 样本，
+   *        SyncedFrame::imu.timestamp_us 保留原始触发时间。
+   *        Set the IMU sampling offset that selects a nearby IMU sample; the
+   *        authoritative trigger timestamp carried by SyncedFrame::imu.timestamp_us is
+   *        unchanged.
+   *
+   * @param offset_us IMU 时间域取样偏移 (us)。
+   *                  Sampling offset in the IMU time domain (us).
    */
   void SetOffsetUs(int32_t offset_us);
 
+  /**
+   * @brief 立即处理待匹配数据，然后清空图像与 trigger 队列。
+   *        Process pending data immediately, then clear the image and trigger queues.
+   */
   void FlushPendingFrames();
-  void OnMonitor() override;
+
+  /**
+   * @brief 监控回调，输出控制状态、profile、周期、计数与 pending_processing 耗时统计。
+   *        Monitor callback that logs the control state, profile, period, counters and
+   *        the pending_processing duration statistics.
+   */
+  void OnMonitor();
 
  private:
   template <typename T, std::size_t Capacity>

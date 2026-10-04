@@ -11,9 +11,9 @@ namespace CameraFrameSyncDetail
  * @brief Fixed-capacity FIFO that moves and destroys non-trivial frame owners
  * correctly.
  *
- * LibXR's byte-oriented queues are kept for trivially copyable IMU samples.
+ * LibXR's byte-oriented queues hold trivially copyable IMU samples.
  * Shared frame handles use this queue so their copy/move/destructor semantics
- * are never bypassed.
+ * stay in effect.
  */
 template <typename T, std::size_t Capacity>
 class FrameQueue

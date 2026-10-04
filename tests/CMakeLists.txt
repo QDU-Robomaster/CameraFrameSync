@@ -60,7 +60,7 @@ if(TARGET camera_frame_sync_profile_switch_test)
     clock_domains
     latest_mode
     latest_mode_ignores_unused_imu
-    runtime_param_compat
+    runtime_param
     deferred_dispatch_retry
     deferred_dispatch_epoch
   )

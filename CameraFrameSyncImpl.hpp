@@ -1,28 +1,12 @@
 #pragma once
+#include "libxr_def.hpp"
 
 template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer& hw,
-                                               LibXR::ApplicationManager& app,
-                                               Base* camera)
-    : CameraFrameSync(hw, app, camera, RuntimeParam{})
+CameraFrameSync<FrameLayoutV>::CameraFrameSync(
+      Base& camera,
+      RuntimeParam runtime)
 {
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer& hw,
-                                               LibXR::ApplicationManager& app,
-                                               Base& camera)
-    : CameraFrameSync(hw, app, &camera, RuntimeParam{})
-{
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
-                                               LibXR::ApplicationManager& app,
-                                               Base* camera, RuntimeParam runtime)
-{
-  REQUIRE(camera != nullptr);
-  camera_ = camera;
+  camera_ = std::addressof(camera);
   REQUIRE(!camera_->NameView().empty());
   REQUIRE(!camera_->ImageTopicNameView().empty());
   REQUIRE(!runtime.host_topic_domain_name.empty());
@@ -30,17 +14,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
   REQUIRE(!runtime.sync_result_topic_name.empty());
   const auto profiles = camera_->Profiles();
   REQUIRE(!profiles.empty());
-  if (!runtime.LegacyTimingMatchesProfile(profiles.front().trigger_period_us))
-  {
-    XR_LOG_ERROR(
-        "CameraFrameSync incompatible legacy timing: probe_div=%u "
-        "target_hz=%.3f "
-        "initial_period_us=%u",
-        runtime.legacy_sync_probe_div,
-        static_cast<double>(runtime.legacy_target_trigger_hz),
-        profiles.front().trigger_period_us);
-    throw std::runtime_error("CameraFrameSync: incompatible legacy timing");
-  }
   calibration_ = camera_->Calibration();
   topics_.emplace(*camera_, runtime);
   callbacks_.emplace(this);
@@ -90,7 +63,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
 
   // Image delivery is registered last so every callback sees complete state.
   topics_->camera_image.RegisterCallback(callbacks_->image);
-  app.Register(*this);
 
   XR_LOG_INFO(
       XR_PRINTF("CameraFrameSync: input=%s output=%s mode=%s profile=%u period_us=%u "
@@ -99,14 +71,6 @@ CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer&,
       SyncModeName(sync_mode_), static_cast<unsigned>(active_profile_),
       static_cast<unsigned>(active_trigger_period_us_),
       static_cast<unsigned long long>(camera_settle_us_));
-}
-
-template <CameraTypes::FrameLayout FrameLayoutV>
-CameraFrameSync<FrameLayoutV>::CameraFrameSync(LibXR::HardwareContainer& hw,
-                                               LibXR::ApplicationManager& app,
-                                               Base& camera, RuntimeParam runtime)
-    : CameraFrameSync(hw, app, &camera, runtime)
-{
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
@@ -151,7 +115,8 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
   XR_LOG_INFO(
       XR_PRINTF("CameraFrameSync monitor: mode=%s state=%s profile=%u period_us=%u "
                 "raw=%llu/%llu/%llu assembled=%llu trigger=%llu image=%llu retained=%llu "
-                "held=%llu pending_trigger=%llu drop=%llu synced=%llu reset=%llu overflow=%llu"),
+                "held=%llu pending_trigger=%llu drop=%llu synced=%llu reset=%llu "
+                "overflow=%llu"),
       SyncModeName(sync_mode_), ControlStateName(state), static_cast<unsigned>(profile),
       static_cast<unsigned>(period_us), static_cast<unsigned long long>(raw_gyro),
       static_cast<unsigned long long>(raw_accl),
@@ -164,13 +129,12 @@ void CameraFrameSync<FrameLayoutV>::OnMonitor()
       static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(synced),
       static_cast<unsigned long long>(resets),
       static_cast<unsigned long long>(overflows));
-  XR_LOG_INFO(
-      XR_PRINTF("CameraFrameSync pending_processing count=%llu average_us=%llu "
-                "minimum_us=%llu maximum_us=%llu"),
-      static_cast<unsigned long long>(pending_processing.sample_count),
-      static_cast<unsigned long long>(pending_processing.average_us),
-      static_cast<unsigned long long>(pending_processing.minimum_us),
-      static_cast<unsigned long long>(pending_processing.maximum_us));
+  XR_LOG_INFO(XR_PRINTF("CameraFrameSync pending_processing count=%llu average_us=%llu "
+                        "minimum_us=%llu maximum_us=%llu"),
+              static_cast<unsigned long long>(pending_processing.sample_count),
+              static_cast<unsigned long long>(pending_processing.average_us),
+              static_cast<unsigned long long>(pending_processing.minimum_us),
+              static_cast<unsigned long long>(pending_processing.maximum_us));
 }
 
 template <CameraTypes::FrameLayout FrameLayoutV>
