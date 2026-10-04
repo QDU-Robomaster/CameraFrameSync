@@ -5,11 +5,8 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@dev
+    uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@v1
     with:
-      xrobot-ref: dev
-      libxr-ref: dev
-      dependency-ref: refs/heads/dev
       template-args: '["CameraTypes::FrameLayout{.width=640,.height=480,.step=1920,.encoding=CameraTypes::Encoding::BGR8}"]'
       cmake-options: '-DXR_LOG_MESSAGE_MAX_LEN=256'
       ctest-regex: '^camera_frame_sync_'
