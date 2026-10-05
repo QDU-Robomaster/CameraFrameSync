@@ -7,6 +7,6 @@ jobs:
   build:
     uses: xrobot-org/XRobot/.github/workflows/module-ci.yml@v1
     with:
-      template-args: '["CameraTypes::FrameLayout{.width=640,.height=480,.step=1920,.encoding=CameraTypes::Encoding::BGR8}"]'
-      cmake-options: '-DXR_LOG_MESSAGE_MAX_LEN=256'
-      ctest-regex: '^camera_frame_sync_'
+      template-args: '[]'
+      apt-packages: 'libopencv-dev libeigen3-dev'
+      ctest-regex: '^camera_frame_sync_.*test$'
