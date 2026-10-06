@@ -195,9 +195,9 @@ int main()
   // BSP 里 CFS 排在 SharedTopic 之前，MCU 的 Topic 不存在时由它创建 / In the BSP CFS
   // precedes SharedTopic and creates absent MCU Topics.
   auto* mk_camera = new FakeCamera("mk");
-  [[maybe_unused]] auto* mk_sync = new CameraFrameSync(
-      *mk_camera,
-      {SyncMode::LATEST_IMU, PERIOD_US, OFFSET_US, "", "mk_gyro", "mk_accl", "mk_quat"});
+  [[maybe_unused]] auto* mk_sync =
+      new CameraFrameSync(*mk_camera, {SyncMode::LATEST_IMU, PERIOD_US, OFFSET_US, "",
+                                       "mk_gyro", "mk_accl", "mk_quat", ImuAxes::BODY});
   Expect(LibXR::Topic::Find("mk_gyro") != nullptr &&
              LibXR::Topic::Find("mk_accl") != nullptr &&
              LibXR::Topic::Find("mk_quat") != nullptr,
@@ -210,8 +210,9 @@ int main()
       LibXR::Topic::CreateTopic<CameraFrameSync::ImuQuaternion>("e2e_quat");
   auto* mcu = new CameraSync(
       *camera, {"camera_sync_result", "e2e_gyro", PERIOD_US, "camera_sync_command"});
-  auto* sync = new CameraFrameSync(*camera, {SyncMode::TRIGGER, PERIOD_US, OFFSET_US, "",
-                                             "e2e_gyro", "e2e_accl", "e2e_quat"});
+  auto* sync =
+      new CameraFrameSync(*camera, {SyncMode::TRIGGER, PERIOD_US, OFFSET_US, "",
+                                    "e2e_gyro", "e2e_accl", "e2e_quat", ImuAxes::BODY});
   auto* receiver = new Receiver("e2e_synced");
 
   std::atomic<bool> imu_running{true};
@@ -282,13 +283,16 @@ int main()
   LibXR::Topic bench_quat =
       LibXR::Topic::CreateTopic<CameraFrameSync::ImuQuaternion>("bench_quat");
   auto* latest = new CameraFrameSync(
-      *bench, {SyncMode::LATEST_IMU, 0, 0, "", "bench_gyro", "bench_accl", "bench_quat"});
+      *bench, {SyncMode::LATEST_IMU, 0, 0, "", "bench_gyro", "bench_accl", "bench_quat",
+               ImuAxes::X_FORWARD_Y_LEFT_Z_UP});
   auto* bench_receiver = new Receiver("bench_synced");
   for (uint64_t i = 1; i <= 5; ++i)
   {
     const LibXR::MicrosecondTimestamp ts(1000 * i);
     CameraFrameSync::ImuVector a(0.0F, 0.0F, 9.8F);
-    CameraFrameSync::ImuVector w(static_cast<float>(i), 0.0F, 0.0F);
+    // x 前、y 左、z 上的原始数据：绕 y 转 i rad/s，机体系 x 应为 -i / Raw x-forward,
+    // y-left, z-up data: i rad/s about y, so body x is -i.
+    CameraFrameSync::ImuVector w(0.0F, static_cast<float>(i), 0.0F);
     CameraFrameSync::ImuQuaternion q(1.0F, 0.0F, 0.0F, 0.0F);
     bench_accl.Publish(a, ts);
     bench_gyro.Publish(w, ts);
@@ -304,8 +308,8 @@ int main()
   for (std::size_t i = 0; i < frames.size(); ++i)
   {
     Expect(frames[i].imu_time == 1000 * (i + 1) &&
-               frames[i].gyro_x == static_cast<float>(i + 1),
-           "the newest IMU at arrival");
+               frames[i].gyro_x == -static_cast<float>(i + 1),
+           "the newest IMU at arrival, converted to the body frame");
   }
   bench->Stop();
   delete latest;

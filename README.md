@@ -69,6 +69,10 @@ IMU 与 CameraSync 的 Topic 位于 `mcu_domain`（车上为 SharedTopic 使用�
 
 The IMU and CameraSync Topics live in `mcu_domain` (`host`, used by SharedTopic, on the robot; the default domain in Webots). The camera image Topic is created before this Module, otherwise start-up is fatal; absent IMU and CameraSync Topics are created here with their types, because SharedTopic only forwards existing typed Topics, and the robot configuration lists this Module before SharedTopic.
 
+`imu_axes` 说明 MCU IMU 的坐标轴：`ImuAxes::BODY` 表示已是机体系（x 右、y 前、z 上）；`ImuAxes::X_FORWARD_Y_LEFT_Z_UP` 表示 x 前、y 左、z 上，进入同步前转成机体系，向量取 `(-y, x, z)`，四元数取 `(w, -y, x, z)`（哨兵 C 板的安装方向）。
+
+`imu_axes` gives the axes of the MCU IMU: `ImuAxes::BODY` means it is already in the body frame (x right, y forward, z up); `ImuAxes::X_FORWARD_Y_LEFT_Z_UP` means x forward, y left, z up and is converted into the body frame before syncing, vectors as `(-y, x, z)` and quaternions as `(w, -y, x, z)` (the sentry C board's mounting).
+
 ## 6. 配置示例 / Configuration Example
 
 ```yaml
@@ -85,15 +89,16 @@ modules:
           gyro_topic: "gimbal_gyro"
           accl_topic: "gimbal_accl"
           quat_topic: "gimbal_quat"
+          imu_axes: ImuAxes::BODY
 ```
 
 ## 7. 测试 / Tests
 
 - `tests/parts_test.cpp`：`ImuHistory` 的插值、四元数半球、尚未到达与过旧；`TriggerLink` 的重发、ACK、稳定、切档与序号循环；`FrameMatcher` 的计数对应、主机丢帧、丢失边沿与各种矛盾。
-- `tests/camera_frame_sync_test.cpp`：假 MCU（1 kHz IMU）驱动真实的 CameraSync，CameraSync 的触发电平驱动假相机出图。检查每帧 IMU 都取在自己的边沿加偏移处、相机漏一次触发后只重新同步一次并恢复、切档后的几何，以及 LATEST_IMU。
+- `tests/camera_frame_sync_test.cpp`：假 MCU（1 kHz IMU）驱动真实的 CameraSync，CameraSync 的触发电平驱动假相机出图。检查每帧 IMU 都取在自己的边沿加偏移处、相机漏一次触发后只重新同步一次并恢复、切档后的几何，LATEST_IMU，以及 x 前、y 左、z 上的 IMU 转成机体系。
 
 - `tests/parts_test.cpp`: `ImuHistory` interpolation, quaternion hemispheres, not-yet and too-old lookups; `TriggerLink` resends, ACKs, settling, view switch and sequence wrap; `FrameMatcher` counter matching, host drops, lost edges and the contradictions.
-- `tests/camera_frame_sync_test.cpp`: a fake MCU (1 kHz IMU) drives the real CameraSync, whose trigger level drives a fake camera. It checks that every frame's IMU is taken at its own edge plus offset, that one missed trigger causes exactly one resync and recovery, the geometry after a view switch, and LATEST_IMU.
+- `tests/camera_frame_sync_test.cpp`: a fake MCU (1 kHz IMU) drives the real CameraSync, whose trigger level drives a fake camera. It checks that every frame's IMU is taken at its own edge plus offset, that one missed trigger causes exactly one resync and recovery, the geometry after a view switch, LATEST_IMU, and the conversion of x-forward, y-left, z-up IMU data into the body frame.
 
 ## 8. 依赖 / Dependencies
 

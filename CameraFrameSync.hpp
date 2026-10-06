@@ -14,6 +14,7 @@ depends:
 // clang-format on
 
 #include <Eigen/Core>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -43,6 +44,13 @@ enum class SyncMode : uint8_t
   LATEST_IMU,  ///< 台架自由运行调试：取最新 IMU / Bench free-run: newest IMU
 };
 
+/// MCU IMU 数据的坐标轴 / Axes of the MCU IMU data.
+enum class ImuAxes : uint8_t
+{
+  BODY,  ///< 已是机体系 x 右、y 前、z 上 / Already body x right, y forward, z up
+  X_FORWARD_Y_LEFT_Z_UP,  ///< x 前、y 左、z 上，转成机体系 / Converted to the body frame
+};
+
 /// 同步设置，与 YAML 一一对应 / Sync settings, one-to-one with the YAML.
 struct FrameSyncSettings
 {
@@ -53,6 +61,7 @@ struct FrameSyncSettings
   std::string_view gyro_topic;  ///< MCU 发布的 IMU Topic 名 / IMU Topics as the MCU
   std::string_view accl_topic;  ///< publishes them
   std::string_view quat_topic;
+  ImuAxes imu_axes;  ///< MCU IMU 的坐标轴 / Axes of the MCU IMU
 };
 
 /**
@@ -96,6 +105,7 @@ class CameraFrameSync
   CameraFrameSync(CameraBase& camera, const FrameSyncSettings& settings)
       : camera_(camera),
         mode_(settings.mode),
+        imu_axes_(settings.imu_axes),
         offset_us_(settings.offset_us),
         synced_topic_(LibXR::Topic::CreateTopic<const AutoAim::SyncedFrame*>(
             StageTopicName(camera.Name(), AutoAim::STAGE_SYNCED).c_str())),
@@ -115,15 +125,15 @@ class CameraFrameSync
     SubscribeMcu<ImuVector>(
         std::string(settings.gyro_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
-        { self->Push(Input{Gyro{t, {v.x(), v.y(), v.z()}}}); });
+        { self->Push(Input{Gyro{t, self->ToBody(v)}}); });
     SubscribeMcu<ImuVector>(
         std::string(settings.accl_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
-        { self->Push(Input{Accl{t, {v.x(), v.y(), v.z()}}}); });
+        { self->Push(Input{Accl{t, self->ToBody(v)}}); });
     SubscribeMcu<ImuQuaternion>(
         std::string(settings.quat_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuQuaternion& q)
-        { self->Push(Input{Quat{t, {q.w(), q.x(), q.y(), q.z()}}}); });
+        { self->Push(Input{Quat{t, self->ToBody(q)}}); });
     if (mode_ == SyncMode::TRIGGER)
     {
       SubscribeMcu<SyncEvent>(
@@ -208,6 +218,27 @@ class CameraFrameSync
     std::atomic<uint32_t> resend{0};
     std::atomic<uint32_t> imu_out_of_order{0};
   };
+
+  /// x 前、y 左、z 上转机体系：向量取 (-y, x, z)，四元数取 (w, -y, x, z)。
+  /// x-forward, y-left, z-up to the body frame: vectors (-y, x, z), quaternions
+  /// (w, -y, x, z).
+  std::array<float, 3> ToBody(const ImuVector& v) const
+  {
+    if (imu_axes_ == ImuAxes::X_FORWARD_Y_LEFT_Z_UP)
+    {
+      return {-v.y(), v.x(), v.z()};
+    }
+    return {v.x(), v.y(), v.z()};
+  }
+
+  std::array<float, 4> ToBody(const ImuQuaternion& q) const
+  {
+    if (imu_axes_ == ImuAxes::X_FORWARD_Y_LEFT_Z_UP)
+    {
+      return {q.w(), -q.y(), q.x(), q.z()};
+    }
+    return {q.w(), q.x(), q.y(), q.z()};
+  }
 
   /// 相机图像 Topic 必须已存在 / The camera image Topic must already exist.
   template <typename Payload, typename Fun>
@@ -452,6 +483,7 @@ class CameraFrameSync
 
   CameraBase& camera_;
   const SyncMode mode_;
+  const ImuAxes imu_axes_;
   const int32_t offset_us_;
   std::optional<LibXR::Topic::Domain> domain_;
   LibXR::Topic synced_topic_;
