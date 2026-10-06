@@ -192,6 +192,17 @@ int main()
   LibXR::PlatformInit();
   g_t0 = NowUs();
 
+  // BSP 里 CFS 排在 SharedTopic 之前，MCU 的 Topic 不存在时由它创建 / In the BSP CFS
+  // precedes SharedTopic and creates absent MCU Topics.
+  auto* mk_camera = new FakeCamera("mk");
+  [[maybe_unused]] auto* mk_sync = new CameraFrameSync(
+      *mk_camera,
+      {SyncMode::LATEST_IMU, PERIOD_US, OFFSET_US, "", "mk_gyro", "mk_accl", "mk_quat"});
+  Expect(LibXR::Topic::Find("mk_gyro") != nullptr &&
+             LibXR::Topic::Find("mk_accl") != nullptr &&
+             LibXR::Topic::Find("mk_quat") != nullptr,
+         "CFS creates the absent MCU Topics");
+
   auto* camera = new FakeCamera("e2e");
   LibXR::Topic gyro = LibXR::Topic::CreateTopic<CameraFrameSync::ImuVector>("e2e_gyro");
   LibXR::Topic accl = LibXR::Topic::CreateTopic<CameraFrameSync::ImuVector>("e2e_accl");

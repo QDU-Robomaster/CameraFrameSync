@@ -112,23 +112,24 @@ class CameraFrameSync
         StageTopicName(camera.Name(), "image"), nullptr,
         [](bool, CameraFrameSync* self, ImageTopicPayload payload)
         { self->Push(Input{*payload}); });
-    Subscribe<ImuVector>(
+    SubscribeMcu<ImuVector>(
         std::string(settings.gyro_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
         { self->Push(Input{Gyro{t, {v.x(), v.y(), v.z()}}}); });
-    Subscribe<ImuVector>(
+    SubscribeMcu<ImuVector>(
         std::string(settings.accl_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
         { self->Push(Input{Accl{t, {v.x(), v.y(), v.z()}}}); });
-    Subscribe<ImuQuaternion>(
+    SubscribeMcu<ImuQuaternion>(
         std::string(settings.quat_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuQuaternion& q)
         { self->Push(Input{Quat{t, {q.w(), q.x(), q.y(), q.z()}}}); });
     if (mode_ == SyncMode::TRIGGER)
     {
-      Subscribe<SyncEvent>(EVENT_TOPIC, domain,
-                           [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t,
-                              SyncEvent& e) { self->Push(Input{Event{t, e}}); });
+      SubscribeMcu<SyncEvent>(
+          EVENT_TOPIC, domain,
+          [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, SyncEvent& e)
+          { self->Push(Input{Event{t, e}}); });
       command_topic_ = LibXR::Topic::CreateTopic<SyncCommand>(COMMAND_TOPIC, domain);
     }
     running_.store(true);
@@ -208,11 +209,27 @@ class CameraFrameSync
     std::atomic<uint32_t> imu_out_of_order{0};
   };
 
+  /// 相机图像 Topic 必须已存在 / The camera image Topic must already exist.
   template <typename Payload, typename Fun>
   void Subscribe(const std::string& name, LibXR::Topic::Domain* domain, Fun fun)
   {
     auto callback = LibXR::Topic::Callback::Create(fun, this);
     AutoAim::RequireTopic<Payload>(name, domain).RegisterCallback(callback);
+  }
+
+  /**
+   * @brief MCU 的 Topic 由 SharedTopic 按名字转发，它只认已存在的带类型 Topic，所以由这里
+   *        创建（已存在则校验类型）；BSP 里本模块排在 SharedTopic 之前。
+   *        MCU Topics are forwarded by name by SharedTopic, which only accepts existing
+   *        typed Topics, so they are created here (or type-checked when they exist); the
+   *        BSP lists this Module before SharedTopic.
+   */
+  template <typename Payload, typename Fun>
+  void SubscribeMcu(const std::string& name, LibXR::Topic::Domain* domain, Fun fun)
+  {
+    auto callback = LibXR::Topic::Callback::Create(fun, this);
+    LibXR::Topic(LibXR::Topic::FindOrCreate<Payload>(name.c_str(), domain))
+        .RegisterCallback(callback);
   }
 
   void Push(Input&& input)

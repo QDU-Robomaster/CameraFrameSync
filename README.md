@@ -65,9 +65,9 @@ The trigger period must exceed the camera's minimum frame period (the larger of 
 | `camera_sync_command` | `CameraSyncDetail::SyncCommand` | 发布（TRIGGER）/ Published (TRIGGER) |
 | `<相机名>_synced` | `const AutoAim::SyncedFrame*` | 发布 / Published |
 
-IMU 与 CameraSync 的 Topic 位于 `mcu_domain`（车上为 SharedTopic 使用的 `host`，Webots 中为默认 domain）。订阅的 Topic 须在本模块之前创建，否则启动即致命退出。
+IMU 与 CameraSync 的 Topic 位于 `mcu_domain`（车上为 SharedTopic 使用的 `host`，Webots 中为默认 domain）。相机图像 Topic 须在本模块之前创建，否则启动即致命退出；IMU 与 CameraSync 的 Topic 不存在时由本模块按类型创建，因为 SharedTopic 只转发已存在的带类型 Topic，车上配置中本模块排在 SharedTopic 之前。
 
-The IMU and CameraSync Topics live in `mcu_domain` (`host`, used by SharedTopic, on the robot; the default domain in Webots). Subscribed Topics are created before this Module, otherwise start-up is fatal.
+The IMU and CameraSync Topics live in `mcu_domain` (`host`, used by SharedTopic, on the robot; the default domain in Webots). The camera image Topic is created before this Module, otherwise start-up is fatal; absent IMU and CameraSync Topics are created here with their types, because SharedTopic only forwards existing typed Topics, and the robot configuration lists this Module before SharedTopic.
 
 ## 6. 配置示例 / Configuration Example
 
