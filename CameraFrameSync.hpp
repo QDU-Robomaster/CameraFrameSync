@@ -25,6 +25,8 @@ depends:
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <variant>
 
 #include "AutoAimTypes.hpp"
@@ -118,28 +120,25 @@ class CameraFrameSync
     }
     LibXR::Topic::Domain* domain = domain_ ? &*domain_ : nullptr;
 
-    Subscribe<ImageTopicPayload>(
-        StageTopicName(camera.Name(), "image"), nullptr,
-        [](bool, CameraFrameSync* self, ImageTopicPayload payload)
-        { self->Push(Input{*payload}); });
-    SubscribeMcu<ImuVector>(
-        std::string(settings.gyro_topic), domain,
-        [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
-        { self->Push(Input{Gyro{t, self->ToBody(v)}}); });
-    SubscribeMcu<ImuVector>(
-        std::string(settings.accl_topic), domain,
-        [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuVector& v)
-        { self->Push(Input{Accl{t, self->ToBody(v)}}); });
+    Subscribe<ImageTopicPayload>(StageTopicName(camera.Name(), "image"), nullptr,
+                                 [](bool, CameraFrameSync* self,
+                                    ImageTopicPayload payload) { self->Push(*payload); });
+    SubscribeMcu<ImuVector>(std::string(settings.gyro_topic), domain,
+                            [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t,
+                               ImuVector& v) { self->Push(Gyro{t, self->ToBody(v)}); });
+    SubscribeMcu<ImuVector>(std::string(settings.accl_topic), domain,
+                            [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t,
+                               ImuVector& v) { self->Push(Accl{t, self->ToBody(v)}); });
     SubscribeMcu<ImuQuaternion>(
         std::string(settings.quat_topic), domain,
         [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuQuaternion& q)
-        { self->Push(Input{Quat{t, self->ToBody(q)}}); });
+        { self->Push(Quat{t, self->ToBody(q)}); });
     if (mode_ == SyncMode::TRIGGER)
     {
       SubscribeMcu<SyncEvent>(
           EVENT_TOPIC, domain,
           [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, SyncEvent& e)
-          { self->Push(Input{Event{t, e}}); });
+          { self->Push(Event{t, e}); });
       command_topic_ = LibXR::Topic::CreateTopic<SyncCommand>(COMMAND_TOPIC, domain);
     }
     running_.store(true);
@@ -163,7 +162,14 @@ class CameraFrameSync
   /// 请求切档，任意线程可调用；TRIGGER 下走 STOP → 稳定 → 切档 → START。
   /// Request a view switch from any thread; in TRIGGER it runs STOP → settle → switch
   /// → START.
-  void RequestView(View view) { Push(Input{view}); }
+  void RequestView(View view) { Push(view); }
+
+  /// 请求移动 NARROW 窗口，任意线程可调用；TRIGGER 下走 STOP → 稳定 → 移窗 → START，
+  /// 停触发是屏障，START 之后的帧都是新窗口。不在 NARROW 时只记下位置。
+  /// Request a NARROW window move from any thread; in TRIGGER it runs STOP → settle →
+  /// move → START, with the stopped trigger as the barrier so every frame after START
+  /// has the new window. Outside NARROW only the position is stored.
+  void RequestMove(NarrowPosition narrow) { Push(narrow); }
 
   /// 打印周期摘要 / Print the periodic summary.
   void OnMonitor()
@@ -198,7 +204,7 @@ class CameraFrameSync
     SyncEvent event;
   };
   /// 工作线程的输入，按到达顺序处理 / Worker input, handled in arrival order.
-  using Input = std::variant<SharedFrame, Gyro, Accl, Quat, Event, View>;
+  using Input = std::variant<SharedFrame, Gyro, Accl, Quat, Event, View, NarrowPosition>;
 
   /// 等边沿或 IMU 的图像 / An image waiting for its edge or IMU.
   struct Pending
@@ -263,7 +269,10 @@ class CameraFrameSync
         .RegisterCallback(callback);
   }
 
-  void Push(Input&& input)
+  /// 就地构造进队列，不移动 Input / Construct in the queue in place, without moving an
+  /// Input.
+  template <typename T>
+  void Push(T&& value)
   {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -276,7 +285,7 @@ class CameraFrameSync
         stats_.overflow.fetch_add(1, std::memory_order_relaxed);
         return;
       }
-      queue_.push_back(std::move(input));
+      queue_.emplace_back(std::in_place_type<std::decay_t<T>>, std::forward<T>(value));
     }
     queue_cv_.notify_one();
   }
@@ -385,10 +394,28 @@ class CameraFrameSync
     Apply(link_.Restart(NowUs(), view));
   }
 
-  /// 先切档，再发命令，最后按 START 重新开始配对 / Switch first, then send, then
-  /// restart matching on START.
+  void Handle(const NarrowPosition& narrow)
+  {
+    if (mode_ == SyncMode::LATEST_IMU)
+    {
+      camera_.MoveNarrow(narrow);
+      return;
+    }
+    matcher_.Stop();
+    pending_.clear();
+    Apply(link_.Restart(NowUs(), std::nullopt, narrow));
+  }
+
+  /// 先移窗、切档，再发命令，最后按 START 重新开始配对。先移窗：从 WIDE 切到 NARROW
+  /// 时用新位置。
+  /// Move and switch first, then send, then restart matching on START. The move comes
+  /// first so a switch from WIDE to NARROW uses the new position.
   void Apply(const TriggerLink::Actions& actions)
   {
+    if (actions.move_narrow)
+    {
+      camera_.MoveNarrow(*actions.move_narrow);
+    }
     if (actions.switch_view)
     {
       camera_.SwitchView(*actions.switch_view);

@@ -91,6 +91,7 @@ class FakeCamera : public CameraBase, public LibXR::GPIO
   std::atomic<bool> miss_next_{false};
   std::atomic<int> missed{0};
   std::atomic<int> switches{0};
+  std::atomic<int> moves{0};
 
  private:
   bool GrabFrame(ImageFrame& frame) override
@@ -113,6 +114,13 @@ class FakeCamera : public CameraBase, public LibXR::GPIO
     counter_ = 0;  // 与 Hik 一样，重新开始取流后计数归零 / Restarts like Hik
     edges_.clear();
     switches.fetch_add(1);
+    return LibXR::ErrorCode::OK;
+  }
+
+  /// 与 Hik 一样不停流，计数不归零 / Keeps streaming like Hik; the counter continues.
+  LibXR::ErrorCode ApplyOffset(const CameraTypes::FrameGeometry&) override
+  {
+    moves.fetch_add(1);
     return LibXR::ErrorCode::OK;
   }
 
@@ -264,6 +272,23 @@ int main()
   Expect(camera->switches.load() == 1, "camera switched once");
   Expect(frames.size() >= 20 && frames.back().geometry.decimation == 1, "NARROW frames");
   CheckPaired(frames, "narrow");
+
+  // 4. 移窗：STOP → 移窗 → START，计数不归零，之后的帧带新窗口 / Window move: the
+  // counter continues and later frames carry the new window.
+  sync->RequestMove({0.0, 1.0});
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  frames = receiver->Take();
+  std::printf("moved: %zu synced frames, moves %d\n", frames.size(),
+              camera->moves.load());
+  Expect(camera->moves.load() == 1 && camera->switches.load() == 1, "window moved once");
+  const CameraTypes::FrameGeometry moved{0, 568, 1};
+  Expect(frames.size() >= 20 && frames.back().geometry == moved, "moved NARROW frames");
+  for (std::size_t i = 1; i < frames.size(); ++i)
+  {
+    Expect(!(frames[i - 1].geometry == moved) || frames[i].geometry == moved,
+           "no old window after a new one");
+  }
+  CheckPaired(frames, "moved");
   sync->OnMonitor();
 
   imu_running.store(false);
@@ -274,7 +299,7 @@ int main()
   UNUSED(mcu);
   UNUSED(receiver);
 
-  // 4. LATEST_IMU：自由运行的台架调试，每帧取最新 IMU / Bench free-run: newest IMU.
+  // 5. LATEST_IMU：自由运行的台架调试，每帧取最新 IMU / Bench free-run: newest IMU.
   auto* bench = new FakeCamera("bench");
   LibXR::Topic bench_gyro =
       LibXR::Topic::CreateTopic<CameraFrameSync::ImuVector>("bench_gyro");

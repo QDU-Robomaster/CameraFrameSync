@@ -100,6 +100,17 @@ void TestTriggerLink()
   Expect(a.send->seq == 3, "next round, next seq");
   link.OnEvent({3, Operation::STOP_TRIGGER, 1, 0, 0, 0}, 600100);
   Expect(!link.Tick(610100).switch_view, "no view switch unless requested");
+  // 移窗与切档并入同一轮 / A move and a switch join the same round.
+  link.Restart(700000, std::nullopt, NarrowPosition{0.25, 0.75});
+  link.Restart(700050, View::WIDE);
+  link.OnEvent({6, Operation::STOP_TRIGGER, 1, 0, 0, 0}, 700100);
+  a = link.Tick(710100);
+  Expect(a.move_narrow && a.move_narrow->u == 0.25 && a.move_narrow->v == 0.75 &&
+             a.switch_view && *a.switch_view == View::WIDE,
+         "move and switch together with START");
+  link.Restart(800000);
+  link.OnEvent({8, Operation::STOP_TRIGGER, 1, 0, 0, 0}, 800100);
+  Expect(!link.Tick(810100).move_narrow, "no move unless requested");
 }
 
 void TestTriggerLinkSeqWrap()
