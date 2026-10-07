@@ -48,6 +48,10 @@ The trigger period must exceed the camera's minimum frame period (the larger of 
 
 `RequestView(view)` may be called from any thread: it stops the trigger, waits, calls the camera's `SwitchView` and restarts the trigger; later frames carry the new view's geometry.
 
+`RequestMove(narrow)` 用同一流程移动 NARROW 窗口：停触发后调用相机的 `MoveNarrow`，相机不停流，停触发期间没有帧曝光，所以 START 之后的帧都是新窗口。还没完成的切档与移窗请求并入下一轮，先移窗再切档，从 WIDE 切到 NARROW 时就用新位置。LATEST_IMU 下两者直接调用相机。
+
+`RequestMove(narrow)` moves the NARROW window through the same round: after the trigger stops it calls the camera's `MoveNarrow`; the camera keeps streaming, and no frame is exposed while the trigger is stopped, so every frame after START has the new window. Unfinished view and move requests join the next round, the move before the switch, so a switch from WIDE to NARROW uses the new position. In LATEST_IMU both call the camera directly.
+
 ## 4. LATEST_IMU
 
 `SyncMode::LATEST_IMU` 只用于没有触发线的台架调试：相机自由运行，每张图到达时取 `ImuHistory` 中最新的 IMU。相机时钟与 MCU 时钟不同源，同步误差约为一个 IMU 周期加上传输延迟，结果不能用来评估跟踪。回放不经过本模块，由 CaptureFileCamera 直接发布同步帧。
@@ -94,11 +98,11 @@ modules:
 
 ## 7. 测试 / Tests
 
-- `tests/parts_test.cpp`：`ImuHistory` 的插值、四元数半球、尚未到达与过旧；`TriggerLink` 的重发、ACK、稳定、切档与序号循环；`FrameMatcher` 的计数对应、主机丢帧、丢失边沿与各种矛盾。
-- `tests/camera_frame_sync_test.cpp`：假 MCU（1 kHz IMU）驱动真实的 CameraSync，CameraSync 的触发电平驱动假相机出图。检查每帧 IMU 都取在自己的边沿加偏移处、相机漏一次触发后只重新同步一次并恢复、切档后的几何，LATEST_IMU，以及 x 前、y 左、z 上的 IMU 转成机体系。
+- `tests/parts_test.cpp`：`ImuHistory` 的插值、四元数半球、尚未到达与过旧；`TriggerLink` 的重发、ACK、稳定、切档、移窗与序号循环；`FrameMatcher` 的计数对应、主机丢帧、丢失边沿与各种矛盾。
+- `tests/camera_frame_sync_test.cpp`：假 MCU（1 kHz IMU）驱动真实的 CameraSync，CameraSync 的触发电平驱动假相机出图。检查每帧 IMU 都取在自己的边沿加偏移处、相机漏一次触发后只重新同步一次并恢复、切档后的几何、移窗后帧计数继续且几何全部换成新窗口，LATEST_IMU，以及 x 前、y 左、z 上的 IMU 转成机体系。
 
-- `tests/parts_test.cpp`: `ImuHistory` interpolation, quaternion hemispheres, not-yet and too-old lookups; `TriggerLink` resends, ACKs, settling, view switch and sequence wrap; `FrameMatcher` counter matching, host drops, lost edges and the contradictions.
-- `tests/camera_frame_sync_test.cpp`: a fake MCU (1 kHz IMU) drives the real CameraSync, whose trigger level drives a fake camera. It checks that every frame's IMU is taken at its own edge plus offset, that one missed trigger causes exactly one resync and recovery, the geometry after a view switch, LATEST_IMU, and the conversion of x-forward, y-left, z-up IMU data into the body frame.
+- `tests/parts_test.cpp`: `ImuHistory` interpolation, quaternion hemispheres, not-yet and too-old lookups; `TriggerLink` resends, ACKs, settling, view switch, window move and sequence wrap; `FrameMatcher` counter matching, host drops, lost edges and the contradictions.
+- `tests/camera_frame_sync_test.cpp`: a fake MCU (1 kHz IMU) drives the real CameraSync, whose trigger level drives a fake camera. It checks that every frame's IMU is taken at its own edge plus offset, that one missed trigger causes exactly one resync and recovery, the geometry after a view switch, a window move with the frame counter continuing and every later frame on the new window, LATEST_IMU, and the conversion of x-forward, y-left, z-up IMU data into the body frame.
 
 ## 8. 依赖 / Dependencies
 
