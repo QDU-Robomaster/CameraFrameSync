@@ -2,666 +2,532 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: 相机帧与 MCU 触发时间戳同步模块：持有相机帧并与 IMU 触发时间配对，发布 SyncedFrame / Camera frame and MCU trigger timestamp synchronization Module that holds camera frames, pairs them with IMU trigger times and publishes SyncedFrame
+module_description: 相机帧同步：按触发边沿给每张图配上 IMU，发布同步帧 / Camera frame sync that pairs every image with the IMU at its trigger edge and publishes synced frames
 depends:
 - id: QDU-Robomaster/CameraBase
   ref: same-or-dev
-- id: QDU-Robomaster/CameraSync
+- id: QDU-Robomaster/AutoAimTypes
   ref: same-or-dev
-- id: xrobot-org/DurationStatistics
+- id: QDU-Robomaster/CameraSync
   ref: same-or-dev
 === END MANIFEST === */
 // clang-format on
 
+#include <Eigen/Core>
 #include <array>
 #include <atomic>
-#include <cmath>
-#include <cstddef>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
-#include <limits>
+#include <deque>
+#include <mutex>
 #include <optional>
-#include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
+#include "AutoAimTypes.hpp"
 #include "CameraBase.hpp"
-#include "CameraFrameSyncCore.hpp"
-#include "CameraFrameSyncFrameQueue.hpp"
-#include "CameraSync.hpp"
-#include "DurationStatistics.hpp"
-#include "libxr.hpp"
+#include "FrameMatcher.hpp"
+#include "ImuHistory.hpp"
+#include "TriggerLink.hpp"
 #include "libxr_def.hpp"
 #include "logger.hpp"
+#include "message.hpp"
 #include "transform.hpp"
 
-/**
- * @brief 同步模式。
- *        Synchronization mode.
- */
-enum class CameraFrameSyncMode : uint8_t
+/// 同步方式 / Sync mode.
+enum class SyncMode : uint8_t
 {
-  TRIGGER = 0,          ///< 与 MCU 真实触发边沿配对
-                        ///< Pair images with real MCU trigger edges
-  RAW_PROBE = TRIGGER,  ///< TRIGGER 的别名
-                        ///< Alias of TRIGGER
-  LATEST_IMU = 1,       ///< 每张图像取最新姿态四元数，数据源已自行同步
-                        ///< Take the latest attitude quaternion per image; the data
-                        ///< source is already synchronized
+  TRIGGER,     ///< MCU 外触发，按边沿配对 / MCU trigger, matched by edge
+  LATEST_IMU,  ///< 台架自由运行调试：取最新 IMU / Bench free-run: newest IMU
+};
+
+/// MCU IMU 数据的坐标轴 / Axes of the MCU IMU data.
+enum class ImuAxes : uint8_t
+{
+  BODY,  ///< 已是机体系 x 右、y 前、z 上 / Already body x right, y forward, z up
+  X_FORWARD_Y_LEFT_Z_UP,  ///< x 前、y 左、z 上，转成机体系 / Converted to the body frame
+};
+
+/// 同步设置，与 YAML 一一对应 / Sync settings, one-to-one with the YAML.
+struct FrameSyncSettings
+{
+  SyncMode mode;
+  uint32_t trigger_period_us;   ///< 须大于曝光 + 读出 / Must exceed exposure + readout
+  int32_t offset_us;            ///< 边沿到曝光中点 / From the edge to mid-exposure
+  std::string_view mcu_domain;  ///< MCU Topic 所在 domain，空为默认 / Empty = default
+  std::string_view gyro_topic;  ///< MCU 发布的 IMU Topic 名 / IMU Topics as the MCU
+  std::string_view accl_topic;  ///< publishes them
+  std::string_view quat_topic;
+  ImuAxes imu_axes;  ///< MCU IMU 的坐标轴 / Axes of the MCU IMU
 };
 
 /**
- * @brief 原始 IMU 的坐标约定。
- *        Coordinate convention of the raw IMU.
- */
-enum class CameraFrameSyncRawImuFrame : uint8_t
-{
-  BODY_X_RIGHT_Y_FORWARD_Z_UP = 0,  ///< 本体系 x 右 / y 前 / z 上，数据原样使用
-                                    ///< Body frame x right / y forward / z up, used as is
-  X_FORWARD_Y_LEFT_Z_UP_TO_BODY = 1,  ///< 转换：x 前 / y 左 / z 上
-                                      ///< Converted: x forward / y left / z up
-};
-
-/**
- * @brief 相机帧同步模块：持有相机帧，与 MCU 触发事件配对并发布 SyncedFrame。
- *        Camera frame synchronization Module that holds camera frames, pairs them with
- *        MCU trigger events and publishes SyncedFrame.
+ * @brief 相机帧同步。订阅相机图像、三路 MCU IMU 与 CameraSync 的触发事件，在自己的工作
+ *        线程上给每张图配上曝光时刻的 IMU，发布 `<相机名>_synced`。
+ *        Camera frame sync. It subscribes to the camera images, the three MCU IMU
+ *        streams and CameraSync's trigger events, and on its own worker thread pairs
+ *        each image with the IMU at its exposure time and publishes `<camera>_synced`.
  *
- * 所有回调共用一把状态互斥锁，Topic 发布在锁外执行，同步订阅者可以重入模块接口。
- * All callbacks share one state mutex. Topic publication runs outside the mutex, so
- * synchronous subscribers may re-enter the Module interface.
+ * TRIGGER：启动时让 MCU 停触发再以 `trigger_period_us` 重新开始；图像按帧计数对应边沿，
+ * IMU 取边沿时刻加 `offset_us` 处的插值。计数与边沿矛盾（相机漏触发、计数复位、MCU 重启）
+ * 时重新同步。LATEST_IMU 只用于没有触发的台架调试：图像到达时取最新 IMU，不保证同步。
+ * TRIGGER: at start-up the MCU stops and restarts the trigger at `trigger_period_us`;
+ * images are matched to edges by frame counter and get the IMU interpolated at the edge
+ * time plus `offset_us`. A contradiction (missed trigger, counter reset, MCU reboot)
+ * triggers a resync. LATEST_IMU is only for bench debugging without a trigger: each
+ * image gets the newest IMU, with no sync guarantee.
  *
- * @tparam FrameLayoutV 帧布局，与相机实例相同。
- *                      Frame layout, identical to that of the camera instance.
+ * Topic 回调注册后不能注销，本模块须与进程同寿命。
+ * Topic callbacks cannot be unregistered, so this Module lives as long as the process.
  */
-template <CameraTypes::FrameLayout FrameLayoutV>
 class CameraFrameSync
 {
  public:
-  using Self = CameraFrameSync<FrameLayoutV>;
-  using Base = CameraBase<FrameLayoutV>;
-  using FrameGeometry = CameraTypes::FrameGeometry;
-  using CameraCalibration = typename Base::CameraCalibration;
-  using ImageFrame = typename Base::ImageFrame;
-  using ImuStamped = typename Base::ImuStamped;
-  using ImuVector = std::array<float, 3>;
-  using QuatSample = std::array<float, 4>;
-  using RawImuVector = Eigen::Matrix<float, 3, 1>;
-  using RawQuatSample = LibXR::Quaternion<float>;
-  using SharedFrame = typename Base::SharedFrame;
-  using CameraImageTopicPayload = typename Base::ImageTopicPayload;
-  using ProfileId = typename Base::ProfileId;
-  using CameraProfile = typename Base::CameraProfile;
-  using AppliedProfile = typename Base::AppliedProfile;
-  using SyncMode = CameraFrameSyncMode;
-  using RawImuFrame = CameraFrameSyncRawImuFrame;
+  using ImuVector = Eigen::Matrix<float, 3, 1>;
+  using ImuQuaternion = LibXR::Quaternion<float>;
+  using SyncCommand = CameraSyncDetail::SyncCommand;
+  using SyncEvent = CameraSyncDetail::SyncEvent;
 
-  static inline constexpr auto frame_layout = FrameLayoutV;
+  /// CameraSync 的命令与事件 Topic / CameraSync command and event Topics.
+  static constexpr const char* COMMAND_TOPIC = "camera_sync_command";
+  static constexpr const char* EVENT_TOPIC = "camera_sync_result";
+  /// 图像等边沿或 IMU 的最长时间 / Longest an image waits for its edge or IMU.
+  static constexpr uint64_t PENDING_TIMEOUT_US = 100000;
+  /// 最多挂起的图像数：挂起的图像占着相机的图像槽 / Images held while waiting; they
+  /// occupy camera slots.
+  static constexpr std::size_t MAX_PENDING = 1;
+  /// 输入队列容量 / Input queue capacity.
+  static constexpr std::size_t QUEUE_CAPACITY = 4096;
 
-  /**
-   * @brief 同步后的图像帧。
-   *        Synchronized image frame.
-   */
-  struct SyncedFrame
+  CameraFrameSync(CameraBase& camera, const FrameSyncSettings& settings)
+      : camera_(camera),
+        mode_(settings.mode),
+        imu_axes_(settings.imu_axes),
+        offset_us_(settings.offset_us),
+        synced_topic_(LibXR::Topic::CreateTopic<const AutoAim::SyncedFrame*>(
+            StageTopicName(camera.Name(), AutoAim::STAGE_SYNCED).c_str())),
+        link_(settings.trigger_period_us)
   {
-    uint64_t sequence{};  ///< 单调递增的输出序号
-                          ///< Monotonically increasing output sequence number
-    SharedFrame image{};  ///< 图像句柄
-                          ///< Image handle
-    ImuStamped imu{};     ///< 配对的 IMU 数据，时间戳为权威时间
-                          ///< Paired IMU data whose timestamp is the authoritative time
-
-    /**
-     * @brief 获取只读图像帧。
-     *        Get the read-only image frame.
-     *
-     * @return 图像帧指针，句柄无效时为空指针。
-     *         Image frame pointer; null when the handle is invalid.
-     */
-    [[nodiscard]] const ImageFrame* GetImageFrame() const noexcept { return image.Get(); }
-
-    /**
-     * @brief 判断图像句柄是否有效。
-     *        Check whether the image handle is valid.
-     *
-     * @return 句柄有效为 true。
-     *         True when the handle is valid.
-     */
-    [[nodiscard]] bool Valid() const noexcept { return image.Valid(); }
-  };
-
-  /**
-   * @brief SyncedFrame Topic 载荷，指针在同步回调期间有效。
-   *        SyncedFrame Topic payload; the pointer is valid during synchronous callbacks.
-   */
-  using SyncedFrameTopicPayload = const SyncedFrame*;
-
-  /**
-   * @brief 运行参数。
-   *        Runtime parameters.
-   */
-  struct RuntimeParam
-  {
-    SyncMode mode = SyncMode::TRIGGER;  ///< 同步模式
-                                        ///< Synchronization mode
-    int32_t offset_us = 0;  ///< IMU 时间域中相对触发时间的取样偏移 (us)，作用于 TRIGGER
-                            ///< Sampling offset relative to the trigger time in the IMU
-                            ///< time domain (us); applies to TRIGGER
-    std::string_view host_topic_domain_name = "shared_memory";
-    ///< 命令、事件和原始 IMU Topic 的 domain 名称
-    ///< Domain name of the command, event and raw IMU Topics
-    std::string_view sync_command_topic_name = "camera_sync_command";
-    ///< 发给 CameraSync 的命令 Topic 名称
-    ///< Name of the command Topic sent to CameraSync
-    std::string_view sync_result_topic_name = "camera_sync_result";
-    ///< CameraSync 回执与触发事件 Topic 名称
-    ///< Name of the CameraSync acknowledgement and trigger event Topic
-    uint32_t sync_active_level = 1;  ///< 触发有效电平，非零按 1 处理
-                                     ///< Trigger active level; non-zero is treated as 1
-    uint64_t camera_settle_us = 10000U;  ///< STOP ACK 后等待相机稳定的时间 (us)
-                                         ///< Time to wait for the camera to settle after
-                                         ///< the STOP ACK (us)
-    RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP;
-    ///< 原始 IMU 坐标约定
-    ///< Raw IMU coordinate convention
-    std::string_view raw_quat_topic_name = {};
-    ///< 非空时替代 <相机名>_quat 的姿态 Topic 名称
-    ///< Attitude Topic name replacing <camera_name>_quat when non-empty
-    std::string_view synced_frame_topic_name = {};
-    ///< 同步结果 Topic 名称，为空时使用 <图像 Topic>_synced
-    ///< Synchronized result Topic name; <image Topic>_synced when empty
-
-    /**
-     * @brief 使用全部默认值构造。
-     *        Construct with all defaults.
-     */
-    RuntimeParam() = default;
-
-    /**
-     * @brief 逐项构造运行参数。
-     *        Construct runtime parameters field by field.
-     *
-     * @param mode 同步模式。
-     *             Synchronization mode.
-     * @param offset_us IMU 时间域取样偏移 (us)。
-     *                  Sampling offset in the IMU time domain (us).
-     * @param host_topic_domain_name 命令、事件和原始 IMU Topic 的 domain 名称。
-     *                               Domain name of the command, event and raw IMU Topics.
-     * @param sync_command_topic_name 命令 Topic 名称。
-     *                                Command Topic name.
-     * @param sync_result_topic_name 回执与触发事件 Topic 名称。
-     *                               Acknowledgement and trigger event Topic name.
-     * @param sync_active_level 触发有效电平。
-     *                          Trigger active level.
-     * @param camera_settle_us STOP ACK 后等待相机稳定的时间 (us)。
-     *                         Time to wait for the camera to settle after the STOP ACK
-     *                         (us).
-     * @param raw_imu_frame 原始 IMU 坐标约定。
-     *                      Raw IMU coordinate convention.
-     * @param raw_quat_topic_name 姿态 Topic 名称，为空时使用 <相机名>_quat。
-     *                            Attitude Topic name; <camera_name>_quat when empty.
-     * @param synced_frame_topic_name 同步结果 Topic 名称，为空时用 <图像 Topic>_synced。
-     *                                Synced result Topic name; <image Topic>_synced when
-     *                                empty.
-     */
-    constexpr RuntimeParam(
-        SyncMode mode, int32_t offset_us, std::string_view host_topic_domain_name,
-        std::string_view sync_command_topic_name, std::string_view sync_result_topic_name,
-        uint32_t sync_active_level, uint64_t camera_settle_us = 10000U,
-        RawImuFrame raw_imu_frame = RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP,
-        std::string_view raw_quat_topic_name = {},
-        std::string_view synced_frame_topic_name = {})
-        : mode(mode),
-          offset_us(offset_us),
-          host_topic_domain_name(host_topic_domain_name),
-          sync_command_topic_name(sync_command_topic_name),
-          sync_result_topic_name(sync_result_topic_name),
-          sync_active_level(sync_active_level),
-          camera_settle_us(camera_settle_us),
-          raw_imu_frame(raw_imu_frame),
-          raw_quat_topic_name(raw_quat_topic_name),
-          synced_frame_topic_name(synced_frame_topic_name)
+    REQUIRE(mode_ == SyncMode::LATEST_IMU || settings.trigger_period_us > 0);
+    if (!settings.mcu_domain.empty())
     {
+      domain_.emplace(std::string(settings.mcu_domain).c_str());
     }
+    LibXR::Topic::Domain* domain = domain_ ? &*domain_ : nullptr;
+
+    Subscribe<ImageTopicPayload>(StageTopicName(camera.Name(), "image"), nullptr,
+                                 [](bool, CameraFrameSync* self,
+                                    ImageTopicPayload payload) { self->Push(*payload); });
+    SubscribeMcu<ImuVector>(std::string(settings.gyro_topic), domain,
+                            [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t,
+                               ImuVector& v) { self->Push(Gyro{t, self->ToBody(v)}); });
+    SubscribeMcu<ImuVector>(std::string(settings.accl_topic), domain,
+                            [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t,
+                               ImuVector& v) { self->Push(Accl{t, self->ToBody(v)}); });
+    SubscribeMcu<ImuQuaternion>(
+        std::string(settings.quat_topic), domain,
+        [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, ImuQuaternion& q)
+        { self->Push(Quat{t, self->ToBody(q)}); });
+    if (mode_ == SyncMode::TRIGGER)
+    {
+      SubscribeMcu<SyncEvent>(
+          EVENT_TOPIC, domain,
+          [](bool, CameraFrameSync* self, LibXR::MicrosecondTimestamp t, SyncEvent& e)
+          { self->Push(Event{t, e}); });
+      command_topic_ = LibXR::Topic::CreateTopic<SyncCommand>(COMMAND_TOPIC, domain);
+    }
+    running_.store(true);
+    worker_ = std::thread([this]() { WorkerLoop(); });
+  }
+
+  ~CameraFrameSync()
+  {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      running_.store(false);
+    }
+    queue_cv_.notify_one();
+    worker_.join();
+    queue_.clear();  // 放掉排队的图像 / Release queued images
+  }
+
+  CameraFrameSync(const CameraFrameSync&) = delete;
+  CameraFrameSync& operator=(const CameraFrameSync&) = delete;
+
+  /// 请求切档，任意线程可调用；TRIGGER 下走 STOP → 稳定 → 切档 → START。
+  /// Request a view switch from any thread; in TRIGGER it runs STOP → settle → switch
+  /// → START.
+  void RequestView(View view) { Push(view); }
+
+  /// 请求移动 NARROW 窗口，任意线程可调用；TRIGGER 下走 STOP → 稳定 → 移窗 → START，
+  /// 停触发是屏障，START 之后的帧都是新窗口。不在 NARROW 时只记下位置。
+  /// Request a NARROW window move from any thread; in TRIGGER it runs STOP → settle →
+  /// move → START, with the stopped trigger as the barrier so every frame after START
+  /// has the new window. Outside NARROW only the position is stored.
+  void RequestMove(NarrowPosition narrow) { Push(narrow); }
+
+  /// 打印周期摘要 / Print the periodic summary.
+  void OnMonitor()
+  {
+    XR_LOG_INFO(
+        "%s sync: published=%u no_edge=%u no_imu=%u overflow=%u resync=%u resend=%u "
+        "imu_out_of_order=%u",
+        camera_.Name().c_str(), stats_.published.exchange(0), stats_.no_edge.exchange(0),
+        stats_.no_imu.exchange(0), stats_.overflow.exchange(0), stats_.resync.exchange(0),
+        stats_.resend.exchange(0), stats_.imu_out_of_order.exchange(0));
+  }
+
+ private:
+  struct Gyro
+  {
+    LibXR::MicrosecondTimestamp t;
+    std::array<float, 3> v;
+  };
+  struct Accl
+  {
+    LibXR::MicrosecondTimestamp t;
+    std::array<float, 3> v;
+  };
+  struct Quat
+  {
+    LibXR::MicrosecondTimestamp t;
+    std::array<float, 4> wxyz;
+  };
+  struct Event
+  {
+    LibXR::MicrosecondTimestamp t;
+    SyncEvent event;
+  };
+  /// 工作线程的输入，按到达顺序处理 / Worker input, handled in arrival order.
+  using Input = std::variant<SharedFrame, Gyro, Accl, Quat, Event, View, NarrowPosition>;
+
+  /// 等边沿或 IMU 的图像 / An image waiting for its edge or IMU.
+  struct Pending
+  {
+    SharedFrame image;
+    uint64_t arrived_us;
+    std::optional<uint64_t> edge_time_us;
   };
 
-  /**
-   * @brief 返回全部默认值的运行参数。
-   *        Return runtime parameters with all defaults.
-   *
-   * @return 默认运行参数。
-   *         Default runtime parameters.
-   */
-  static RuntimeParam DefaultRuntime() { return {}; }
-
-  /**
-   * @brief 构造 CameraFrameSync，订阅图像、原始 IMU 与同步事件 Topic。
-   *        TRIGGER 模式下立即对当前 profile 发起一次 STOP / settle / START。
-   *        Construct CameraFrameSync and subscribe to the image, raw IMU and
-   *        synchronization event Topics. In TRIGGER mode it immediately starts one
-   *        STOP / settle / START sequence on the current profile.
-   *
-   * 相机名、图像 Topic、domain 与两个同步 Topic 名为非空值，相机 profile 数量为 1 到 2
-   * 且周期非零、几何合法、ID 唯一；否则 REQUIRE 失败。
-   * The camera name, image Topic, domain and both synchronization Topic names are
-   * non-empty, and the camera has one or two profiles with non-zero periods, valid
-   * geometry and unique IDs; otherwise REQUIRE fails.
-   *
-   * @param camera 相机实例，其帧布局为 FrameLayoutV。
-   *               Camera instance whose frame layout is FrameLayoutV.
-   * @param runtime 运行参数。
-   *                Runtime parameters.
-   */
-  CameraFrameSync(Base& camera, RuntimeParam runtime = DefaultRuntime());
-
-  /**
-   * @brief 获取同步结果 Topic 名称。
-   *        Get the name of the synchronized result Topic.
-   *
-   * @return Topic 名称。
-   *         Topic name.
-   */
-  [[nodiscard]] const char* SyncedFrameTopicName() const;
-
-  /**
-   * @brief 获取命令、事件和原始 IMU Topic 的 domain 名称。
-   *        Get the domain name of the command, event and raw IMU Topics.
-   *
-   * @return domain 名称。
-   *         Domain name.
-   */
-  [[nodiscard]] const char* RawTopicDomainName() const;
-
-  /**
-   * @brief 获取构造时复制的相机原生标定。
-   *        Get the native camera calibration copied at construction.
-   *
-   * @return 相机标定。
-   *         Camera calibration.
-   */
-  [[nodiscard]] const CameraCalibration& Calibration() const noexcept
+  struct Stats
   {
-    return calibration_;
+    std::atomic<uint32_t> published{0};
+    std::atomic<uint32_t> no_edge{0};
+    std::atomic<uint32_t> no_imu{0};
+    std::atomic<uint32_t> overflow{0};
+    std::atomic<uint32_t> resync{0};
+    std::atomic<uint32_t> resend{0};
+    std::atomic<uint32_t> imu_out_of_order{0};
+  };
+
+  /// x 前、y 左、z 上转机体系：向量取 (-y, x, z)，四元数取 (w, -y, x, z)。
+  /// x-forward, y-left, z-up to the body frame: vectors (-y, x, z), quaternions
+  /// (w, -y, x, z).
+  std::array<float, 3> ToBody(const ImuVector& v) const
+  {
+    if (imu_axes_ == ImuAxes::X_FORWARD_Y_LEFT_Z_UP)
+    {
+      return {-v.y(), v.x(), v.z()};
+    }
+    return {v.x(), v.y(), v.z()};
+  }
+
+  std::array<float, 4> ToBody(const ImuQuaternion& q) const
+  {
+    if (imu_axes_ == ImuAxes::X_FORWARD_Y_LEFT_Z_UP)
+    {
+      return {q.w(), -q.y(), q.x(), q.z()};
+    }
+    return {q.w(), q.x(), q.y(), q.z()};
+  }
+
+  /// 相机图像 Topic 必须已存在 / The camera image Topic must already exist.
+  template <typename Payload, typename Fun>
+  void Subscribe(const std::string& name, LibXR::Topic::Domain* domain, Fun fun)
+  {
+    auto callback = LibXR::Topic::Callback::Create(fun, this);
+    AutoAim::RequireTopic<Payload>(name, domain).RegisterCallback(callback);
   }
 
   /**
-   * @brief 获取相机声明的固定 profile。
-   *        Get the fixed profiles declared by the camera.
-   *
-   * @return profile 列表。
-   *         Profile list.
+   * @brief MCU 的 Topic 由 SharedTopic 按名字转发，它只认已存在的带类型 Topic，所以由这里
+   *        创建（已存在则校验类型）；BSP 里本模块排在 SharedTopic 之前。
+   *        MCU Topics are forwarded by name by SharedTopic, which only accepts existing
+   *        typed Topics, so they are created here (or type-checked when they exist); the
+   *        BSP lists this Module before SharedTopic.
    */
-  [[nodiscard]] std::span<const CameraProfile> Profiles() const noexcept;
+  template <typename Payload, typename Fun>
+  void SubscribeMcu(const std::string& name, LibXR::Topic::Domain* domain, Fun fun)
+  {
+    auto callback = LibXR::Topic::Callback::Create(fun, this);
+    LibXR::Topic(LibXR::Topic::FindOrCreate<Payload>(name.c_str(), domain))
+        .RegisterCallback(callback);
+  }
 
-  /**
-   * @brief 获取当前生效的 profile。
-   *        Get the profile currently in effect.
-   *
-   * @return profile ID。
-   *         Profile ID.
-   */
-  [[nodiscard]] ProfileId ActiveProfile() const;
-
-  /**
-   * @brief 获取同步模式。
-   *        Get the synchronization mode.
-   *
-   * @return 同步模式。
-   *         Synchronization mode.
-   */
-  [[nodiscard]] SyncMode GetSyncMode() const;
-
-  /**
-   * @brief 请求切换到另一个固定 profile，仅接纳异步的 STOP / settle /
-   *        SwitchProfile / START 事务。
-   *        Request a different fixed profile; the call admits the asynchronous
-   *        STOP / settle / SwitchProfile / START transaction.
-   *
-   * TRIGGER 模式仅在 RUNNING 状态接纳请求，进入 FAILED 之后对当前 profile 的请求同样
-   * 返回 STATE_ERR。LATEST_IMU 模式仅当前 profile 可用。
-   * TRIGGER mode admits requests only while RUNNING; after FAILED, a request for the
-   * current profile also returns STATE_ERR. In LATEST_IMU mode only the current profile
-   * is available.
-   *
-   * @param profile 目标 profile ID。
-   *                Target profile ID.
-   * @return OK 表示已接纳或已处于该 profile，NOT_SUPPORT 表示相机未声明该 profile
-   *         （LATEST_IMU 模式下为非当前 profile），STATE_ERR 表示当前状态不接纳请求。
-   *         OK when admitted or already on that profile; NOT_SUPPORT when the camera
-   *         does not declare the profile (a non-current profile in LATEST_IMU mode);
-   *         STATE_ERR when the current state does not admit requests.
-   */
-  LibXR::ErrorCode RequestProfile(ProfileId profile);
-
-  /**
-   * @brief 设置 IMU 取样偏移，选择触发时间附近的 IMU 样本，
-   *        SyncedFrame::imu.timestamp_us 保留原始触发时间。
-   *        Set the IMU sampling offset that selects a nearby IMU sample; the
-   *        authoritative trigger timestamp carried by SyncedFrame::imu.timestamp_us is
-   *        unchanged.
-   *
-   * @param offset_us IMU 时间域取样偏移 (us)。
-   *                  Sampling offset in the IMU time domain (us).
-   */
-  void SetOffsetUs(int32_t offset_us);
-
-  /**
-   * @brief 立即处理待匹配数据，然后清空图像与 trigger 队列。
-   *        Process pending data immediately, then clear the image and trigger queues.
-   */
-  void FlushPendingFrames();
-
-  /**
-   * @brief 监控回调，输出控制状态、profile、周期、计数与 pending_processing 耗时统计。
-   *        Monitor callback that logs the control state, profile, period, counters and
-   *        the pending_processing duration statistics.
-   */
-  void OnMonitor();
-
- private:
-  template <typename T, std::size_t Capacity>
-  using SampleHistory = CameraFrameSyncCore::SampleHistory<T, Capacity>;
-
+  /// 就地构造进队列，不移动 Input / Construct in the queue in place, without moving an
+  /// Input.
   template <typename T>
-  class DropOldestQueue
+  void Push(T&& value)
   {
-   public:
-    explicit DropOldestQueue(std::size_t capacity) : queue_(capacity) {}
-
-    [[nodiscard]] bool Empty() const { return queue_.Size() == 0U; }
-    [[nodiscard]] bool Front(T& out) { return queue_.Peek(out) == LibXR::ErrorCode::OK; }
-    void PopFront() { queue_.Pop(); }
-    void Clear() { queue_.Reset(); }
-
-    /** @return true when the oldest element had to be discarded. */
-    [[nodiscard]] bool PushBackDropOldest(const T& value)
     {
-      if (queue_.Push(value) == LibXR::ErrorCode::OK)
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      if (!running_.load())
       {
-        return false;
+        return;
       }
-      T dropped{};
-      queue_.Pop(dropped);
-      const auto result = queue_.Push(value);
-      ASSERT(result == LibXR::ErrorCode::OK);
-      return true;
+      if (queue_.size() >= QUEUE_CAPACITY)
+      {
+        stats_.overflow.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      queue_.emplace_back(std::in_place_type<std::decay_t<T>>, std::forward<T>(value));
     }
+    queue_cv_.notify_one();
+  }
 
-   private:
-    LibXR::Queue<T> queue_;
-  };
-
-  struct Topics
+  static uint64_t NowUs()
   {
-    Topics(const Base& camera, const RuntimeParam& runtime)
-        : camera_image_name(camera.ImageTopicNameView()),
-          synced_frame_name(runtime.synced_frame_topic_name.empty()
-                                ? std::string(camera.ImageTopicNameView()) + "_synced"
-                                : std::string(runtime.synced_frame_topic_name)),
-          host_domain_name(runtime.host_topic_domain_name),
-          sync_command_name(runtime.sync_command_topic_name),
-          sync_result_name(runtime.sync_result_topic_name),
-          raw_imu_prefix(camera.NameView()),
-          gyro_name(raw_imu_prefix + "_gyro"),
-          accl_name(raw_imu_prefix + "_accl"),
-          quat_name(runtime.raw_quat_topic_name.empty()
-                        ? raw_imu_prefix + "_quat"
-                        : std::string(runtime.raw_quat_topic_name)),
-          host_domain(host_domain_name.c_str()),
-          camera_image(LibXR::Topic::FindOrCreate<CameraImageTopicPayload>(
-              camera_image_name.c_str())),
-          synced_frame(LibXR::Topic::FindOrCreate<SyncedFrameTopicPayload>(
-              synced_frame_name.c_str())),
-          sync_command(LibXR::Topic::FindOrCreate<CameraSync::SyncCommand>(
-              sync_command_name.c_str(), &host_domain)),
-          sync_result(LibXR::Topic::FindOrCreate<CameraSync::SyncEvent>(
-              sync_result_name.c_str(), &host_domain)),
-          gyro(LibXR::Topic::FindOrCreate<RawImuVector>(gyro_name.c_str(), &host_domain)),
-          accl(LibXR::Topic::FindOrCreate<RawImuVector>(accl_name.c_str(), &host_domain)),
-          quat(LibXR::Topic::FindOrCreate<RawQuatSample>(quat_name.c_str(), &host_domain))
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+  }
+
+  void WorkerLoop()
+  {
+    if (mode_ == SyncMode::TRIGGER)
     {
-      ASSERT(!raw_imu_prefix.empty());
+      Apply(link_.Restart(NowUs()));
     }
-
-    std::string camera_image_name;
-    std::string synced_frame_name;
-    std::string host_domain_name;
-    std::string sync_command_name;
-    std::string sync_result_name;
-    std::string raw_imu_prefix;
-    std::string gyro_name;
-    std::string accl_name;
-    std::string quat_name;
-    LibXR::Topic::Domain host_domain;
-    LibXR::Topic camera_image;
-    LibXR::Topic synced_frame;
-    LibXR::Topic sync_command;
-    LibXR::Topic sync_result;
-    LibXR::Topic gyro;
-    LibXR::Topic accl;
-    LibXR::Topic quat;
-  };
-
-  struct TopicCallbacks
-  {
-    explicit TopicCallbacks(Self* self)
-        : image(LibXR::Topic::Callback::Create(OnImageStatic, self)),
-          gyro(LibXR::Topic::Callback::Create(OnGyroStatic, self)),
-          accl(LibXR::Topic::Callback::Create(OnAcclStatic, self)),
-          quat(LibXR::Topic::Callback::Create(OnQuatStatic, self)),
-          sync_result(LibXR::Topic::Callback::Create(OnSyncResultStatic, self))
+    std::deque<Input> batch;
+    while (true)
     {
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                           [this]() { return !queue_.empty() || !running_.load(); });
+        if (!running_.load())
+        {
+          break;
+        }
+        batch.swap(queue_);
+      }
+      for (Input& input : batch)
+      {
+        std::visit([this](auto& value) { Handle(value); }, input);
+      }
+      batch.clear();
+      const uint64_t now = NowUs();
+      if (mode_ == SyncMode::TRIGGER)
+      {
+        Apply(link_.Tick(now));
+        stats_.resend.fetch_add(link_.TakeResends(), std::memory_order_relaxed);
+        ProcessPending(now);
+      }
+      stats_.imu_out_of_order.fetch_add(history_.TakeOutOfOrder(),
+                                        std::memory_order_relaxed);
     }
+    pending_.clear();  // 放掉图像槽 / Release the image slots
+  }
 
-    LibXR::Topic::Callback image;
-    LibXR::Topic::Callback gyro;
-    LibXR::Topic::Callback accl;
-    LibXR::Topic::Callback quat;
-    LibXR::Topic::Callback sync_result;
-  };
-
-  struct GyroSample
+  void Handle(SharedFrame& image)
   {
-    uint64_t sensor_timestamp_us{};
-    ImuVector angular_velocity_xyz{};
-  };
+    if (mode_ == SyncMode::LATEST_IMU)
+    {
+      const std::optional<AutoAim::ImuSample> imu = history_.Latest();
+      if (imu)
+      {
+        Publish(image, *imu);
+      }
+      else
+      {
+        stats_.no_imu.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
+    }
+    if (pending_.size() >= MAX_PENDING)
+    {
+      pending_.pop_front();
+      stats_.no_edge.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending_.push_back({std::move(image), NowUs(), std::nullopt});
+    ProcessPending(NowUs());
+  }
 
-  struct AcclSample
+  void Handle(const Gyro& s)
   {
-    uint64_t sensor_timestamp_us{};
-    ImuVector linear_acceleration_xyz{};
-  };
-
-  struct QuatReading
+    history_.AddAngularVelocity(static_cast<uint64_t>(s.t), s.v);
+  }
+  void Handle(const Accl& s)
   {
-    uint64_t sensor_timestamp_us{};
-    QuatSample rotation_wxyz{};
-  };
+    history_.AddLinearAcceleration(static_cast<uint64_t>(s.t), s.v);
+  }
+  void Handle(const Quat& s) { history_.AddRotation(static_cast<uint64_t>(s.t), s.wxyz); }
 
-  struct AssembledImu
+  void Handle(const Event& e)
   {
-    uint64_t sensor_timestamp_us{};
-    QuatSample rotation_wxyz{};
-    ImuVector angular_velocity_xyz{};
-    ImuVector linear_acceleration_xyz{};
-  };
+    const uint64_t now = NowUs();
+    if (e.event.operation != CameraSyncDetail::Operation::FRAME_TRIGGER)
+    {
+      Apply(link_.OnEvent(e.event, now));
+      return;
+    }
+    if (!matcher_.OnEdge(e.event, static_cast<uint64_t>(e.t)))
+    {
+      Resync(now, "edge from another trigger run");
+    }
+  }
 
-  struct ImageSample
+  void Handle(const View& view)
   {
-    uint64_t camera_timestamp_us{};
-    uint64_t sequence{};
-    SharedFrame frame{};
-  };
+    if (mode_ == SyncMode::LATEST_IMU)
+    {
+      camera_.SwitchView(view);
+      return;
+    }
+    matcher_.Stop();
+    pending_.clear();
+    Apply(link_.Restart(NowUs(), view));
+  }
 
-  struct TriggerSample
+  void Handle(const NarrowPosition& narrow)
   {
-    uint64_t imu_timestamp_us{};
-    uint32_t sequence{};
-  };
+    if (mode_ == SyncMode::LATEST_IMU)
+    {
+      camera_.MoveNarrow(narrow);
+      return;
+    }
+    matcher_.Stop();
+    pending_.clear();
+    Apply(link_.Restart(NowUs(), std::nullopt, narrow));
+  }
 
-  enum class OutboundKind : uint8_t
+  /// 先移窗、切档，再发命令，最后按 START 重新开始配对。先移窗：从 WIDE 切到 NARROW
+  /// 时用新位置。
+  /// Move and switch first, then send, then restart matching on START. The move comes
+  /// first so a switch from WIDE to NARROW uses the new position.
+  void Apply(const TriggerLink::Actions& actions)
   {
-    SYNC_COMMAND = 0,
-    SYNCED_FRAME = 1,
-  };
+    if (actions.move_narrow)
+    {
+      camera_.MoveNarrow(*actions.move_narrow);
+    }
+    if (actions.switch_view)
+    {
+      camera_.SwitchView(*actions.switch_view);
+    }
+    if (actions.send)
+    {
+      SyncCommand command = *actions.send;
+      command_topic_.Publish(command);
+    }
+    if (actions.started)
+    {
+      pending_.clear();
+      matcher_.Reset(*actions.started, link_.PeriodUs());
+      XR_LOG_INFO("%s sync: trigger running, period %u us", camera_.Name().c_str(),
+                  link_.PeriodUs());
+    }
+  }
 
-  struct OutboundItem
+  void Resync(uint64_t now, const char* reason)
   {
-    OutboundKind kind{OutboundKind::SYNC_COMMAND};
-    CameraSync::SyncCommand command{};
-    bool consumes_retry{false};
-    SyncedFrame frame{};
-  };
+    if (!matcher_.Running())
+    {
+      return;  // 已在重新同步 / Already resyncing
+    }
+    const uint32_t count = stats_.resync.fetch_add(1, std::memory_order_relaxed) + 1;
+    ++total_resyncs_;
+    if (AutoAim::ShouldLog(total_resyncs_))
+    {
+      XR_LOG_WARN("%s sync: resync (%s), %u in this period", camera_.Name().c_str(),
+                  reason, count);
+    }
+    matcher_.Stop();
+    pending_.clear();
+    Apply(link_.Restart(now));
+  }
 
-  enum class ControlState : uint8_t
+  void ProcessPending(uint64_t now)
   {
-    BYPASS = 0,
-    WAIT_STOP_ACK,
-    SETTLING,
-    SWITCHING_CAMERA,
-    WAIT_START_ACK,
-    RUNNING,
-    FAILED,
-  };
+    while (!pending_.empty())
+    {
+      Pending& p = pending_.front();
+      const bool timed_out = now - p.arrived_us > PENDING_TIMEOUT_US;
+      if (!p.edge_time_us)
+      {
+        uint64_t edge_time_us = 0;
+        const FrameMatcher::Result result =
+            matcher_.Match(p.image->frame_counter,
+                           static_cast<uint64_t>(p.image->timestamp_us), edge_time_us);
+        if (result == FrameMatcher::Result::RESYNC)
+        {
+          Resync(now, "frame counter contradicts the edges");
+          return;
+        }
+        if (result == FrameMatcher::Result::WAIT && !timed_out)
+        {
+          return;
+        }
+        if (result != FrameMatcher::Result::MATCHED)
+        {
+          stats_.no_edge.fetch_add(1, std::memory_order_relaxed);
+          pending_.pop_front();
+          continue;
+        }
+        p.edge_time_us = edge_time_us;
+      }
+      AutoAim::ImuSample imu{};
+      const int64_t t = static_cast<int64_t>(*p.edge_time_us) + offset_us_;
+      const ImuHistory::Lookup lookup = history_.At(static_cast<uint64_t>(t), imu);
+      if (lookup == ImuHistory::Lookup::NOT_YET && !timed_out)
+      {
+        return;
+      }
+      if (lookup == ImuHistory::Lookup::OK)
+      {
+        Publish(p.image, imu);
+      }
+      else
+      {
+        stats_.no_imu.fetch_add(1, std::memory_order_relaxed);
+      }
+      pending_.pop_front();
+    }
+  }
 
-  enum class ImuLookup : uint8_t
+  void Publish(const SharedFrame& image, const AutoAim::ImuSample& imu)
   {
-    WAIT = 0,
-    FOUND,
-    MISSING,
-  };
+    const AutoAim::SyncedFrame synced{++sequence_, image, imu};
+    const AutoAim::SyncedFrame* payload = &synced;
+    synced_topic_.Publish(payload);
+    stats_.published.fetch_add(1, std::memory_order_relaxed);
+  }
 
-  static constexpr std::size_t pending_limit = 1024U;
-  static constexpr std::size_t history_limit = 1024U;
-  static constexpr std::size_t image_queue_capacity = Base::image_slot_count;
-  static constexpr std::size_t trigger_queue_capacity = 256U;
-  static constexpr std::size_t outbound_queue_capacity = Base::image_slot_count + 4U;
-  static constexpr uint32_t max_camera_gap_stride = 128U;
-  static constexpr uint64_t command_retry_interval_us = 100000U;
-  static constexpr uint8_t command_retry_limit = 3U;
-  static constexpr uint64_t offset_lookup_tolerance_us = 500U;
+  CameraBase& camera_;
+  const SyncMode mode_;
+  const ImuAxes imu_axes_;
+  const int32_t offset_us_;
+  std::optional<LibXR::Topic::Domain> domain_;
+  LibXR::Topic synced_topic_;
+  LibXR::Topic command_topic_;
 
-  static const char* SyncModeName(SyncMode mode);
-  static const char* ControlStateName(ControlState state);
-  static const char* RawImuFrameName(RawImuFrame frame);
-  static ImuVector ToImuVector(const RawImuVector& data, RawImuFrame frame);
-  static QuatSample ToQuatSample(const RawQuatSample& data, RawImuFrame frame);
+  // 只在工作线程使用 / Worker thread only.
+  TriggerLink link_;
+  FrameMatcher matcher_;
+  ImuHistory history_;
+  std::deque<Pending> pending_;
+  uint64_t sequence_ = 0;
+  uint64_t total_resyncs_ = 0;
 
-  static void OnImageStatic(bool, Self* self, CameraImageTopicPayload borrowed);
-  static void OnGyroStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
-                           const RawImuVector& data);
-  static void OnAcclStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
-                           const RawImuVector& data);
-  static void OnQuatStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
-                           const RawQuatSample& data);
-  static void OnSyncResultStatic(bool, Self* self, LibXR::MicrosecondTimestamp timestamp,
-                                 const CameraSync::SyncEvent& event);
-
-  void HandleImage(SharedFrame image);
-  void HandleSyncEventLocked(uint64_t event_timestamp_us,
-                             const CameraSync::SyncEvent& event);
-
-  [[nodiscard]] const CameraProfile* FindProfile(ProfileId profile) const noexcept;
-  uint8_t AllocateSyncSequence();
-  void BeginRestartLocked(ProfileId profile, bool switch_profile);
-  [[nodiscard]] bool QueueCommandLocked(CameraSync::Operation operation,
-                                        uint32_t trigger_period_us);
-  void ArmCommandLocked(const CameraSync::SyncCommand& command);
-  void ClearCommandLocked();
-  [[nodiscard]] bool IsPendingCommandLocked(const CameraSync::SyncCommand& command) const;
-  void MaybeRetryCommandLocked(uint64_t gyro_timestamp_us);
-  [[nodiscard]] std::optional<ProfileId> AdvanceSettlingLocked(
-      uint64_t gyro_timestamp_us);
-  void ApplyProfileSwitch(ProfileId profile);
-  void QueueStartLocked();
-  void FailControlLocked();
-  void RestartForMismatchLocked();
-  void ResetTimestampEpochLocked(uint64_t gyro_timestamp_us);
-  void ResetMatchingLocked();
-  void ResetRawImuLocked();
-
-  void AssembleImuHistoryLocked();
-  [[nodiscard]] bool TryAssembleOneImuLocked();
-  void AcceptAssembledImuLocked(const AssembledImu& imu);
-  void ProcessPendingLocked();
-  void ProcessTriggerMatchesLocked();
-  void ProcessLatestMatchesLocked();
-  [[nodiscard]] ImuLookup FindImuLocked(uint64_t trigger_timestamp_us,
-                                        const AssembledImu*& imu) const;
-  [[nodiscard]] bool QueueSyncedFrameLocked(ImageSample& image, const AssembledImu& imu,
-                                            uint64_t authoritative_timestamp_us);
-  void CompleteMatchedImageLocked(uint64_t camera_timestamp_us,
-                                  uint32_t trigger_sequence);
-
-  [[nodiscard]] bool QueueOutboundLocked(OutboundItem item);
-  void DispatchOutbound();
-  void ProcessSyncWorkWithoutImage();
-
-  Base* camera_{nullptr};
-  CameraCalibration calibration_{};
-  std::optional<Topics> topics_{};
-  std::optional<TopicCallbacks> callbacks_{};
-  std::optional<DropOldestQueue<GyroSample>> pending_gyros_{};
-  std::optional<DropOldestQueue<AcclSample>> pending_accls_{};
-  std::optional<DropOldestQueue<QuatReading>> pending_quats_{};
-  std::optional<SampleHistory<AssembledImu, history_limit>> imu_history_{};
-
-  mutable LibXR::Mutex sync_state_mutex_{};
-  CameraFrameSyncDetail::FrameQueue<ImageSample, image_queue_capacity> images_{};
-  CameraFrameSyncDetail::FrameQueue<TriggerSample, trigger_queue_capacity> triggers_{};
-  CameraFrameSyncDetail::FrameQueue<OutboundItem, outbound_queue_capacity> outbound_{};
-
-  SyncMode sync_mode_{SyncMode::TRIGGER};
-  RawImuFrame raw_imu_frame_{RawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP};
-  int32_t offset_us_{0};
-  uint8_t sync_active_level_{1U};
-  uint64_t camera_settle_us_{10000U};
-
-  ControlState control_state_{ControlState::BYPASS};
-  ProfileId active_profile_{ProfileId::WIDE};
-  ProfileId requested_profile_{ProfileId::WIDE};
-  uint32_t active_trigger_period_us_{0U};
-  uint32_t requested_trigger_period_us_{0U};
-  bool switch_profile_after_settle_{false};
-  bool camera_switch_in_progress_{false};
-  bool epoch_recovery_{false};
-  uint64_t settle_deadline_us_{0U};
-  uint8_t active_start_seq_{0U};
-  uint8_t next_sync_seq_{1U};
-
-  CameraSync::SyncCommand pending_command_{};
-  bool command_waiting_ack_{false};
-  bool command_pending_dispatch_{false};
-  uint8_t command_retry_count_{0U};
-  uint64_t command_last_dispatch_imu_timestamp_us_{0U};
-  uint64_t latest_raw_imu_timestamp_us_{0U};
-
-  bool trigger_stream_valid_{false};
-  uint32_t last_received_trigger_sequence_{0U};
-  uint64_t last_received_trigger_timestamp_us_{0U};
-  bool matched_pair_valid_{false};
-  uint64_t last_matched_camera_timestamp_us_{0U};
-  uint32_t last_matched_trigger_sequence_{0U};
-  bool last_output_timestamp_valid_{false};
-  uint64_t last_output_timestamp_us_{0U};
-  uint64_t next_frame_sequence_{1U};
-  bool dispatching_outbound_{false};
-  bool geometry_reject_logged_{false};
-
-  std::atomic<uint64_t> monitor_raw_gyro_count_{0U};
-  std::atomic<uint64_t> monitor_raw_accl_count_{0U};
-  std::atomic<uint64_t> monitor_raw_quat_count_{0U};
-  std::atomic<uint64_t> monitor_assembled_imu_count_{0U};
-  std::atomic<uint64_t> monitor_trigger_count_{0U};
-  std::atomic<uint64_t> monitor_image_input_count_{0U};
-  std::atomic<uint64_t> monitor_image_retained_count_{0U};
-  std::atomic<uint64_t> monitor_image_drop_count_{0U};
-  std::atomic<uint64_t> monitor_synced_output_count_{0U};
-  std::atomic<uint64_t> monitor_reset_count_{0U};
-  std::atomic<uint64_t> monitor_overflow_count_{0U};
-  XRobot::DurationStatistics pending_processing_duration_{};
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::deque<Input> queue_;
+  std::atomic<bool> running_{false};
+  Stats stats_;
+  std::thread worker_;
 };
-
-#include "CameraFrameSyncImpl.hpp"
-#include "CameraFrameSyncStateMachine.hpp"

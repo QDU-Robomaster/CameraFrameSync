@@ -1,280 +1,111 @@
 # CameraFrameSync
 
-相机帧与 MCU 触发时间戳同步模块：持有相机帧并与 IMU 触发时间配对，发布 SyncedFrame / Camera frame and MCU trigger timestamp synchronization Module that holds camera frames, pairs them with IMU trigger times and publishes SyncedFrame
+相机帧同步：按触发边沿给每张图配上 IMU，发布同步帧 / Camera frame sync that pairs every image with the IMU at its trigger edge and publishes synced frames
 
 ## 1. 模块作用 / Purpose
 
-CameraFrameSync 在单进程内完成两件事：
+相机由 MCU（CameraSync 模块）按固定周期外触发，MCU 为每个触发边沿发一条带 IMU 时间戳的事件。CameraFrameSync 在主机侧把每张图对应到它的触发边沿，取曝光时刻的 IMU，组成 `SyncedFrame{sequence, image, imu}` 发布到 `<相机名>_synced`，检测器从这里开始处理。
 
-- 从 `CameraBase<FrameLayoutV>` 的 Topic 接收并持有 `SharedFrame`。
-- 把图像与 MCU 每个真实相机触发边沿对应的 IMU 时间戳配对，发布 `SyncedFrame`。
+The camera is triggered by the MCU (the CameraSync Module) at a fixed period, and the MCU sends one event with an IMU timestamp for every trigger edge. On the host, CameraFrameSync matches each image to its trigger edge, takes the IMU at the exposure time and publishes `SyncedFrame{sequence, image, imu}` on `<camera>_synced`, where the detector starts.
 
-全部处理在各 Topic 回调所在的线程内完成，模块自身没有工作线程。`SyncCommand` 与 `SyncedFrame` 的同步订阅者可以在回调中调用本模块的接口。
+## 2. 结构 / Structure
 
-`SyncedFrame` 包含单调递增的 `sequence`、图像句柄 `image`（`GetImageFrame()` 取只读帧）和 `imu`（`ImuStamped`，平移恒为 0）。
+所有回调只把输入放进一条按到达顺序处理的队列；配对、链路控制和发布都在模块自己的工作线程上进行。工作线程使用三个部件，各自可以单独测试：
 
-同步状态机、图像与边沿的匹配、原始 IMU 组装、命令重试和监控输出的实现细节见 [docs/internals.md](docs/internals.md)。
+Every callback only puts its input into one queue handled in arrival order; matching, link control and publishing all run on the Module's own worker thread, which uses three parts that can be tested on their own:
 
-CameraFrameSync completes two tasks inside one process:
+| 部件 / Part | 职责 / Role |
+| --- | --- |
+| `ImuHistory` | 角速度、加速度、姿态三路各自的时间环形缓冲，按任意时刻插值 / Time rings of the three IMU streams, interpolated at any time |
+| `TriggerLink` | 与 CameraSync 的 STOP → 稳定 → 切档 → START 链路，等 ACK 时重发 / The STOP → settle → switch → START link to CameraSync, resending while waiting for ACKs |
+| `FrameMatcher` | 按相机帧计数把图像对应到边沿，发现矛盾即要求重新同步 / Matches images to edges by frame counter and requests a resync on a contradiction |
 
-- It receives and holds `SharedFrame` handles from the Topic of `CameraBase<FrameLayoutV>`.
-- It pairs each image with the IMU timestamp of the corresponding real MCU camera trigger edge and publishes a `SyncedFrame`.
+## 3. 配对 / Matching
 
-All processing runs on the threads of the Topic callbacks, and the Module owns no worker thread. Synchronous subscribers of `SyncCommand` and `SyncedFrame` may call the interface of this Module from their callbacks.
+启动时 CameraFrameSync 让 MCU 停止触发，等 10 ms 让在途图像到齐，再以 `trigger_period_us` 重新开始。START 生效后的第一张图的帧计数记为 c0，对应边沿 1；计数为 c 的图对应边沿 c − c0 + 1。图像的 IMU 取在边沿时刻加 `offset_us` 处（触发延迟加半个曝光），由 `ImuHistory` 插值得到；边沿或 IMU 尚未到达时图像最多等待 100 ms。
 
-A `SyncedFrame` holds a monotonically increasing `sequence`, the image handle `image` (`GetImageFrame()` returns the read-only frame) and `imu` (`ImuStamped`, translation always 0).
+At start-up CameraFrameSync stops the MCU trigger, waits 10 ms for images in flight and restarts it at `trigger_period_us`. The first image after START has frame counter c0 and belongs to edge 1; an image with counter c belongs to edge c − c0 + 1. Its IMU is interpolated by `ImuHistory` at the edge time plus `offset_us` (trigger delay plus half the exposure); an image waits at most 100 ms for its edge or IMU.
 
-The implementation details of the synchronization state machine, image and edge matching, raw IMU assembly, command retries and monitoring output are in [docs/internals.md](docs/internals.md).
+主机侧丢掉的图只让帧计数跳号，配对仍然准确；丢失的边沿消息只让对应的那张图被丢弃。以下情况说明计数与边沿已经错位，模块重新执行 STOP/START：
 
-## 2. 时间域与原始 IMU 坐标 / Time Domain and Raw IMU Frame
+A frame dropped on the host only skips a counter value and matching stays exact; a lost edge message only drops its own image. The following show that counters and edges no longer line up, and the Module runs STOP/START again:
 
-相机时间与 MCU / IMU 时间属于两个独立的设备时钟域：
+- 两张图的设备时间间隔与对应两个边沿的间隔相差超过四分之一周期（至少 1.5 ms），即相机漏了触发；
+- 帧计数没有递增，即相机重新开始计数；
+- 图像领先最新边沿 3 个以上；
+- 收到不属于当前 START 的边沿，例如 MCU 重启后的默认触发。
 
-- `ImageFrame::timestamp_us` 保存相机采样时间。
-- 原始 IMU 使用 Topic 消息时间戳。
-- `FRAME_TRIGGER` 的 Topic 消息时间戳是 MCU 产生真实 GPIO 边沿时的 IMU 时间。
-- `TRIGGER` 模式下，`SyncedFrame::imu.timestamp_us` 等于匹配边沿的时间戳。
+- two images whose device-time interval differs from that of their edges by more than a quarter period (at least 1.5 ms): the camera missed a trigger;
+- a frame counter that did not advance: the camera restarted its counter;
+- an image more than 3 edges ahead of the newest edge;
+- an edge that does not belong to the current START, such as the MCU's default trigger after a reboot.
 
-相机时间只用于计算相邻已匹配图像的间隔，下游排序使用 `SyncedFrame::imu.timestamp_us`。同一时钟纪元（epoch）内的权威时间戳严格递增，迟到输出被丢弃。gyro 时间戳回退时开始新的纪元，模块清除旧的匹配与时间基线并重新同步；新纪元发布的时间戳可以小于上一纪元，下游据此重建跟踪时间基线。
+触发周期须大于曝光时间与读出时间的较大者，否则相机会跳过触发，表现为反复重新同步。
 
-触发周期由相机 profile 的 `trigger_period_us` 决定。
+The trigger period must exceed the camera's minimum frame period (the larger of readout and exposure), otherwise the camera skips triggers and the Module keeps resyncing.
 
-`raw_imu_frame` 声明原始 IMU 的坐标约定：
+`RequestView(view)` 可在任意线程调用：停触发、等稳定、调用相机的 `SwitchView`、再启动触发，之后的帧带新视角的几何。
 
-- `BODY_X_RIGHT_Y_FORWARD_Z_UP`（默认）：数据原样使用。
-- `X_FORWARD_Y_LEFT_Z_UP_TO_BODY`：把 x 前 / y 左 / z 上的数据转换到本体系（x 右 / y 前 / z 上），向量取 `(-y, x, z)`，四元数取 `(w, -y, x, z)`。
+`RequestView(view)` may be called from any thread: it stops the trigger, waits, calls the camera's `SwitchView` and restarts the trigger; later frames carry the new view's geometry.
 
-The camera time and the MCU / IMU time belong to two independent device clock domains:
+`RequestMove(narrow)` 用同一流程移动 NARROW 窗口：停触发后调用相机的 `MoveNarrow`，相机不停流，停触发期间没有帧曝光，所以 START 之后的帧都是新窗口。还没完成的切档与移窗请求并入下一轮，先移窗再切档，从 WIDE 切到 NARROW 时就用新位置。LATEST_IMU 下两者直接调用相机。
 
-- `ImageFrame::timestamp_us` holds the camera sampling time.
-- The raw IMU uses the Topic message timestamp.
-- The Topic message timestamp of `FRAME_TRIGGER` is the IMU time at which the MCU produced the real GPIO edge.
-- In `TRIGGER` mode, `SyncedFrame::imu.timestamp_us` equals the timestamp of the matched edge.
+`RequestMove(narrow)` moves the NARROW window through the same round: after the trigger stops it calls the camera's `MoveNarrow`; the camera keeps streaming, and no frame is exposed while the trigger is stopped, so every frame after START has the new window. Unfinished view and move requests join the next round, the move before the switch, so a switch from WIDE to NARROW uses the new position. In LATEST_IMU both call the camera directly.
 
-The camera time is used only to compute the gap between adjacent matched images, and downstream ordering uses `SyncedFrame::imu.timestamp_us`. Authoritative timestamps increase strictly within one clock epoch, and late outputs are discarded. A gyro timestamp regression starts a new epoch: the Module clears the old matching and time baselines and resynchronizes. A new epoch may publish timestamps smaller than those of the previous epoch, and downstream Modules rebuild their tracking time baseline accordingly.
+## 4. LATEST_IMU
 
-The trigger period is given by `trigger_period_us` of the camera profile.
+`SyncMode::LATEST_IMU` 只用于没有触发线的台架调试：相机自由运行，每张图到达时取 `ImuHistory` 中最新的 IMU。相机时钟与 MCU 时钟不同源，同步误差约为一个 IMU 周期加上传输延迟，结果不能用来评估跟踪。回放不经过本模块，由 CaptureFileCamera 直接发布同步帧。
 
-`raw_imu_frame` declares the coordinate convention of the raw IMU:
+`SyncMode::LATEST_IMU` is only for bench debugging without a trigger line: the camera free-runs and each image gets the newest IMU in `ImuHistory`. The camera and MCU clocks are independent, so the sync error is about one IMU period plus the transport delay, and results are not fit for judging tracking. Replay does not use this Module; CaptureFileCamera publishes synced frames itself.
 
-- `BODY_X_RIGHT_Y_FORWARD_Z_UP` (default): data is used as is.
-- `X_FORWARD_Y_LEFT_Z_UP_TO_BODY`: converts x-forward / y-left / z-up data into the body frame (x right / y forward / z up); vectors become `(-y, x, z)` and quaternions `(w, -y, x, z)`.
+## 5. Topic
 
-## 3. TRIGGER 模式 / TRIGGER Mode
-
-`TRIGGER` 是实机默认模式。模块在 `sync_command_topic_name` 上向 CameraSync 发送 `STOP_TRIGGER` 与 `START_TRIGGER` 命令，并在 `sync_result_topic_name` 上接收命令的 ACK 和每个真实触发边沿（`FRAME_TRIGGER`）。构造时，模块对当前 profile 执行一次同步：发送 STOP，等待 `camera_settle_us`，发送 START，收到 START 的 ACK 后进入 `RUNNING`。切换 profile 时，模块在稳定等待之后、START 之前调用 `CameraBase::SwitchProfile()`。
-
-进入 `RUNNING` 后，每张图像与 START 之后对应的真实触发边沿配对；相机少交付图像时，对应的边沿被跳过。`offset_us` 为 0 时取该边沿时刻的 IMU 样本，非零时在 IMU 时间域中取 `trigger_timestamp + offset_us` 附近 500 us 内最近的样本。无论选用哪条 IMU 样本，发布的 `SyncedFrame::imu.timestamp_us` 都是原始 `FRAME_TRIGGER` 时间。`SetOffsetUs()` 可在运行时修改 offset。
-
-图像与边沿无法对应时（相机时间重复或回退、边沿不连续或回退、队列溢出等），模块清除本地匹配，对当前 profile 重新执行 STOP / 稳定等待 / START，期间保持当前相机 profile。命令重试耗尽、ACK 内容非法、相机切档失败或待发送队列无法接纳命令时，状态进入 `FAILED`。
-
-`TRIGGER` is the default mode on the machine. The Module sends the `STOP_TRIGGER` and `START_TRIGGER` commands to CameraSync on `sync_command_topic_name` and receives the command ACKs and every real trigger edge (`FRAME_TRIGGER`) on `sync_result_topic_name`. On construction the Module synchronizes the current profile once: it sends STOP, waits `camera_settle_us`, sends START, and enters `RUNNING` after the START ACK. On a profile switch, the Module calls `CameraBase::SwitchProfile()` after the settle wait and before START.
-
-Once `RUNNING`, every image is paired with the corresponding real trigger edge after START; when the camera delivers fewer images, the corresponding edges are skipped. With `offset_us` equal to 0 the IMU sample at the edge time is taken; with a non-zero offset the nearest sample within 500 us around `trigger_timestamp + offset_us` in the IMU time domain is taken. Whichever IMU sample is selected, the published `SyncedFrame::imu.timestamp_us` is the original `FRAME_TRIGGER` time. `SetOffsetUs()` changes the offset at run time.
-
-When images and edges cannot be paired (a repeated or regressing camera time, a discontinuous or regressing edge, a queue overflow and similar cases), the Module clears the local matching and runs STOP / settle / START again on the current profile, keeping the current camera profile meanwhile. When the command retries are exhausted, an ACK carries invalid content, a camera switch fails or the outbound queue cannot accept a command, the state becomes `FAILED`.
-
-## 4. 固定 profile 与逐帧 geometry / Fixed Profiles and Per-frame Geometry
-
-相机通过 `Profiles()` 声明一到两个固定 profile（构造时检查 ID 唯一、周期非零、几何合法）。每项包含 `ProfileId`、逐帧 geometry 和直接传给 MCU 的 `trigger_period_us`。
-
-`RequestProfile()` 接纳异步的 STOP / 稳定等待 / SwitchProfile / START 事务：
-
-- 相机不支持的 profile 返回 `NOT_SUPPORT`。
-- 非 `RUNNING` 状态（包括控制阶段和 `FAILED`）返回 `STATE_ERR`。
-- `RUNNING` 中请求当前 profile 直接返回 `OK`，命令与 `SwitchProfile()` 均省略。
-- 单 profile 相机在启动和异常恢复时执行 STOP / START，相机 profile 保持不变。
-- `SwitchProfile()` 失败或返回不一致的结果时进入 `FAILED`，START 保持未发送，旧配置视为失效，回滚由调用方决定。
-- 命令 ACK 超时同样进入 `FAILED`，MCU 是否已执行命令、触发是否已停止，需另行确认。
-
-非 `RUNNING` 控制阶段到达的图像立即释放。切档过程中，已被下游持有的旧 profile `SharedFrame` 与新 profile 图像可以同时存在。
-
-构造时模块复制相机的原生 `CameraCalibration`（`Calibration()` 返回）。每张图像携带不可变的 `ImageFrame::geometry`，提交后像素和 geometry 保持只读。CameraFrameSync 验证该快照能由 `FrameLayoutV` 承载并落在原生标定范围内，其它合法 geometry 同样被接受。
-
-profile id 因此仅存在于控制面。下游按当前帧的 geometry 把像素坐标映射到统一的原生相机坐标或物理坐标。
-
-The camera declares one or two fixed profiles through `Profiles()` (the constructor checks unique IDs, non-zero periods and valid geometry). Each entry holds a `ProfileId`, the per-frame geometry and the `trigger_period_us` passed directly to the MCU.
-
-`RequestProfile()` admits the asynchronous STOP / settle / SwitchProfile / START transaction:
-
-- A profile unsupported by the camera returns `NOT_SUPPORT`.
-- Any state other than `RUNNING` (including the control phases and `FAILED`) returns `STATE_ERR`.
-- Requesting the current profile while `RUNNING` returns `OK` directly, omitting both the commands and `SwitchProfile()`.
-- A single-profile camera runs STOP / START at startup and during fault recovery, and its camera profile stays unchanged.
-- When `SwitchProfile()` fails or returns an inconsistent result, the state becomes `FAILED`, START stays unsent, the old configuration is treated as invalid, and rollback is left to the caller.
-- A command ACK timeout also leads to `FAILED`; whether the MCU executed the command and whether triggering has stopped has to be confirmed separately.
-
-Images arriving in a control phase other than `RUNNING` are released immediately. During a switch, old-profile `SharedFrame` handles still held downstream can coexist with new-profile images.
-
-On construction the Module copies the native `CameraCalibration` of the camera (returned by `Calibration()`). Every image carries an immutable `ImageFrame::geometry`, and pixels and geometry stay read-only after submission. CameraFrameSync validates that the snapshot can be carried by `FrameLayoutV` and lies within the native calibration range; any other valid geometry is accepted as well.
-
-The profile id therefore lives in the control plane only. Downstream Modules map pixel coordinates to unified native-camera or physical coordinates with the geometry of the current frame.
-
-## 5. LATEST_IMU 模式 / LATEST_IMU Mode
-
-`LATEST_IMU` 对应数据源已经自行同步的路径：
-
-- 发送 `CameraSync::SyncCommand` 的步骤省略。
-- 仅当前 profile 可用（`RequestProfile()` 对当前 profile 返回 `OK`，其余返回 `NOT_SUPPORT`）。
-- 只消费 quat 样本，以 quat 的 Topic 消息时间戳作为输出权威时间，角速度和加速度置零。
-- 每张图像取最新 quat；自上次输出后没有时间戳更新的 quat 时，该图像被丢弃，同一 quat timestamp 只发布一次。
-- `offset_us` 作用于 `TRIGGER` 的边沿匹配，`LATEST_IMU` 使用 quat 时间原值。
-
-`LATEST_IMU` serves the path where the data source is already synchronized by itself:
-
-- The step of sending `CameraSync::SyncCommand` is omitted.
-- Only the current profile is available (`RequestProfile()` returns `OK` for the current profile and `NOT_SUPPORT` for any other).
-- Only quat samples are consumed; the quat Topic message timestamp is the authoritative output time, and angular velocity and acceleration are set to zero.
-- Each image takes the latest quat; when no quat with a newer timestamp has arrived since the last output, the image is discarded, and one quat timestamp is published once.
-- `offset_us` applies to the edge matching of `TRIGGER`, while `LATEST_IMU` uses the quat time as is.
-
-## 6. 所有权与监控 / Ownership and Monitoring
-
-Topic 中的指针在当前同步回调返回前有效。图像需要在回调后继续使用时，订阅者在回调内复制整个 `SyncedFrame` 或其中的 `SharedFrame`，再把副本移动到自己的稳定工作槽位。异步订阅者（如 `QueuedSubscriber`）保存复制后的副本。
-
-每份 `SharedFrame` 共同持有 CameraBase 图像槽中的同一槽位。最后一份句柄析构后槽位归还 CameraBase，像素不被复制。
-
-启动日志记录输入 / 输出 Topic、模式、active profile、触发周期和稳定等待时间。`OnMonitor()` 由 XRobot 监控循环调用，报告当前控制状态、profile、触发周期和自上次调用以来的各项计数，各项内容见 [docs/internals.md](docs/internals.md)。
-
-The pointers in the Topics are valid until the current synchronous callback returns. A subscriber that needs the image after the callback copies the whole `SyncedFrame` or its `SharedFrame` inside the callback and moves the copy into its own stable work slot. An asynchronous subscriber (such as `QueuedSubscriber`) stores the copied value.
-
-Every `SharedFrame` co-owns the same image slot of CameraBase. When the last handle is destroyed the slot returns to CameraBase; pixels are not copied.
-
-The startup log records the input / output Topics, the mode, the active profile, the trigger period and the settle time. `OnMonitor()` is called by the XRobot monitor loop and reports the current control state, profile and trigger period together with the counts since the previous call; the items are listed in [docs/internals.md](docs/internals.md).
-
-## 7. 构造接口 / Constructor
-
-```cpp
-template <CameraTypes::FrameLayout FrameLayoutV>
-class CameraFrameSync;
-
-CameraFrameSync(Base& camera, RuntimeParam runtime = DefaultRuntime());
-```
-
-模板参数：
-
-- `FrameLayoutV`：帧布局，与相机实例的模板参数相同。
-
-依赖：
-
-- `camera`：`CameraBase<FrameLayoutV>&`，前面某个相机模块实例（HikCamera、WebotsCamera、CaptureFileCamera 等）。
-
-配置参数（`RuntimeParam`，`DefaultRuntime()` 即全部默认值）：
-
-| 字段 | 默认值 | 说明 |
+| Topic | 载荷 / Payload | 方向 / Direction |
 | --- | --- | --- |
-| `mode` | `CameraFrameSyncMode::TRIGGER` | `TRIGGER` 或 `LATEST_IMU`。 |
-| `offset_us` | `0` | 在 IMU 时间域中相对触发时间的取样偏移，单位 us，作用于 `TRIGGER`。 |
-| `host_topic_domain_name` | `"shared_memory"` | 命令、事件和原始 IMU Topic 的 domain。 |
-| `sync_command_topic_name` | `"camera_sync_command"` | 发给 CameraSync 的命令 Topic。 |
-| `sync_result_topic_name` | `"camera_sync_result"` | CameraSync 回执和触发事件 Topic。 |
-| `sync_active_level` | `1` | 触发有效电平，非零按 1 处理。 |
-| `camera_settle_us` | `10000` | STOP ACK 后等待相机稳定的时间，单位 us。 |
-| `raw_imu_frame` | `CameraFrameSyncRawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP` | 原始 IMU 坐标约定，见第 2 节。 |
-| `raw_quat_topic_name` | 空 | 非空时替代 `<camera_name>_quat`。 |
-| `synced_frame_topic_name` | 空 | 为空时使用 `<图像 topic>_synced`。 |
+| `<相机名>_image` | `const SharedFrame*` | 订阅 / Subscribed |
+| `gyro_topic`、`accl_topic` | `Eigen::Matrix<float, 3, 1>` | 订阅，MCU 发布的名字 / Subscribed, MCU names |
+| `quat_topic` | `LibXR::Quaternion<float>` | 订阅 / Subscribed |
+| `camera_sync_result` | `CameraSyncDetail::SyncEvent` | 订阅（TRIGGER）/ Subscribed (TRIGGER) |
+| `camera_sync_command` | `CameraSyncDetail::SyncCommand` | 发布（TRIGGER）/ Published (TRIGGER) |
+| `<相机名>_synced` | `const AutoAim::SyncedFrame*` | 发布 / Published |
 
-相机名、图像 Topic、domain 和两个同步 Topic 名为非空值，相机 profile 合法；否则构造时 `REQUIRE` 失败。
+IMU 与 CameraSync 的 Topic 位于 `mcu_domain`（车上为 SharedTopic 使用的 `host`，Webots 中为默认 domain）。相机图像 Topic 须在本模块之前创建，否则启动即致命退出；IMU 与 CameraSync 的 Topic 不存在时由本模块按类型创建，因为 SharedTopic 只转发已存在的带类型 Topic，车上配置中本模块排在 SharedTopic 之前。
 
-公共方法：`SyncedFrameTopicName()`、`RawTopicDomainName()`、`Calibration()`、`Profiles()`、`ActiveProfile()`、`GetSyncMode()`、`RequestProfile()`、`SetOffsetUs()`、`FlushPendingFrames()`（立即处理待匹配数据后清空图像和 trigger 队列）、`OnMonitor()`。
+The IMU and CameraSync Topics live in `mcu_domain` (`host`, used by SharedTopic, on the robot; the default domain in Webots). The camera image Topic is created before this Module, otherwise start-up is fatal; absent IMU and CameraSync Topics are created here with their types, because SharedTopic only forwards existing typed Topics, and the robot configuration lists this Module before SharedTopic.
 
-Template parameter:
+`imu_axes` 说明 MCU IMU 的坐标轴：`ImuAxes::BODY` 表示已是机体系（x 右、y 前、z 上）；`ImuAxes::X_FORWARD_Y_LEFT_Z_UP` 表示 x 前、y 左、z 上，进入同步前转成机体系，向量取 `(-y, x, z)`，四元数取 `(w, -y, x, z)`（哨兵 C 板的安装方向）。
 
-- `FrameLayoutV`: the frame layout, identical to the template parameter of the camera instance.
+`imu_axes` gives the axes of the MCU IMU: `ImuAxes::BODY` means it is already in the body frame (x right, y forward, z up); `ImuAxes::X_FORWARD_Y_LEFT_Z_UP` means x forward, y left, z up and is converted into the body frame before syncing, vectors as `(-y, x, z)` and quaternions as `(w, -y, x, z)` (the sentry C board's mounting).
 
-Dependencies:
-
-- `camera`: `CameraBase<FrameLayoutV>&`, an earlier camera Module instance (HikCamera, WebotsCamera, CaptureFileCamera, and so on).
-
-Configuration parameters (`RuntimeParam`; `DefaultRuntime()` holds all defaults):
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `mode` | `CameraFrameSyncMode::TRIGGER` | `TRIGGER` or `LATEST_IMU`. |
-| `offset_us` | `0` | Sampling offset relative to the trigger time in the IMU time domain, in us; applies to `TRIGGER`. |
-| `host_topic_domain_name` | `"shared_memory"` | Domain of the command, event and raw IMU Topics. |
-| `sync_command_topic_name` | `"camera_sync_command"` | Command Topic sent to CameraSync. |
-| `sync_result_topic_name` | `"camera_sync_result"` | CameraSync acknowledgement and trigger event Topic. |
-| `sync_active_level` | `1` | Trigger active level; non-zero is treated as 1. |
-| `camera_settle_us` | `10000` | Time to wait for the camera to settle after the STOP ACK, in us. |
-| `raw_imu_frame` | `CameraFrameSyncRawImuFrame::BODY_X_RIGHT_Y_FORWARD_Z_UP` | Raw IMU coordinate convention, see section 2. |
-| `raw_quat_topic_name` | empty | Replaces `<camera_name>_quat` when non-empty. |
-| `synced_frame_topic_name` | empty | `<image Topic>_synced` is used when empty. |
-
-The camera name, the image Topic, the domain and the two synchronization Topic names are non-empty and the camera profiles are valid; otherwise `REQUIRE` fails in the constructor.
-
-Public methods: `SyncedFrameTopicName()`, `RawTopicDomainName()`, `Calibration()`, `Profiles()`, `ActiveProfile()`, `GetSyncMode()`, `RequestProfile()`, `SetOffsetUs()`, `FlushPendingFrames()` (processes pending data immediately, then clears the image and trigger queues) and `OnMonitor()`.
-
-## 8. Topic
-
-`<camera_name>` 是相机的实例名（`camera.NameView()`）。命令、事件和原始 IMU Topic 使用 `host_topic_domain_name`。默认 domain 是 `shared_memory`；产品配置可以改为 `host` 等 SharedTopic 转发 domain，进程内仿真使用默认域 `libxr_def_domain`。图像和 `SyncedFrame` 是当前进程内的普通 Topic，裸指针在进程内传递。
-
-| Topic | 方向 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| `camera.ImageTopicNameView()` | 订阅 | `const SharedFrame*` | 相机图像，载荷在同步回调期间有效 |
-| `<camera_name>_gyro` | 订阅 | `Eigen::Matrix<float, 3, 1>` | 角速度，单位 rad/s |
-| `<camera_name>_accl` | 订阅 | `Eigen::Matrix<float, 3, 1>` | 加速度，单位 m/s^2 |
-| `<camera_name>_quat`（`raw_quat_topic_name` 非空时使用该名字） | 订阅 | `LibXR::Quaternion<float>` | 姿态四元数 |
-| `sync_result_topic_name`（默认 `camera_sync_result`） | 订阅 | `CameraSync::SyncEvent` | CameraSync 的 ACK 与触发事件 |
-| `synced_frame_topic_name`，为空时为 `<图像 Topic>_synced` | 发布 | `const SyncedFrame*` | 同步结果，载荷在同步回调期间有效；名字由 `SyncedFrameTopicName()` 查询 |
-| `sync_command_topic_name`（默认 `camera_sync_command`） | 发布 | `CameraSync::SyncCommand` | STOP / START 触发命令 |
-
-`<camera_name>` is the instance name of the camera (`camera.NameView()`). The command, event and raw IMU Topics use `host_topic_domain_name`. The default domain is `shared_memory`; a product configuration can set a SharedTopic forwarding domain such as `host`, and in-process simulation uses the default domain `libxr_def_domain`. The image and `SyncedFrame` are ordinary Topics inside the current process, and raw pointers are passed within the process.
-
-| Topic | Direction | Type | Meaning |
-| --- | --- | --- | --- |
-| `camera.ImageTopicNameView()` | Subscribe | `const SharedFrame*` | Camera image, payload valid during the synchronous callback |
-| `<camera_name>_gyro` | Subscribe | `Eigen::Matrix<float, 3, 1>` | Angular velocity in rad/s |
-| `<camera_name>_accl` | Subscribe | `Eigen::Matrix<float, 3, 1>` | Acceleration in m/s^2 |
-| `<camera_name>_quat` (the name from `raw_quat_topic_name` when non-empty) | Subscribe | `LibXR::Quaternion<float>` | Attitude quaternion |
-| `sync_result_topic_name` (default `camera_sync_result`) | Subscribe | `CameraSync::SyncEvent` | ACKs and trigger events of CameraSync |
-| `synced_frame_topic_name`, `<image Topic>_synced` when empty | Publish | `const SyncedFrame*` | Synchronized result, payload valid during the synchronous callback; the name is returned by `SyncedFrameTopicName()` |
-| `sync_command_topic_name` (default `camera_sync_command`) | Publish | `CameraSync::SyncCommand` | STOP / START trigger commands |
-
-## 9. 配置示例 / Configuration Example
-
-`xrobot instance add QDU-Robomaster/CameraFrameSync --template-arg <FrameLayout>` 写入的实例：`template_args` 为帧布局 constexpr，`camera` 填为相机实例的 id，`runtime` 为 `DefaultRuntime()` 表达式，`RuntimeParam` 的默认值见第 7 节。帧布局与相机实例一致：
-
-An instance written by `xrobot instance add QDU-Robomaster/CameraFrameSync --template-arg <FrameLayout>`: `template_args` is the frame layout constexpr, `camera` is set to the id of a camera instance, and `runtime` is the `DefaultRuntime()` expression, with the defaults of `RuntimeParam` listed in section 7. The frame layout equals that of the camera instance:
+## 6. 配置示例 / Configuration Example
 
 ```yaml
-constexpr_namespace: AutoAimRunConfig
-constexpr_includes:
-  - CameraBase.hpp
-constexprs:
-  MainFrameLayout:
-    type: CameraTypes::FrameLayout
-    value: '{.width = 800, .height = 600, .step = 2400, .encoding = CameraTypes::Encoding::BGR8}'
 modules:
   - module: QDU-Robomaster/CameraFrameSync
-    id: CameraFrameSync_0
-    template_args:
-      - AutoAimRunConfig::MainFrameLayout
+    id: frame_sync
     args:
-      - camera: WebotsCamera_0
-      - runtime: CameraFrameSync<AutoAimRunConfig::MainFrameLayout>::DefaultRuntime()
+      - camera: camera
+      - settings:
+          mode: SyncMode::TRIGGER
+          trigger_period_us: 10000
+          offset_us: AutoAimRunConfig::HikSyncOffsetUs
+          mcu_domain: "host"
+          gyro_topic: "gimbal_gyro"
+          accl_topic: "gimbal_accl"
+          quat_topic: "gimbal_quat"
+          imu_axes: ImuAxes::BODY
 ```
 
-`WebotsCamera_0` 是 WebotsCamera（或 HikCamera、CaptureFileCamera）实例的 id，它列在本实例之前，使用相同的 `template_args`。`runtime` 也可以展开为 `RuntimeParam` 全部字段的 YAML 映射，字段顺序见第 7 节；数据源已经自行同步时，其中 `mode` 取 `CameraFrameSyncMode::LATEST_IMU`。ArmorDetector、ArmorTracker 等下游模块以 `sync: CameraFrameSync_0` 引用本实例。
+## 7. 测试 / Tests
 
-`WebotsCamera_0` is the id of a WebotsCamera (or HikCamera, CaptureFileCamera) instance, listed before this instance and using the same `template_args`. `runtime` can also be expanded into a YAML mapping of all `RuntimeParam` fields in the order of section 7; when the data source is already synchronized by itself, its `mode` is `CameraFrameSyncMode::LATEST_IMU`. Downstream Modules such as ArmorDetector and ArmorTracker reference this instance with `sync: CameraFrameSync_0`.
+- `tests/parts_test.cpp`：`ImuHistory` 的插值、四元数半球、尚未到达与过旧；`TriggerLink` 的重发、ACK、稳定、切档、移窗与序号循环；`FrameMatcher` 的计数对应、主机丢帧、丢失边沿与各种矛盾。
+- `tests/camera_frame_sync_test.cpp`：假 MCU（1 kHz IMU）驱动真实的 CameraSync，CameraSync 的触发电平驱动假相机出图。检查每帧 IMU 都取在自己的边沿加偏移处、相机漏一次触发后只重新同步一次并恢复、切档后的几何、移窗后帧计数继续且几何全部换成新窗口，LATEST_IMU，以及 x 前、y 左、z 上的 IMU 转成机体系。
 
-## 10. 依赖与硬件 / Dependencies and Hardware
+- `tests/parts_test.cpp`: `ImuHistory` interpolation, quaternion hemispheres, not-yet and too-old lookups; `TriggerLink` resends, ACKs, settling, view switch, window move and sequence wrap; `FrameMatcher` counter matching, host drops, lost edges and the contradictions.
+- `tests/camera_frame_sync_test.cpp`: a fake MCU (1 kHz IMU) drives the real CameraSync, whose trigger level drives a fake camera. It checks that every frame's IMU is taken at its own edge plus offset, that one missed trigger causes exactly one resync and recovery, the geometry after a view switch, a window move with the frame counter continuing and every later frame on the new window, LATEST_IMU, and the conversion of x-forward, y-left, z-up IMU data into the body frame.
 
-依赖：
+## 8. 依赖 / Dependencies
 
-- `QDU-Robomaster/CameraBase`：相机基类、帧布局、`SharedFrame` 与 `ImuStamped`。
-- `QDU-Robomaster/CameraSync`：`SyncCommand` / `SyncEvent` 协议类型；MCU 侧（或仿真中同进程）的 CameraSync 实例负责实际触发和回执。
-- `xrobot-org/DurationStatistics`：`pending_processing` 耗时统计。
-- LibXR（含 Eigen）。
+CameraBase、AutoAimTypes、CameraSync（协议头文件）、LibXR。
 
-硬件：相机的触发输入由 MCU 侧 CameraSync 驱动；IMU 数据来自发布 `<camera_name>_gyro`、`<camera_name>_accl`、`<camera_name>_quat` 的实例。模块为 header-only 模板，所需的硬件对象通过相机实例和 Topic 获得。
-
-Dependencies:
-
-- `QDU-Robomaster/CameraBase`: camera base class, frame layout, `SharedFrame` and `ImuStamped`.
-- `QDU-Robomaster/CameraSync`: `SyncCommand` / `SyncEvent` protocol types; the CameraSync instance on the MCU side (or in the same process in simulation) performs the actual triggering and acknowledgement.
-- `xrobot-org/DurationStatistics`: duration statistics of `pending_processing`.
-- LibXR (including Eigen).
-
-Hardware: the camera trigger input is driven by CameraSync on the MCU side; the IMU data comes from the instances publishing `<camera_name>_gyro`, `<camera_name>_accl` and `<camera_name>_quat`. The Module is a header-only template; the hardware objects it needs come through the camera instance and the Topics.
+CameraBase, AutoAimTypes, CameraSync (protocol header), LibXR.
